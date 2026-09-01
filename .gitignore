@@ -1,0 +1,39 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Dataset files and generated fine-tuning data
+my_data_cache/
+dataset/my_data_cache/
+dataset/huatuo_samples/
+dataset/huatuo_deepseek_finetune/
+dataset/medical_qa_finetune/
+dataset/*_finetune/
+dataset/*_samples/
+dataset/**/*.arrow
+dataset/**/*.parquet
+dataset/**/*.csv
+dataset/**/*.tsv
+
+# Large local model assets, caches, and fine-tuning outputs.
+# Keep only the local training scripts and their dependency file.
+DeepSeek-Model/*
+!DeepSeek-Model/
+!DeepSeek-Model/finetune_huatuo_lora.py
+!DeepSeek-Model/finetune_huatuo_lora2.py
+!DeepSeek-Model/requirements-lora.txt
+
+# Temporary or demo scripts
+test_hello_world.py
+test2.py
