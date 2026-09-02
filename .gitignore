@@ -34,6 +34,10 @@ DeepSeek-Model/*
 !DeepSeek-Model/finetune_huatuo_lora2.py
 !DeepSeek-Model/requirements-lora.txt
 
+
+config.json
+
 # Temporary or demo scripts
 test_hello_world.py
-test2.py
+
+

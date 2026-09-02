@@ -14,3 +14,10 @@ snapshot_download(
     resume_download=True,          # 启用断点续传
     local_dir_use_symlinks=False   # 不使用符号链接，复制实际文件
 )
+
+'''
+    模型 ID: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    本地目录: DeepSeek-Model
+    本地下载: revision：ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562
+    架构: Qwen2ForCausalLM
+'''

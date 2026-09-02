@@ -1,14 +1,16 @@
 import openai # pip install openai
-config={
-  "localhost":{
-    "model_path":"DeepSeek-Model",
-  }
-}
+
+import json
+with open("config.json", "r", encoding="utf-8") as file:
+  config = json.load(file)
+  print(config)
+
 param={
   "max_new_tokens":1000,#256,#512      # 最大生成长度
   "temperature":0.001,#0.1,#0.7,#0.6           # 控制随机性（0=确定性，越高越随机）
   "stream" : False 
 }
+
 import os
 if os.path.exists(config["localhost"]["model_path"]):
   from transformers import AutoModelForCausalLM, AutoTokenizer # pip install transformers torch accelerate
