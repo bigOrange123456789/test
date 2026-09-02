@@ -200,6 +200,24 @@ def initUI():# Gradio UI
     output_box = gr.Textbox(label="模型回答", interactive=False)
     send_button.click(chat_with_model, inputs=[model_selector, input_box], outputs=output_box)
   demo.launch(debug=True)
+def initUI2():
+  from flask import Flask, send_from_directory # pip install flask
+  from flask_socketio import SocketIO, emit # pip install flask-socketio
+  app = Flask(__name__)
+  socketio = SocketIO(app)
+  @app.route("/")
+  def index():
+    return send_from_directory(".", "test.html")
+  @socketio.on("chatMessage")
+  def handle_chat_message(data):
+    model_id = data["modelId"]
+    question = data["question"]
+    try:
+      response = chat_with_model(model_id, question)
+    except Exception as e:
+      response = str(e)
+    emit("chatResponse", {"response": response})
+  socketio.run(app, host="0.0.0.0", port=3000)
 while True:
   prompt = input("   our:")
   if len(prompt.split("switch-"))>1:
@@ -210,6 +228,9 @@ while True:
     elif str0=="gradio":
       print("[gradio]正在生成交互页面的链接...")
       initUI()
+    elif str0=="html":
+      print("[html]正在生成交互页面的链接...")
+      initUI2()
     else:
       print("无法识别的切换目标:",str0)
       exit(0)

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多模型 LLM 聊天界面</title>
+  <!-- <script src="/socket.io/socket.io.js"></script> -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; }
+    .container { max-width: 600px; margin: 0 auto; }
+    .row { display: flex; justify-content: space-between; }
+    textarea { width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>💬 多模型 LLM 聊天界面</h2>
+    <div>
+      <label for="modelSelector">选择模型:</label>
+      <select id="modelSelector">
+        <option value="tongyi">tongyi</option>
+        <option value="qianfan">qianfan</option>
+        <option value="deepseek">deepseek</option>
+        <option value="chatgpt">chatgpt</option>
+      </select>
+    </div>
+    <div class="row">
+      <textarea id="inputBox" placeholder="请输入你想问的问题"></textarea>
+      <button id="sendButton">发送</button>
+    </div>
+    <div>
+      <label for="outputBox">模型回答:</label>
+      <textarea id="outputBox" readonly></textarea>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    document.getElementById("sendButton").addEventListener("click", () => {
+      const modelId = document.getElementById("modelSelector").value;
+      const question = document.getElementById("inputBox").value;
+      socket.emit("chatMessage", { modelId, question });
+    });
+    socket.on("chatResponse", (data) => {
+      if (data.response) {
+        document.getElementById("outputBox").value = data.response;
+      } else {
+        document.getElementById("outputBox").value = "Error: " + data.error;
+      }
+    });
+  </script>
+</body>
+</html>
