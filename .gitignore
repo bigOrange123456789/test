@@ -36,6 +36,7 @@ DeepSeek-Model/*
 
 
 config.json
+files
 
 # Temporary or demo scripts
 test_hello_world.py

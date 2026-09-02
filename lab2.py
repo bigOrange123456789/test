@@ -1,9 +1,114 @@
 import openai # pip install openai
 
 import json
-with open("config.json", "r", encoding="utf-8") as file:
-  config = json.load(file)
-  print(config)
+import os
+import re
+from collections import defaultdict
+
+
+def mask_api_key(api_key):
+  if not api_key:
+    return "<empty>"
+  if len(api_key) <= 8:
+    return "<set>"
+  return api_key[:4] + "..." + api_key[-4:]
+
+
+def load_config(path="config.json"):
+  with open(path, "r", encoding="utf-8") as file:
+    return json.load(file)
+
+
+def print_config_summary(config):
+  print("\n========== 配置摘要 ==========")
+  for model_id, cfg in config.items():
+    if model_id == "localhost":
+      print(f"[{model_id}] local model_path={cfg.get('model_path', '')}")
+      continue
+
+    print(
+      f"[{model_id}] base_url={cfg.get('base_url', '')} "
+      f"configured_model={cfg.get('model', '')} "
+      f"api_key={mask_api_key(str(cfg.get('api_key', '')))}"
+    )
+  print("==============================\n")
+
+
+def normalize_model_ids(models_response):
+  model_ids = []
+  for model in getattr(models_response, "data", []):
+    model_id = getattr(model, "id", None)
+    if model_id:
+      model_ids.append(model_id)
+  return sorted(set(model_ids))
+
+
+def short_error_message(error):
+  message = str(error).replace("\n", " ").strip()
+  message = re.sub(r"\s+", " ", message)
+  return message[:300] + ("..." if len(message) > 300 else "")
+
+
+def print_available_remote_models(config):
+  print("========== 远程 API 可用模型检查 ==========")
+
+  grouped = defaultdict(list)
+  for model_id, cfg in config.items():
+    if model_id == "localhost":
+      continue
+    api_key = cfg.get("api_key")
+    base_url = cfg.get("base_url")
+    if not api_key or not base_url:
+      print(f"[{model_id}] 跳过：缺少 api_key 或 base_url")
+      continue
+    grouped[(base_url, api_key)].append(model_id)
+
+  if not grouped:
+    print("没有发现远程 API 配置。")
+    print("==========================================\n")
+    return
+
+  for (base_url, api_key), model_ids in grouped.items():
+    title = ", ".join(model_ids)
+    print(f"\n[{title}]")
+    print(f"base_url: {base_url}")
+    print(f"api_key: {mask_api_key(str(api_key))}")
+
+    try:
+      client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=15)
+      available_models = normalize_model_ids(client.models.list())
+    except Exception as error:
+      print("状态：查询失败，api_key 可能失效，或 base_url 不支持 /models。")
+      print(f"错误：{short_error_message(error)}")
+      continue
+
+    if not available_models:
+      print("状态：查询成功，但没有返回模型列表。")
+      continue
+
+    unavailable_model_ids = []
+
+    for model_id in model_ids:
+      configured_model = config[model_id].get("model", "")
+      if configured_model in available_models:
+        print(f"当前配置 [{model_id}].model = {configured_model}：可用")
+      else:
+        unavailable_model_ids.append(model_id)
+        print(f"当前配置 [{model_id}].model = {configured_model}：未在可用模型列表中，请检查是否已下线或名称写错")
+
+    if unavailable_model_ids:
+      print(f"可用模型数量：{len(available_models)}")
+      print("可用模型：")
+      for available_model in available_models:
+        print(f"  - {available_model}")
+
+  print("\n==========================================\n")
+
+
+config = load_config()
+# print_config_summary(config)
+if  False:
+  print_available_remote_models(config)
 
 param={
   "max_new_tokens":1000,#256,#512      # 最大生成长度
@@ -11,7 +116,6 @@ param={
   "stream" : False 
 }
 
-import os
 if os.path.exists(config["localhost"]["model_path"]):
   from transformers import AutoModelForCausalLM, AutoTokenizer # pip install transformers torch accelerate
   config["localhost"]["model"] = AutoModelForCausalLM.from_pretrained(
