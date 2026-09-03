@@ -134,7 +134,7 @@ def chat_with_model(modelId, question):
     return "Please enter a question~"
   try:
     config[modelId]["messages"].append({"role": "user", "content": question})
-    if modelId =="localhost":
+    if len(modelId.split("localhost"))>1:#if modelId =="localhost":
       model=config[modelId]["model"]
       tokenizer=config[modelId]["tokenizer"]
       # 应用聊天模板生成模型输入
