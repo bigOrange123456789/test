@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections import defaultdict
-
+DEFAULT_SYSTEM_PROMPT = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"#"请用简洁、简短的语言回答用户的问题"
 
 def mask_api_key(api_key):
   if not api_key:
@@ -14,7 +14,7 @@ def mask_api_key(api_key):
   return api_key[:4] + "..." + api_key[-4:]
 
 
-def load_config(path="config.json"):
+def load_config(path="./inferenceValid/config.json"):
   with open(path, "r", encoding="utf-8") as file:
     return json.load(file)
 
@@ -113,7 +113,8 @@ if  False:
 param={
   "max_new_tokens":1000,#256,#512      # 最大生成长度
   "temperature":0.001,#0.1,#0.7,#0.6           # 控制随机性（0=确定性，越高越随机）
-  "stream" : False 
+  "stream" : False,
+  # "enable_thinking":False, 
 }
 
 if os.path.exists(config["localhost"]["model_path"]):
@@ -126,7 +127,7 @@ if os.path.exists(config["localhost"]["model_path"]):
   config["localhost"]["tokenizer"] = AutoTokenizer.from_pretrained(config["localhost"]["model_path"])
 modelId=""
 for modelId in config:
-  config[modelId]["messages"]=[{"role": "system", "content": "请用简洁、简短的语言回答用户的问题"}]
+  config[modelId]["messages"]=[{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
   # config[modelId]["messages"]=[{"role": "system", "content": "请专业且详细的回答用户的问题"}]
 def chat_with_model(modelId, question):
   if not question:
@@ -170,7 +171,8 @@ def chat_with_model(modelId, question):
         extra_body=config[modelId]["extra_body"],
         temperature=param["temperature"],
         max_tokens=param["max_new_tokens"], #1000
-        stream=param["stream"]  # 开启流式
+        stream=param["stream"],  # 开启流式
+        # enable_thinking=param["enable_thinking"],
       )
       if param["stream"]:
         response = ""
@@ -205,9 +207,13 @@ def initUI2():
   from flask_socketio import SocketIO, emit # pip install flask-socketio
   app = Flask(__name__)
   socketio = SocketIO(app)
+  # @app.route("/")
+  # def index():
+  #   return send_from_directory(".", "inferenceValid/test.html") # return send_from_directory(".", "test.html")
   @app.route("/")
   def index():
-    return send_from_directory(".", "test.html")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(script_dir, "test.html")
   @socketio.on("chatMessage")
   def handle_chat_message(data):
     model_id = data["modelId"]
