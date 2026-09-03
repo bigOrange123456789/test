@@ -5,6 +5,7 @@ import os
 import re
 from collections import defaultdict
 DEFAULT_SYSTEM_PROMPT = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"#"请用简洁、简短的语言回答用户的问题"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def mask_api_key(api_key):
   if not api_key:
@@ -14,20 +15,60 @@ def mask_api_key(api_key):
   return api_key[:4] + "..." + api_key[-4:]
 
 
-def load_config(path="./inferenceValid/config.json"):
+def load_config(path=None):
+  if path is None:
+    path = os.path.join(SCRIPT_DIR, "config.json")
   with open(path, "r", encoding="utf-8") as file:
     return json.load(file)
+
+
+def parse_config_bool(value, default=False):
+  if value is None:
+    return default
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+      return True
+    if normalized in ("0", "false", "no", "n", "off"):
+      return False
+  return bool(value)
+
+
+def is_local_config(_model_id, cfg):
+  return parse_config_bool(cfg.get("localhost"), default=False)
+
+
+def resolve_existing_path(path):
+  if not path or os.path.isabs(path):
+    return path
+
+  candidates = [
+    os.path.abspath(path),
+    os.path.abspath(os.path.join(SCRIPT_DIR, path)),
+    os.path.abspath(os.path.join(SCRIPT_DIR, "..", path)),
+  ]
+  for candidate in candidates:
+    if os.path.exists(candidate):
+      return candidate
+  return candidates[0]
 
 
 def print_config_summary(config):
   print("\n========== 配置摘要 ==========")
   for model_id, cfg in config.items():
-    if model_id == "localhost":
-      print(f"[{model_id}] local model_path={cfg.get('model_path', '')}")
+    if is_local_config(model_id, cfg):
+      print(
+        f"[{model_id}] localhost=True "
+        f"model_path={cfg.get('model_path', '')} "
+        f"lora_adapter={cfg.get('lora_adapter', '')}"
+      )
       continue
 
     print(
-      f"[{model_id}] base_url={cfg.get('base_url', '')} "
+      f"[{model_id}] localhost=False "
+      f"base_url={cfg.get('base_url', '')} "
       f"configured_model={cfg.get('model', '')} "
       f"api_key={mask_api_key(str(cfg.get('api_key', '')))}"
     )
@@ -54,7 +95,7 @@ def print_available_remote_models(config):
 
   grouped = defaultdict(list)
   for model_id, cfg in config.items():
-    if model_id == "localhost":
+    if is_local_config(model_id, cfg):
       continue
     api_key = cfg.get("api_key")
     base_url = cfg.get("base_url")
@@ -105,6 +146,53 @@ def print_available_remote_models(config):
   print("\n==========================================\n")
 
 
+def load_local_models(config):
+  local_configs = [(model_id, cfg) for model_id, cfg in config.items() if is_local_config(model_id, cfg)]
+  if not local_configs:
+    return
+
+  from transformers import AutoModelForCausalLM, AutoTokenizer # pip install transformers torch accelerate
+
+  try:
+    from peft import PeftModel # pip install peft
+  except Exception:
+    PeftModel = None
+
+  for model_id, cfg in local_configs:
+    model_path = resolve_existing_path(cfg.get("model_path"))
+    if not model_path or not os.path.exists(model_path):
+      cfg["load_error"] = f"本地模型路径不存在：{cfg.get('model_path')}"
+      print(f"[{model_id}] {cfg['load_error']}")
+      continue
+
+    try:
+      model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype="auto",          # 自动选择最佳数据类型（如fp16）
+            device_map="cpu", #"cuda:0", #"auto",            # 自动分配到可用设备（GPU优先）
+      )
+      tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+      lora_adapter = cfg.get("lora_adapter")
+      if lora_adapter:
+        lora_adapter = resolve_existing_path(lora_adapter)
+        if not os.path.exists(lora_adapter):
+          raise FileNotFoundError(f"LoRA adapter 路径不存在：{cfg.get('lora_adapter')}")
+        if PeftModel is None:
+          raise ImportError("当前环境未安装 peft，无法加载 LoRA adapter")
+        model = PeftModel.from_pretrained(model, lora_adapter)
+
+      cfg["model"] = model
+      cfg["tokenizer"] = tokenizer
+      cfg["resolved_model_path"] = model_path
+      if cfg.get("lora_adapter"):
+        cfg["resolved_lora_adapter"] = lora_adapter
+      print(f"[{model_id}] 本地模型加载完成：{model_path}")
+    except Exception as error:
+      cfg["load_error"] = short_error_message(error)
+      print(f"[{model_id}] 本地模型加载失败：{cfg['load_error']}")
+
+
 config = load_config()
 # print_config_summary(config)
 if  False:
@@ -117,14 +205,7 @@ param={
   # "enable_thinking":False, 
 }
 
-if os.path.exists(config["localhost"]["model_path"]):
-  from transformers import AutoModelForCausalLM, AutoTokenizer # pip install transformers torch accelerate
-  config["localhost"]["model"] = AutoModelForCausalLM.from_pretrained(
-        config["localhost"]["model_path"],
-        torch_dtype="auto",          # 自动选择最佳数据类型（如fp16）
-        device_map="cpu", #"cuda:0", #"auto",            # 自动分配到可用设备（GPU优先）
-  )
-  config["localhost"]["tokenizer"] = AutoTokenizer.from_pretrained(config["localhost"]["model_path"])
+load_local_models(config)
 modelId=""
 for modelId in config:
   config[modelId]["messages"]=[{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
@@ -133,13 +214,19 @@ def chat_with_model(modelId, question):
   if not question:
     return "Please enter a question~"
   try:
-    config[modelId]["messages"].append({"role": "user", "content": question})
-    if len(modelId.split("localhost"))>1:#if modelId =="localhost":
-      model=config[modelId]["model"]
-      tokenizer=config[modelId]["tokenizer"]
+    cfg = config[modelId]
+    cfg["messages"].append({"role": "user", "content": question})
+    if is_local_config(modelId, cfg):
+      if "load_error" in cfg:
+        return f"本地模型未加载成功：{cfg['load_error']}"
+      if "model" not in cfg or "tokenizer" not in cfg:
+        return "本地模型未加载成功：缺少 model 或 tokenizer"
+
+      model=cfg["model"]
+      tokenizer=cfg["tokenizer"]
       # 应用聊天模板生成模型输入
       text = tokenizer.apply_chat_template(
-          config[modelId]["messages"],#history,
+          cfg["messages"],#history,
           tokenize=False,
           add_generation_prompt=True   # 为模型回复添加生成提示
       )
@@ -162,13 +249,13 @@ def chat_with_model(modelId, question):
       )
     else:
       client = openai.OpenAI(
-        api_key=config[modelId]["api_key"],
-        base_url=config[modelId]["base_url"]
+        api_key=cfg["api_key"],
+        base_url=cfg["base_url"]
       )
       message = client.chat.completions.create(
-        model=config[modelId]["model"],
-        messages=config[modelId]["messages"],
-        extra_body=config[modelId]["extra_body"],
+        model=cfg["model"],
+        messages=cfg["messages"],
+        extra_body=cfg.get("extra_body", {}),
         temperature=param["temperature"],
         max_tokens=param["max_new_tokens"], #1000
         stream=param["stream"],  # 开启流式
@@ -187,7 +274,7 @@ def chat_with_model(modelId, question):
         response = message.choices[0].message.content
       import re
       response = re.sub(r'.*?</think>\s*', '', response, flags=re.DOTALL) # 删除Chain of Thought
-    config[modelId]["messages"].append({"role": "assistant", "content": response})
+    cfg["messages"].append({"role": "assistant", "content": response})
     return response
   except Exception as e:
     return f"Failed to call model:{e}" 
