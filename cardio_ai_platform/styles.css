@@ -640,10 +640,15 @@ a {
   resize: vertical;
 }
 
+.textarea.compact-textarea {
+  min-height: 72px;
+}
+
 .check-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  margin-top: 10px;
 }
 
 .check-pill {
@@ -767,6 +772,32 @@ a {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.65;
+}
+
+.structured-output {
+  min-height: 54px;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.structured-output.placeholder {
+  color: var(--subtle);
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 2px;
+  background: var(--teal);
+  vertical-align: -0.14em;
+  animation: cursorBlink 0.9s steps(2, start) infinite;
+}
+
+@keyframes cursorBlink {
+  50% {
+    opacity: 0;
+  }
 }
 
 .risk-band {

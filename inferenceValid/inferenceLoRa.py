@@ -17,9 +17,11 @@ Config-driven inference script for local DeepSeek/LoRA models and remote APIs.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import sys
+import time
 from collections import defaultdict
 from importlib import metadata
 from pathlib import Path
@@ -370,16 +372,35 @@ def generate_local_answer(
 
     prompt = build_prompt(tokenizer, messages)
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    do_sample = args.temperature > 0
+    generation_config = copy.deepcopy(getattr(model, "generation_config", None))
+    if generation_config is not None:
+        generation_config.do_sample = do_sample
+        if do_sample:
+            generation_config.temperature = args.temperature
+            generation_config.top_p = args.top_p
+        else:
+            generation_config.temperature = 1.0
+            generation_config.top_p = 1.0
     generation_kwargs = {
         **inputs,
         "max_new_tokens": args.max_new_tokens,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "do_sample": args.temperature > 0,
+        "do_sample": do_sample,
         "repetition_penalty": args.repetition_penalty,
         "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
         "eos_token_id": tokenizer.eos_token_id,
     }
+    if generation_config is not None:
+        generation_kwargs["generation_config"] = generation_config
+    if do_sample:
+        generation_kwargs["temperature"] = args.temperature
+        generation_kwargs["top_p"] = args.top_p
+    print(
+        f"[{model_id}] Generation start: prompt_tokens={inputs.input_ids.shape[1]}, "
+        f"max_new_tokens={args.max_new_tokens}, do_sample={do_sample}",
+        flush=True,
+    )
+    started_at = time.perf_counter()
 
     if args.stream:
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
@@ -397,6 +418,11 @@ def generate_local_answer(
         answer = "".join(answer_parts)
         if args.strip_thinking:
             answer = remove_thinking_text(answer)
+        print(
+            f"[{model_id}] Generation end: elapsed={time.perf_counter() - started_at:.2f}s, "
+            f"answer_chars={len(answer)}",
+            flush=True,
+        )
         return answer.strip()
 
     with torch.no_grad():
@@ -406,6 +432,11 @@ def generate_local_answer(
     answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
     if args.strip_thinking:
         answer = remove_thinking_text(answer)
+    print(
+        f"[{model_id}] Generation end: elapsed={time.perf_counter() - started_at:.2f}s, "
+        f"generated_tokens={generated_ids.shape[0]}, answer_chars={len(answer)}",
+        flush=True,
+    )
     return answer.strip()
 
 

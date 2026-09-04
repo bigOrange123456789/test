@@ -377,5 +377,6 @@ while True:
       exit(0)
     continue
   response = chat_with_model(modelId,prompt)
+  print("response",response)
   if not param["stream"]:
     print(" "+modelId+":", response)

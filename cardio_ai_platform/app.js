@@ -6,6 +6,19 @@ const state = {
   selectedSourceId: "source-papers",
   analysisIndex: -1,
   analyzing: false,
+  analysisStatus: "idle",
+  selectedAnalysisModel: "deepseek-original",
+  analysisInputs: null,
+  analysisResult: null,
+  analysisDraft: {
+    diagnosis: "",
+    findings: "",
+    analysis: "",
+    advice: "",
+  },
+  analysisError: "",
+  analysisRunId: 0,
+  typingField: "",
   reportGenerated: false,
   uploadState: "等待上传",
   paperFilter: "全部",
@@ -13,6 +26,53 @@ const state = {
 };
 
 let analysisTimer = null;
+let typewriterTimer = null;
+
+const ANALYSIS_API_URL = "/api/analyze";
+const ANALYSIS_DEBUG = true;
+
+const analysisModels = [
+  { id: "deepseek-original", label: "原本deepseek（本地）" },
+  { id: "deepseek-finetuned", label: "微调deepseek（LoRA）" },
+  { id: "remote-api-1", label: "远程 API-1（deepseek）" },
+  { id: "remote-api-2", label: "远程 API-2（通义）" },
+];
+
+const analysisReportFields = [
+  { key: "diagnosis", label: "综合诊断结果" },
+  { key: "findings", label: "关键发现" },
+  { key: "analysis", label: "AI 分析" },
+  { key: "advice", label: "临床建议" },
+];
+
+function analysisDebug(label, data) {
+  if (!ANALYSIS_DEBUG) return;
+  if (data === undefined) {
+    console.info(`[CardioAI][病例分析] ${label}`);
+    return;
+  }
+  console.info(`[CardioAI][病例分析] ${label}`, data);
+}
+
+function analysisInputLengths(inputs = {}) {
+  return Object.fromEntries(
+    Object.entries(inputs).map(([key, value]) => [key, String(value ?? "").length])
+  );
+}
+
+function analysisReportLengths(report = {}) {
+  return Object.fromEntries(
+    analysisReportFields.map(({ key }) => [key, String(report[key] ?? "").length])
+  );
+}
+
+function analysisPayloadSummary(payload) {
+  return {
+    model: payload?.model || "",
+    inputKeys: Object.keys(payload?.inputs || {}),
+    inputLengths: analysisInputLengths(payload?.inputs || {}),
+  };
+}
 
 const navGroups = [
   {
@@ -411,6 +471,13 @@ function currentPaper() {
   return papers.find((item) => item.id === state.selectedPaperId) || papers[0];
 }
 
+function selectedAnalysisModelLabel() {
+  return (
+    analysisModels.find((model) => model.id === state.selectedAnalysisModel)?.label ||
+    state.selectedAnalysisModel
+  );
+}
+
 function routeLabel(routeId) {
   for (const group of navGroups) {
     const hit = group.items.find((item) => item.id === routeId);
@@ -430,6 +497,280 @@ function tags(items, variant = "") {
   return `<div class="tag-row">${items
     .map((item) => `<span class="tag ${variant}">${h(item)}</span>`)
     .join("")}</div>`;
+}
+
+function emptyAnalysisReport() {
+  return {
+    diagnosis: "",
+    findings: "",
+    analysis: "",
+    advice: "",
+  };
+}
+
+function defaultAnalysisInputs(item = currentCase()) {
+  return {
+    age: String(item.age ?? ""),
+    sex: item.sex || "",
+    bmi: String(item.bmi ?? ""),
+    bloodPressure: item.bloodPressure || "",
+    heartRate: item.heartRate || "",
+    familyHistory: "冠心病家族史：阳性",
+    caseInput: item.history,
+    symptoms: item.symptoms.join("、"),
+    exams: item.exams.join("\n"),
+    diagnosisReport: `主诉：${item.symptoms.join("、")}
+病史：${item.history}
+初步意见：需要结合心电图、血脂、冠脉影像和医生判断。`,
+  };
+}
+
+function analysisInputValue(key, item = currentCase()) {
+  const currentInputs = {
+    ...defaultAnalysisInputs(item),
+    ...(state.analysisInputs || {}),
+  };
+  return currentInputs[key] ?? "";
+}
+
+function collectAnalysisPayload() {
+  const inputs = {
+    age: document.querySelector('[data-analysis-meta="age"]')?.value || "",
+    sex: document.querySelector('[data-analysis-meta="sex"]')?.value || "",
+    bmi: document.querySelector('[data-analysis-meta="bmi"]')?.value || "",
+    bloodPressure:
+      document.querySelector('[data-analysis-meta="bloodPressure"]')?.value || "",
+    heartRate: document.querySelector('[data-analysis-meta="heartRate"]')?.value || "",
+    familyHistory:
+      document.querySelector('[data-analysis-meta="familyHistory"]')?.value || "",
+    caseInput: document.querySelector('[data-analysis-input="caseInput"]')?.value || "",
+    symptoms: document.querySelector('[data-analysis-input="symptoms"]')?.value || "",
+    exams: document.querySelector('[data-analysis-input="exams"]')?.value || "",
+    diagnosisReport:
+      document.querySelector('[data-analysis-input="diagnosisReport"]')?.value || "",
+  };
+  const checkedSymptoms = Array.from(
+    document.querySelectorAll("[data-symptom-checkbox]:checked")
+  )
+    .map((input) => input.getAttribute("data-symptom-checkbox"))
+    .filter(Boolean);
+  if (!inputs.symptoms.trim() && checkedSymptoms.length) {
+    inputs.symptoms = checkedSymptoms.join("、");
+  }
+  const model =
+    document.querySelector("[data-analysis-model]")?.value || state.selectedAnalysisModel;
+  return { model, inputs };
+}
+
+function stringifyAnalysisValue(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item)).join("\n");
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") return JSON.stringify(value, null, 2);
+  return String(value);
+}
+
+function pickAnalysisField(source, keys) {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      return stringifyAnalysisValue(source[key]);
+    }
+  }
+  return "";
+}
+
+function extractAnalysisReport(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const source =
+    payload.data && typeof payload.data === "object"
+      ? payload.data
+      : payload.result && typeof payload.result === "object"
+        ? payload.result
+        : payload.delta && typeof payload.delta === "object"
+          ? payload.delta
+          : payload;
+  const report = {
+    diagnosis: pickAnalysisField(source, ["diagnosis", "综合诊断结果", "综合诊断", "result"]),
+    findings: pickAnalysisField(source, ["findings", "关键发现", "key_findings", "keyFindings"]),
+    analysis: pickAnalysisField(source, ["analysis", "AI分析", "AI 分析", "ai_analysis", "aiAnalysis"]),
+    advice: pickAnalysisField(source, ["advice", "临床建议", "recommendation", "recommendations"]),
+  };
+  return Object.values(report).some((value) => value.trim()) ? report : null;
+}
+
+function normalizeAnalysisReport(payload) {
+  const report = extractAnalysisReport(payload);
+  if (!report) {
+    throw new Error("API 响应中没有 diagnosis/findings/analysis/advice 字段");
+  }
+  return report;
+}
+
+function mergeAnalysisReports(base, update) {
+  const merged = { ...emptyAnalysisReport(), ...(base || {}) };
+  for (const { key } of analysisReportFields) {
+    if (update?.[key]?.trim()) {
+      merged[key] = update[key];
+    }
+  }
+  return merged;
+}
+
+function collectJsonCandidates(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const candidates = [trimmed];
+  for (const eventBlock of trimmed.split(/\r?\n\r?\n/)) {
+    const data = eventBlock
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .filter((line) => line && line !== "[DONE]")
+      .join("\n");
+    if (data) candidates.push(data);
+  }
+  for (const line of trimmed.split(/\r?\n/)) {
+    const candidate = line.trim().startsWith("data:")
+      ? line.trim().slice(5).trim()
+      : line.trim();
+    if (candidate && candidate !== "[DONE]") candidates.push(candidate);
+  }
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  return Array.from(new Set(candidates));
+}
+
+function parseAnalysisStreamPayload(text) {
+  const candidates = collectJsonCandidates(text);
+  let mergedReport = null;
+  for (const candidate of candidates) {
+    try {
+      const payload = JSON.parse(candidate);
+      const report = extractAnalysisReport(payload);
+      if (report) mergedReport = mergeAnalysisReports(mergedReport, report);
+    } catch (error) {
+      // Partial stream chunks are expected to be invalid JSON until enough text arrives.
+    }
+  }
+  return mergedReport;
+}
+
+function parseAnalysisResponseText(text, contentType = "") {
+  const report = parseAnalysisStreamPayload(text);
+  if (report) return report;
+
+  const trimmed = text.trim();
+  const isSse = contentType.includes("text/event-stream") || trimmed.startsWith("data:");
+  if (isSse) {
+    throw new Error("API 返回了 SSE 流，但没有包含 diagnosis/findings/analysis/advice 字段");
+  }
+
+  try {
+    return normalizeAnalysisReport(JSON.parse(trimmed));
+  } catch (error) {
+    throw new Error(`API 响应不是有效的结构化 JSON：${error.message}`);
+  }
+}
+
+async function readAnalysisResponse(response) {
+  const contentType = response.headers?.get("Content-Type") || "";
+  const reader = response.body?.getReader();
+  analysisDebug("response:body-reader", {
+    hasReader: Boolean(reader),
+    contentType,
+  });
+  if (!reader) {
+    const text = await response.text();
+    analysisDebug("response:text-body", {
+      chars: text.length,
+      preview: text.slice(0, 320),
+    });
+    return parseAnalysisResponseText(text, contentType);
+  }
+
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let latestReport = null;
+  let chunkIndex = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunkIndex += 1;
+    buffer += decoder.decode(value, { stream: true });
+    const streamedReport = parseAnalysisStreamPayload(buffer);
+    if (streamedReport) latestReport = mergeAnalysisReports(latestReport, streamedReport);
+    analysisDebug("stream:chunk", {
+      chunkIndex,
+      bytes: value?.byteLength || 0,
+      bufferChars: buffer.length,
+      latestFieldLengths: latestReport ? analysisReportLengths(latestReport) : null,
+    });
+  }
+
+  buffer += decoder.decode();
+  const finalReport = parseAnalysisStreamPayload(buffer);
+  analysisDebug("stream:done", {
+    chunks: chunkIndex,
+    bufferChars: buffer.length,
+    hasFinalReport: Boolean(finalReport),
+    hasLatestReport: Boolean(latestReport),
+  });
+  if (finalReport) {
+    const merged = mergeAnalysisReports(latestReport, finalReport);
+    analysisDebug("stream:report", {
+      fieldLengths: analysisReportLengths(merged),
+    });
+    return merged;
+  }
+  if (latestReport) {
+    analysisDebug("stream:report", {
+      fieldLengths: analysisReportLengths(latestReport),
+    });
+    return latestReport;
+  }
+  analysisDebug("stream:unparsed-buffer-preview", buffer.slice(0, 600));
+  return parseAnalysisResponseText(buffer, contentType);
+}
+
+async function requestAnalysis(payload) {
+  const startedAt = performance.now();
+  analysisDebug("request:start", {
+    url: ANALYSIS_API_URL,
+    ...analysisPayloadSummary(payload),
+  });
+  const response = await fetch(ANALYSIS_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify(payload),
+  });
+  analysisDebug("response:headers", {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    contentType: response.headers?.get("Content-Type") || "",
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    analysisDebug("response:error-body", detail.slice(0, 600));
+    throw new Error(
+      `${ANALYSIS_API_URL} 返回 ${response.status} ${response.statusText}${
+        detail ? `：${detail.slice(0, 240)}` : ""
+      }`
+    );
+  }
+  const report = await readAnalysisResponse(response);
+  analysisDebug("request:complete", {
+    elapsedMs: Math.round(performance.now() - startedAt),
+    fieldLengths: analysisReportLengths(report),
+  });
+  return report;
 }
 
 function renderSidebar() {
@@ -471,6 +812,8 @@ function renderSidebar() {
 
 function renderTopbar() {
   const meta = pageMeta[state.activeRoute] || pageMeta.dashboard;
+  const modelLabel =
+    state.activeRoute === "diagnosis" ? selectedAnalysisModelLabel() : "CVD-LLM-R2";
   return `
     <header class="topbar">
       <div class="breadcrumb">
@@ -478,7 +821,7 @@ function renderTopbar() {
         <h1 class="page-title">${h(meta.title)}</h1>
       </div>
       <div class="topbar-actions">
-        <span class="status-pill">Model: CVD-LLM-R2</span>
+        <span class="status-pill">Model: ${h(modelLabel)}</span>
         <span class="status-pill">System: Online</span>
         <span class="status-pill warning">Mode: Research Demo</span>
       </div>
@@ -641,11 +984,24 @@ function renderDashboard() {
 function renderDiagnosis() {
   const item = currentCase();
   const finished = state.analysisIndex >= workflow.length;
+  const analysisBusy = state.analysisStatus === "running" || state.analysisStatus === "typing";
+  const statusLabel =
+    state.analysisStatus === "typing"
+      ? "Rendering"
+      : state.analysisStatus === "complete"
+        ? "Completed"
+        : state.analysisStatus === "error"
+          ? "Error"
+          : state.analysisStatus === "running" && !state.analyzing
+            ? "Waiting API"
+            : state.analyzing
+              ? "Running"
+              : "Ready";
   return `
     <div class="page-grid">
       <div class="notice research">
         <strong>AI-generated / Research Demo</strong>
-        <span>以下患者信息、结论和建议均为演示数据，用于验证前端交互与结构化输出。</span>
+        <span>病例分析模块已接入 /api/analyze，当前输出由后端返回的结构化 JSON 动态驱动。</span>
       </div>
       <section class="diagnosis-layout">
         <div class="panel">
@@ -656,21 +1012,32 @@ function renderDiagnosis() {
             </div>
           </div>
           <div class="input-grid">
-            <div class="field"><label>年龄</label><input class="input" value="${h(item.age)}" /></div>
-            <div class="field"><label>性别</label><select class="select"><option>${h(item.sex)}</option><option>女</option><option>男</option></select></div>
-            <div class="field"><label>BMI</label><input class="input" value="${h(item.bmi)}" /></div>
-            <div class="field"><label>血压</label><input class="input" value="${h(item.bloodPressure)}" /></div>
-            <div class="field"><label>心率</label><input class="input" value="${h(item.heartRate)}" /></div>
-            <div class="field"><label>家族史</label><input class="input" value="冠心病家族史：阳性" /></div>
+            <div class="field"><label>年龄</label><input class="input" data-analysis-meta="age" value="${h(analysisInputValue("age", item))}" /></div>
+            <div class="field"><label>性别</label><select class="select" data-analysis-meta="sex">
+              ${["男", "女"]
+                .map(
+                  (sex) => `<option value="${h(sex)}" ${analysisInputValue("sex", item) === sex ? "selected" : ""}>${h(sex)}</option>`
+                )
+                .join("")}
+            </select></div>
+            <div class="field"><label>BMI</label><input class="input" data-analysis-meta="bmi" value="${h(analysisInputValue("bmi", item))}" /></div>
+            <div class="field"><label>血压</label><input class="input" data-analysis-meta="bloodPressure" value="${h(analysisInputValue("bloodPressure", item))}" /></div>
+            <div class="field"><label>心率</label><input class="input" data-analysis-meta="heartRate" value="${h(analysisInputValue("heartRate", item))}" /></div>
+            <div class="field"><label>家族史</label><input class="input" data-analysis-meta="familyHistory" value="${h(analysisInputValue("familyHistory", item))}" /></div>
+          </div>
+          <div class="report-section">
+            <h3>病例输入</h3>
+            <textarea class="textarea" data-analysis-input="caseInput">${h(analysisInputValue("caseInput", item))}</textarea>
           </div>
           <div class="report-section">
             <h3>临床症状</h3>
+            <textarea class="textarea compact-textarea" data-analysis-input="symptoms">${h(analysisInputValue("symptoms", item))}</textarea>
             <div class="check-list">
               ${["胸痛", "胸闷", "心悸", "呼吸困难", "晕厥", "活动后气短"]
                 .map(
                   (symptom) => `
                   <label class="check-pill">
-                    <input type="checkbox" ${item.symptoms.some((s) => s.includes(symptom)) ? "checked" : ""} />
+                    <input type="checkbox" data-symptom-checkbox="${h(symptom)}" ${item.symptoms.some((s) => s.includes(symptom)) ? "checked" : ""} />
                     ${h(symptom)}
                   </label>`
                 )
@@ -679,13 +1046,11 @@ function renderDiagnosis() {
           </div>
           <div class="report-section">
             <h3>检查结果</h3>
-            <textarea class="textarea">${h(item.exams.join("\n"))}</textarea>
+            <textarea class="textarea" data-analysis-input="exams">${h(analysisInputValue("exams", item))}</textarea>
           </div>
           <div class="report-section">
             <h3>病例诊断报告</h3>
-            <textarea class="textarea">主诉：${h(item.symptoms.join("、"))}
-病史：${h(item.history)}
-初步意见：需要结合心电图、血脂、冠脉影像和医生判断。</textarea>
+            <textarea class="textarea" data-analysis-input="diagnosisReport">${h(analysisInputValue("diagnosisReport", item))}</textarea>
           </div>
           <div class="report-section">
             <h3>医学影像上传</h3>
@@ -699,8 +1064,21 @@ function renderDiagnosis() {
               </div>
             </div>
           </div>
+          <div class="report-section">
+            <div class="field">
+              <label for="analysis-model">AI 模型</label>
+              <select id="analysis-model" class="select" data-analysis-model>
+                ${analysisModels
+                  .map(
+                    (model) => `
+                    <option value="${h(model.id)}" ${state.selectedAnalysisModel === model.id ? "selected" : ""}>${h(model.label)}</option>`
+                  )
+                  .join("")}
+              </select>
+            </div>
+          </div>
           <div class="button-row">
-            <button class="button" data-action="start-analysis" ${state.analyzing ? "disabled" : ""}>开始 AI 分析</button>
+            <button class="button" data-action="start-analysis" ${analysisBusy ? "disabled" : ""}>开始 AI 分析</button>
             <button class="button secondary" data-route="cases">选择病例</button>
           </div>
         </div>
@@ -710,7 +1088,7 @@ function renderDiagnosis() {
               <h2 class="panel-title">中间：AI 医学分析过程</h2>
               <p class="panel-kicker">从输入解析到证据检查的医学推理流程可视化。</p>
             </div>
-            <span class="tag ${finished ? "" : "gray"}">${finished ? "Completed" : state.analyzing ? "Running" : "Ready"}</span>
+            <span class="tag ${finished ? "" : "gray"}">${h(statusLabel)}</span>
           </div>
           <div class="workflow-list">
             ${workflow
@@ -739,60 +1117,39 @@ function renderDiagnosis() {
           <div class="panel-header">
             <div>
               <h2 class="panel-title">右侧：结构化诊疗结果</h2>
-              <p class="panel-kicker">报告输出绑定证据，避免无依据生成。</p>
+              <p class="panel-kicker">由后端返回的 diagnosis / findings / analysis / advice 字段生成。</p>
             </div>
           </div>
-          ${renderStructuredReport(item, finished)}
+          ${renderStructuredReport()}
         </div>
       </section>
     </div>
   `;
 }
 
-function renderStructuredReport(item, finished = true) {
-  if (!finished) {
-    return `
-      <div class="empty-state">
-        点击“开始 AI 分析”后，系统将模拟知识检索、风险预测、证据一致性检查并生成结构化报告。
-      </div>
-    `;
-  }
-  return `
-    <div class="report-section">
-      <h3>综合诊断</h3>
-      <p><strong>${h(item.disease)}</strong></p>
-    </div>
-    <div class="report-section">
-      <h3>风险等级</h3>
-      <div class="risk-band">
-        <div class="risk-cell low">低风险</div>
-        <div class="risk-cell mid ${item.risk.includes("中") ? "active" : ""}">中风险</div>
-        <div class="risk-cell high ${item.risk.includes("高") ? "active" : ""}">高风险</div>
-      </div>
-      <p>Confidence：<strong>${h(item.confidence)}%</strong></p>
-    </div>
-    <div class="report-section">
-      <h3>关键发现</h3>
-      <ol>${item.findings.map((finding) => `<li>${h(finding)}</li>`).join("")}</ol>
-    </div>
-    <div class="report-section">
-      <h3>医学证据 Evidence</h3>
-      ${tags(item.evidence)}
-    </div>
-    <div class="report-section">
-      <h3>AI 分析</h3>
-      <p>该病例在胸痛症状、血脂异常、高血压病史和冠脉影像证据上形成较强关联；模型将其归入需要进一步心血管专科评估的高风险队列。</p>
-    </div>
-    <div class="report-section">
-      <h3>临床建议</h3>
-      <p>${h(item.recommendation)}</p>
-    </div>
-    <div class="report-section">
-      <h3>证据一致性</h3>
-      ${progress(item.consistency)}
-      <p>Evidence Consistency：<strong>${h(item.consistency)}%</strong></p>
-    </div>
-  `;
+function renderStructuredReport() {
+  const report = state.analysisDraft || emptyAnalysisReport();
+  const placeholder =
+    state.analysisStatus === "running"
+      ? "AI 分析完成后显示结果。"
+      : state.analysisStatus === "error"
+        ? "API 请求失败，详情请查看浏览器控制台。"
+        : "等待分析结果。";
+
+  return analysisReportFields
+    .map(({ key, label }) => {
+      const value = report[key] || "";
+      const isTyping = state.analysisStatus === "typing" && state.typingField === key;
+      return `
+        <div class="report-section">
+          <h3>${h(label)}</h3>
+          <p class="structured-output ${value ? "" : "placeholder"}">${h(value || placeholder)}${
+            isTyping ? '<span class="typing-cursor" aria-hidden="true"></span>' : ""
+          }</p>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function renderEvidence() {
@@ -1476,7 +1833,7 @@ function renderSettings() {
         <div class="constraint-grid">
           ${[
             ["/api/cases", "病例列表、详情、上传报告"],
-            ["/api/analysis/start", "启动 AI 分析任务"],
+            ["/api/analyze", "病例分析模块文本大模型流式输出"],
             ["/api/prediction/risk", "心血管风险预测"],
             ["/api/reports/generate", "结构化医学报告生成"],
             ["/api/evidence/check", "证据一致性分析"],
@@ -1537,19 +1894,131 @@ function setRoute(route) {
   render();
 }
 
-function startAnalysis() {
+function stopAnalysisTimers() {
   clearInterval(analysisTimer);
+  clearInterval(typewriterTimer);
+  analysisTimer = null;
+  typewriterTimer = null;
+}
+
+function runAnalysisWorkflow(runId) {
+  return new Promise((resolve) => {
+    analysisDebug("workflow:start", {
+      runId,
+      steps: workflow.length,
+    });
+    analysisTimer = setInterval(() => {
+      if (runId !== state.analysisRunId) {
+        clearInterval(analysisTimer);
+        resolve();
+        return;
+      }
+      state.analysisIndex += 1;
+      if (state.analysisIndex >= workflow.length) {
+        state.analyzing = false;
+        clearInterval(analysisTimer);
+        analysisTimer = null;
+        analysisDebug("workflow:complete", { runId });
+        resolve();
+      }
+      render();
+    }, 650);
+  });
+}
+
+function typeAnalysisResult(report, runId) {
+  return new Promise((resolve) => {
+    clearInterval(typewriterTimer);
+    state.analysisDraft = emptyAnalysisReport();
+    state.analysisStatus = "typing";
+    state.typingField = analysisReportFields[0]?.key || "";
+    let fieldIndex = 0;
+    let charIndex = 0;
+
+    typewriterTimer = setInterval(() => {
+      if (runId !== state.analysisRunId) {
+        clearInterval(typewriterTimer);
+        resolve();
+        return;
+      }
+
+      const field = analysisReportFields[fieldIndex];
+      if (!field) {
+        clearInterval(typewriterTimer);
+        typewriterTimer = null;
+        state.analysisDraft = { ...report };
+        state.analysisStatus = "complete";
+        state.typingField = "";
+        render();
+        resolve();
+        return;
+      }
+
+      const text = report[field.key] || "";
+      state.typingField = field.key;
+      state.analysisDraft[field.key] = text.slice(0, charIndex);
+      charIndex += 1;
+
+      if (charIndex > text.length + 1) {
+        fieldIndex += 1;
+        charIndex = 0;
+      }
+
+      render();
+    }, 22);
+  });
+}
+
+async function startAnalysis() {
+  const payload = collectAnalysisPayload();
+  const runId = state.analysisRunId + 1;
+  stopAnalysisTimers();
+  state.analysisRunId = runId;
   state.analyzing = true;
+  state.analysisStatus = "running";
   state.analysisIndex = 0;
+  state.selectedAnalysisModel = payload.model;
+  state.analysisInputs = { ...payload.inputs };
+  state.analysisResult = null;
+  state.analysisDraft = emptyAnalysisReport();
+  state.analysisError = "";
+  state.typingField = "";
   render();
-  analysisTimer = setInterval(() => {
-    state.analysisIndex += 1;
-    if (state.analysisIndex >= workflow.length) {
-      state.analyzing = false;
-      clearInterval(analysisTimer);
-    }
+
+  const requestPromise = requestAnalysis(payload);
+  analysisDebug("request:dispatched", {
+    runId,
+    note: "fetch 已在中间动画启动前派发，模型推理不会等待动画结束。",
+  });
+  const workflowPromise = runAnalysisWorkflow(runId);
+  try {
+    const report = await requestPromise;
+    analysisDebug("request:report-ready", {
+      runId,
+      fieldLengths: analysisReportLengths(report),
+    });
+    await workflowPromise;
+    if (runId !== state.analysisRunId) return;
+    state.analyzing = false;
+    state.analysisIndex = workflow.length;
+    state.analysisResult = report;
+    await typeAnalysisResult(report, runId);
+  } catch (error) {
+    if (runId !== state.analysisRunId) return;
+    console.error("病例分析 API 调用失败：", error);
+    stopAnalysisTimers();
+    state.analyzing = false;
+    state.analysisStatus = "error";
+    state.analysisError = error?.message || "未知错误";
+    const friendlyError = state.analysisError.split("：")[0];
+    state.analysisDraft = {
+      diagnosis: "",
+      findings: "",
+      analysis: `AI 分析请求失败：${friendlyError}`,
+      advice: "请确认 /api/analyze 后端服务已启动、接口路径一致，并查看浏览器控制台中的错误详情。",
+    };
     render();
-  }, 650);
+  }
 }
 
 function drawCanvasBase(canvas) {
@@ -1712,7 +2181,16 @@ document.addEventListener("click", (event) => {
   if (routeButton) {
     const caseId = routeButton.getAttribute("data-case");
     const sourceId = routeButton.getAttribute("data-source");
-    if (caseId) state.selectedCaseId = caseId;
+    if (caseId && caseId !== state.selectedCaseId) {
+      stopAnalysisTimers();
+      state.analysisRunId += 1;
+      state.selectedCaseId = caseId;
+      state.analyzing = false;
+      state.analysisInputs = null;
+      state.analysisStatus = "idle";
+      state.analysisDraft = emptyAnalysisReport();
+      state.analysisIndex = -1;
+    }
     if (sourceId) state.selectedSourceId = sourceId;
     setRoute(routeButton.getAttribute("data-route"));
     return;
@@ -1736,7 +2214,17 @@ document.addEventListener("click", (event) => {
 
   const caseButton = event.target.closest("[data-case]");
   if (caseButton) {
-    state.selectedCaseId = caseButton.getAttribute("data-case");
+    const nextCaseId = caseButton.getAttribute("data-case");
+    if (nextCaseId !== state.selectedCaseId) {
+      stopAnalysisTimers();
+      state.analysisRunId += 1;
+      state.selectedCaseId = nextCaseId;
+      state.analyzing = false;
+      state.analysisInputs = null;
+      state.analysisStatus = "idle";
+      state.analysisDraft = emptyAnalysisReport();
+      state.analysisIndex = -1;
+    }
     render();
     return;
   }
@@ -1763,6 +2251,17 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.matches("[data-analysis-input], [data-analysis-meta]")) {
+    const key =
+      event.target.getAttribute("data-analysis-input") ||
+      event.target.getAttribute("data-analysis-meta");
+    state.analysisInputs = {
+      ...defaultAnalysisInputs(currentCase()),
+      ...(state.analysisInputs || {}),
+      [key]: event.target.value,
+    };
+  }
+
   if (event.target.matches("[data-paper-search]")) {
     const cursor = event.target.selectionStart || event.target.value.length;
     state.paperSearch = event.target.value;
@@ -1772,6 +2271,37 @@ document.addEventListener("input", (event) => {
       input.focus();
       input.setSelectionRange(cursor, cursor);
     }
+  }
+});
+
+document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-analysis-model]")) {
+    state.selectedAnalysisModel = event.target.value;
+    render();
+    return;
+  }
+
+  if (event.target.matches('[data-analysis-meta="sex"]')) {
+    state.analysisInputs = {
+      ...defaultAnalysisInputs(currentCase()),
+      ...(state.analysisInputs || {}),
+      sex: event.target.value,
+    };
+    return;
+  }
+
+  if (event.target.matches("[data-symptom-checkbox]")) {
+    const symptoms = Array.from(document.querySelectorAll("[data-symptom-checkbox]:checked"))
+      .map((input) => input.getAttribute("data-symptom-checkbox"))
+      .filter(Boolean)
+      .join("、");
+    const textarea = document.querySelector('[data-analysis-input="symptoms"]');
+    if (textarea) textarea.value = symptoms;
+    state.analysisInputs = {
+      ...defaultAnalysisInputs(currentCase()),
+      ...(state.analysisInputs || {}),
+      symptoms,
+    };
   }
 });
 
