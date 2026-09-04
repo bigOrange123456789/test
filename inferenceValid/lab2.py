@@ -1,11 +1,17 @@
-import openai # pip install openai
-
+import argparse
 import json
 import os
 import re
+import sys
 from collections import defaultdict
+from threading import Thread
 DEFAULT_SYSTEM_PROMPT = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"#"请用简洁、简短的语言回答用户的问题"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def configure_stdout():
+  if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def mask_api_key(api_key):
   if not api_key:
@@ -91,6 +97,12 @@ def short_error_message(error):
 
 
 def print_available_remote_models(config):
+  try:
+    import openai # pip install openai
+  except ImportError:
+    print("当前环境未安装 openai，无法检查远程 API 模型列表。")
+    return
+
   print("========== 远程 API 可用模型检查 ==========")
 
   grouped = defaultdict(list)
@@ -193,15 +205,33 @@ def load_local_models(config):
       print(f"[{model_id}] 本地模型加载失败：{cfg['load_error']}")
 
 
+def parse_args():
+  parser = argparse.ArgumentParser(description="多目标大模型对话脚本，支持本地模型和远程 API。")
+  stream_group = parser.add_mutually_exclusive_group()
+  stream_group.add_argument("--stream", action="store_true", dest="stream", help="开启流式输出。")
+  stream_group.add_argument("--no-stream", action="store_false", dest="stream", help="关闭流式输出。")
+  parser.add_argument("--max-new-tokens", type=int, default=1000, help="模型单次回答最多生成的 token 数。")
+  parser.add_argument("--temperature", type=float, default=0.001, help="生成温度，数值越高随机性越强。")
+  parser.add_argument("--top-p", type=float, default=0.95, help="本地模型 nucleus sampling 的 top_p 参数。")
+  parser.add_argument("--repetition-penalty", type=float, default=1.1, help="本地模型重复惩罚系数。")
+  parser.add_argument("--check-remote-models", action="store_true", help="启动时检查远程 API 当前配置模型是否可用。")
+  parser.set_defaults(stream=True)
+  return parser.parse_args()
+
+
+configure_stdout()
+args = parse_args()
 config = load_config()
 # print_config_summary(config)
-if  False:
+if args.check_remote_models:
   print_available_remote_models(config)
 
 param={
-  "max_new_tokens":1000,#256,#512      # 最大生成长度
-  "temperature":0.001,#0.1,#0.7,#0.6           # 控制随机性（0=确定性，越高越随机）
-  "stream" : False,
+  "max_new_tokens":args.max_new_tokens,#256,#512      # 最大生成长度
+  "temperature":args.temperature,#0.1,#0.7,#0.6           # 控制随机性（0=确定性，越高越随机）
+  "top_p":args.top_p,
+  "repetition_penalty":args.repetition_penalty,
+  "stream" : args.stream,
   # "enable_thinking":False, 
 }
 
@@ -232,22 +262,40 @@ def chat_with_model(modelId, question):
       )
       # 分词并转移到模型所在设备
       inputs = tokenizer(text, return_tensors="pt").to(model.device)
-      # 生成回复
-      outputs = model.generate(
+      generation_kwargs = {
           **inputs,
-          max_new_tokens=256,#param["max_new_tokens"],#256,#512      # 最大生成长度
-          temperature=param["temperature"],#0.1,#0.6           # 控制随机性（0=确定性，越高越随机）
-          top_p=0.95,                  # 核采样阈值
-          do_sample=True,              # 启用采样（否则为贪心解码）
-          repetition_penalty=1.1,      # 重复惩罚
-          pad_token_id=tokenizer.eos_token_id #填充标记（
-      )
-      # 解码生成部分（仅保留新生成的token）
-      response = tokenizer.decode(
-          outputs[0][inputs.input_ids.shape[1]:],
-          skip_special_tokens=True
-      )
+          "max_new_tokens":param["max_new_tokens"],#256,#512      # 最大生成长度
+          "temperature":param["temperature"],#0.1,#0.6           # 控制随机性（0=确定性，越高越随机）
+          "top_p":param["top_p"],                  # 核采样阈值
+          "do_sample":param["temperature"] > 0,              # 启用采样（否则为贪心解码）
+          "repetition_penalty":param["repetition_penalty"],      # 重复惩罚
+          "pad_token_id":tokenizer.eos_token_id #填充标记（
+      }
+      if param["stream"]:
+        from transformers import TextIteratorStreamer
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs["streamer"] = streamer
+        generation_thread = Thread(target=model.generate, kwargs=generation_kwargs, daemon=True)
+        generation_thread.start()
+        response_parts = []
+        print(" "+modelId+":", end="", flush=True)
+        for content in streamer:
+          response_parts.append(content)
+          print(content, end="", flush=True)
+        generation_thread.join()
+        print()
+        response = "".join(response_parts)
+      else:
+        # 生成回复
+        outputs = model.generate(**generation_kwargs)
+        # 解码生成部分（仅保留新生成的token）
+        response = tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:],
+            skip_special_tokens=True
+        )
     else:
+      import openai # pip install openai
+
       client = openai.OpenAI(
         api_key=cfg["api_key"],
         base_url=cfg["base_url"]

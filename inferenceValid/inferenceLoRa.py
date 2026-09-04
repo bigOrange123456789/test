@@ -23,6 +23,7 @@ import sys
 from collections import defaultdict
 from importlib import metadata
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 
@@ -356,6 +357,7 @@ def remove_thinking_text(text: str) -> str:
 
 
 def generate_local_answer(
+    model_id: str,
     model: Any,
     tokenizer: Any,
     device: str,
@@ -364,21 +366,41 @@ def generate_local_answer(
 ) -> str:
     """使用本地 DeepSeek 或 DeepSeek+LoRA 根据对话历史生成回答。"""
     import torch
+    from transformers import TextIteratorStreamer
 
     prompt = build_prompt(tokenizer, messages)
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    generation_kwargs = {
+        **inputs,
+        "max_new_tokens": args.max_new_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "do_sample": args.temperature > 0,
+        "repetition_penalty": args.repetition_penalty,
+        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+
+    if args.stream:
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs["streamer"] = streamer
+        generation_thread = Thread(target=model.generate, kwargs=generation_kwargs, daemon=True)
+        generation_thread.start()
+
+        answer_parts = []
+        print(f" {model_id}:", end="", flush=True)
+        for content in streamer:
+            answer_parts.append(content)
+            print(content, end="", flush=True)
+        generation_thread.join()
+        print()
+        answer = "".join(answer_parts)
+        if args.strip_thinking:
+            answer = remove_thinking_text(answer)
+        return answer.strip()
 
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            do_sample=args.temperature > 0,
-            repetition_penalty=args.repetition_penalty,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        outputs = model.generate(**generation_kwargs)
 
     generated_ids = outputs[0][inputs.input_ids.shape[1] :]
     answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -438,7 +460,7 @@ def chat_with_model(model_id: str, question: str, config: dict[str, dict[str, An
     try:
         if is_local_config(model_id, cfg):
             model, tokenizer, device = load_local_target(model_id, cfg, args)
-            answer = generate_local_answer(model, tokenizer, device, cfg["messages"], args)
+            answer = generate_local_answer(model_id, model, tokenizer, device, cfg["messages"], args)
         else:
             answer = call_remote_model(model_id, cfg, args)
     except Exception as error:
@@ -512,9 +534,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetition-penalty", type=float, default=1.1)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--api-timeout", type=float, default=60)
-    parser.add_argument("--stream", action="store_true", help="Stream remote API output.")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--check-remote-models", action="store_true", help="Check remote API model availability on startup.")
+
+    stream_group = parser.add_mutually_exclusive_group()
+    stream_group.add_argument("--stream", action="store_true", dest="stream", help="Stream local and remote model output.")
+    stream_group.add_argument("--no-stream", action="store_false", dest="stream", help="Disable streaming output.")
 
     lora_group = parser.add_mutually_exclusive_group()
     lora_group.add_argument("--use-lora", action="store_true", dest="use_lora", help="Force local targets to use lora_adapter.")
@@ -526,7 +551,7 @@ def parse_args() -> argparse.Namespace:
         dest="strip_thinking",
         help="Keep text before </think> if the model emits it.",
     )
-    parser.set_defaults(strip_thinking=True, use_lora=None)
+    parser.set_defaults(strip_thinking=True, use_lora=None, stream=True)
     return parser.parse_args()
 
 
@@ -544,7 +569,8 @@ def main() -> None:
     model_id = choose_initial_model(config, args.model_id)
     if args.question:
         answer = chat_with_model(model_id, args.question, config, args)
-        print(answer)
+        if not args.stream:
+            print(answer)
     else:
         interactive_loop(config, args)
 
