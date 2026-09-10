@@ -1,4 +1,6 @@
 import argparse
+import base64
+import io
 import json
 import os
 import re
@@ -194,7 +196,13 @@ def load_local_transformers_model(model_path):
     # 这里默认只做文本对话。AutoProcessor 会加载图像/视频处理依赖，
     # Qwen3-VL 的视频处理器需要 torchvision；纯文本场景用 tokenizer 即可。
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    return model, tokenizer, None, "vision_language"
+    try:
+      from transformers import Qwen2VLImageProcessorPil
+      image_processor = Qwen2VLImageProcessorPil.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as error:
+      image_processor = None
+      print(f"视觉模型图片处理器加载失败，网页图片问答将不可用：{short_error_message(error)}")
+    return model, tokenizer, None, image_processor, "vision_language"
 
   model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -203,7 +211,7 @@ def load_local_transformers_model(model_path):
         trust_remote_code=True,
   )
   tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-  return model, tokenizer, None, "causal_lm"
+  return model, tokenizer, None, None, "causal_lm"
 
 
 def load_local_models(config):
@@ -224,7 +232,7 @@ def load_local_models(config):
       continue
 
     try:
-      model, tokenizer, processor, local_model_kind = load_local_transformers_model(model_path)
+      model, tokenizer, processor, image_processor, local_model_kind = load_local_transformers_model(model_path)
 
       lora_adapter = cfg.get("lora_adapter")
       if lora_adapter:
@@ -238,6 +246,7 @@ def load_local_models(config):
       cfg["model"] = model
       cfg["tokenizer"] = tokenizer
       cfg["processor"] = processor
+      cfg["image_processor"] = image_processor
       cfg["local_model_kind"] = local_model_kind
       cfg["resolved_model_path"] = model_path
       if cfg.get("lora_adapter"):
@@ -262,10 +271,60 @@ def parse_args():
   return parser.parse_args()
 
 
-def build_local_model_inputs(cfg):
+def decode_image_data_url(image_data_url):
+  if not image_data_url:
+    return None
+  if "," in image_data_url:
+    _, image_data = image_data_url.split(",", 1)
+  else:
+    image_data = image_data_url
+
+  try:
+    from PIL import Image
+  except ImportError as error:
+    raise ImportError("当前环境未安装 pillow，无法读取网页上传的图片。请先执行 pip install pillow") from error
+
+  image_bytes = base64.b64decode(image_data)
+  return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+def build_user_message(question, image=None):
+  if image is None:
+    return {"role": "user", "content": question}
+  text = question.strip() if question and question.strip() else "请描述这张图片。"
+  return {
+    "role": "user",
+    "content": [
+      {"type": "image"},
+      {"type": "text", "text": text},
+    ],
+  }
+
+
+def build_history_user_message(question, has_image=False):
+  text = question.strip() if question and question.strip() else "请描述这张图片。"
+  if has_image:
+    text = f"[用户上传了一张图片] {text}"
+  return {"role": "user", "content": text}
+
+
+def expand_image_tokens_in_text(texts, image_grid_thw, image_processor, tokenizer):
+  image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
+  merge_length = image_processor.merge_size ** 2
+  image_index = 0
+
+  for text_index in range(len(texts)):
+    while image_token in texts[text_index]:
+      num_image_tokens = int(image_grid_thw[image_index].prod().item() // merge_length)
+      texts[text_index] = texts[text_index].replace(image_token, "<|placeholder|>" * num_image_tokens, 1)
+      image_index += 1
+    texts[text_index] = texts[text_index].replace("<|placeholder|>", image_token)
+  return texts
+
+
+def build_local_model_inputs(cfg, messages, image=None):
   tokenizer = cfg["tokenizer"]
   processor = cfg.get("processor")
-  messages = cfg["messages"]
 
   if cfg.get("local_model_kind") == "vision_language":
     if processor is not None and hasattr(processor, "apply_chat_template"):
@@ -280,6 +339,15 @@ def build_local_model_inputs(cfg):
           tokenize=False,
           add_generation_prompt=True
       )
+    if image is not None:
+      image_processor = cfg.get("image_processor")
+      if image_processor is None:
+        raise RuntimeError("当前视觉模型没有可用的图片处理器，无法进行图片问答。")
+      image_inputs = image_processor(images=[image], return_tensors="pt")
+      texts = expand_image_tokens_in_text([text], image_inputs["image_grid_thw"], image_processor, tokenizer)
+      text_inputs = tokenizer(texts, return_tensors="pt", padding=True)
+      text_inputs.update(image_inputs)
+      return text_inputs
     if processor is not None:
       return processor(text=[text], return_tensors="pt", padding=True)
     return tokenizer(text, return_tensors="pt")
@@ -344,21 +412,25 @@ modelId=""
 for modelId in config:
   config[modelId]["messages"]=[{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
   # config[modelId]["messages"]=[{"role": "system", "content": "请专业且详细的回答用户的问题"}]
-def chat_with_model(modelId, question):
-  if not question:
-    return "Please enter a question~"
+def chat_with_model(modelId, question, image_data_url=None):
   try:
+    image = decode_image_data_url(image_data_url) if image_data_url else None
+    if not question and image is None:
+      return "Please enter a question~"
     cfg = config[modelId]
-    cfg["messages"].append({"role": "user", "content": question})
+    request_user_message = build_user_message(question, image=image)
+    generation_messages = cfg["messages"] + [request_user_message]
     if is_local_config(modelId, cfg):
       if "load_error" in cfg:
         return f"本地模型未加载成功：{cfg['load_error']}"
       if "model" not in cfg or "tokenizer" not in cfg:
         return "本地模型未加载成功：缺少 model 或 tokenizer"
+      if image is not None and cfg.get("local_model_kind") != "vision_language":
+        return "当前本地模型不是视觉语言模型，不能处理图片。请切换到 myQwen 后再上传图片。"
 
       model=cfg["model"]
       tokenizer=cfg["tokenizer"]
-      inputs = build_local_model_inputs(cfg).to(model.device)
+      inputs = build_local_model_inputs(cfg, generation_messages, image=image).to(model.device)
       generation_kwargs = local_generation_kwargs(cfg, inputs)
       if param["stream"]:
         from transformers import TextIteratorStreamer
@@ -382,13 +454,23 @@ def chat_with_model(modelId, question):
     else:
       import openai # pip install openai
 
+      remote_messages = cfg["messages"] + [request_user_message]
+      if image_data_url:
+        remote_messages = cfg["messages"] + [{
+          "role": "user",
+          "content": [
+            {"type": "text", "text": question.strip() if question and question.strip() else "请描述这张图片。"},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+          ],
+        }]
+
       client = openai.OpenAI(
         api_key=cfg["api_key"],
         base_url=cfg["base_url"]
       )
       message = client.chat.completions.create(
         model=cfg["model"],
-        messages=cfg["messages"],
+        messages=remote_messages,
         extra_body=cfg.get("extra_body", {}),
         temperature=param["temperature"],
         max_tokens=param["max_new_tokens"], #1000
@@ -408,6 +490,7 @@ def chat_with_model(modelId, question):
         response = message.choices[0].message.content
       import re
       response = re.sub(r'.*?</think>\s*', '', response, flags=re.DOTALL) # 删除Chain of Thought
+    cfg["messages"].append(build_history_user_message(question, has_image=image is not None))
     cfg["messages"].append({"role": "assistant", "content": response})
     return response
   except Exception as e:
@@ -424,10 +507,10 @@ def initUI():# Gradio UI
     send_button.click(chat_with_model, inputs=[model_selector, input_box], outputs=output_box)
   demo.launch(debug=True)
 def initUI2():
-  from flask import Flask, send_from_directory # pip install flask
+  from flask import Flask, jsonify, send_from_directory # pip install flask
   from flask_socketio import SocketIO, emit # pip install flask-socketio
   app = Flask(__name__)
-  socketio = SocketIO(app)
+  socketio = SocketIO(app, max_http_buffer_size=20 * 1024 * 1024)
   # @app.route("/")
   # def index():
   #   return send_from_directory(".", "inferenceValid/test.html") # return send_from_directory(".", "test.html")
@@ -435,12 +518,25 @@ def initUI2():
   def index():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return send_from_directory(script_dir, "test.html")
+  @app.route("/models")
+  def models():
+    vision_model_ids = [
+      model_id
+      for model_id, cfg in config.items()
+      if cfg.get("local_model_kind") == "vision_language"
+    ]
+    return jsonify({
+      "models": list(config.keys()),
+      "defaultModel": vision_model_ids[0] if vision_model_ids else modelId,
+      "visionModels": vision_model_ids
+    })
   @socketio.on("chatMessage")
   def handle_chat_message(data):
     model_id = data["modelId"]
-    question = data["question"]
+    question = data.get("question", "")
+    image_data_url = data.get("imageDataUrl")
     try:
-      response = chat_with_model(model_id, question)
+      response = chat_with_model(model_id, question, image_data_url=image_data_url)
     except Exception as e:
       response = str(e)
     emit("chatResponse", {"response": response})

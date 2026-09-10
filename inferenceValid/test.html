@@ -1,54 +1,305 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>多模型 LLM 聊天界面</title>
-  <!-- <script src="/socket.io/socket.io.js"></script> -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
   <style>
-    body { font-family: Arial, sans-serif; }
-    .container { max-width: 600px; margin: 0 auto; }
-    .row { display: flex; justify-content: space-between; }
-    textarea { width: 100%; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      background: #f6f7f9;
+      color: #1f2937;
+    }
+    .container {
+      width: min(880px, calc(100% - 32px));
+      margin: 32px auto;
+      padding: 24px;
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+    }
+    h2 {
+      margin: 0 0 20px;
+      font-size: 22px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    select,
+    textarea,
+    button {
+      font: inherit;
+    }
+    select {
+      width: 100%;
+      height: 38px;
+      padding: 0 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+    textarea {
+      width: 100%;
+      min-height: 110px;
+      padding: 10px;
+      resize: vertical;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      line-height: 1.5;
+    }
+    button {
+      height: 38px;
+      padding: 0 14px;
+      border: 1px solid #2563eb;
+      border-radius: 6px;
+      background: #2563eb;
+      color: #ffffff;
+      cursor: pointer;
+    }
+    button.secondary {
+      border-color: #cbd5e1;
+      background: #ffffff;
+      color: #1f2937;
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .field {
+      margin-bottom: 16px;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .upload-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .preview {
+      display: none;
+      width: 180px;
+      max-height: 180px;
+      object-fit: contain;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #f8fafc;
+    }
+    .status {
+      min-height: 22px;
+      color: #64748b;
+      font-size: 14px;
+    }
+    .hint {
+      margin-top: 6px;
+      color: #64748b;
+      font-size: 13px;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <h2>💬 多模型 LLM 聊天界面</h2>
-    <div>
-      <label for="modelSelector">选择模型:</label>
-      <select id="modelSelector">
-        <option value="tongyi">tongyi</option>
-        <option value="qianfan">qianfan</option>
-        <option value="deepseek">deepseek</option>
-        <option value="chatgpt">chatgpt</option>
-      </select>
+    <h2>多模型 LLM 聊天界面</h2>
+
+    <div class="field">
+      <label for="modelSelector">选择模型</label>
+      <select id="modelSelector"></select>
+      <div class="hint" id="modelHint"></div>
     </div>
-    <div class="row">
-      <textarea id="inputBox" placeholder="请输入你想问的问题"></textarea>
-      <button id="sendButton">发送</button>
+
+    <div class="field">
+      <label for="imageInput">上传图片</label>
+      <div class="upload-row">
+        <input id="imageInput" type="file" accept="image/*">
+        <button id="clearImageButton" class="secondary" type="button">清除图片</button>
+      </div>
+      <div class="hint">图片会在浏览器中压缩到较小尺寸后发送；建议选择 myQwen 进行图片问答。</div>
     </div>
-    <div>
-      <label for="outputBox">模型回答:</label>
+
+    <div class="field">
+      <img id="imagePreview" class="preview" alt="图片预览">
+    </div>
+
+    <div class="field">
+      <label for="inputBox">你的问题</label>
+      <textarea id="inputBox" placeholder="请输入你想问的问题，例如：请描述这张图片，或者图片中有什么异常？"></textarea>
+      <div class="actions">
+        <button id="sendButton" type="button">发送</button>
+        <span id="statusText" class="status"></span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="outputBox">模型回答</label>
       <textarea id="outputBox" readonly></textarea>
     </div>
   </div>
 
   <script>
     const socket = io();
-    document.getElementById("sendButton").addEventListener("click", () => {
-      const modelId = document.getElementById("modelSelector").value;
-      const question = document.getElementById("inputBox").value;
-      socket.emit("chatMessage", { modelId, question });
-    });
-    socket.on("chatResponse", (data) => {
-      if (data.response) {
-        document.getElementById("outputBox").value = data.response;
+    const modelSelector = document.getElementById("modelSelector");
+    const modelHint = document.getElementById("modelHint");
+    const inputBox = document.getElementById("inputBox");
+    const outputBox = document.getElementById("outputBox");
+    const imageInput = document.getElementById("imageInput");
+    const imagePreview = document.getElementById("imagePreview");
+    const clearImageButton = document.getElementById("clearImageButton");
+    const sendButton = document.getElementById("sendButton");
+    const statusText = document.getElementById("statusText");
+
+    let imageDataUrl = "";
+    let visionModels = [];
+
+    function setStatus(text) {
+      statusText.textContent = text || "";
+    }
+
+    function populateModels(models, defaultModel) {
+      modelSelector.innerHTML = "";
+      models.forEach((modelId) => {
+        const option = document.createElement("option");
+        option.value = modelId;
+        option.textContent = modelId;
+        modelSelector.appendChild(option);
+      });
+      if (defaultModel && models.includes(defaultModel)) {
+        modelSelector.value = defaultModel;
+      }
+      updateModelHint();
+    }
+
+    function updateModelHint() {
+      const modelId = modelSelector.value;
+      if (visionModels.includes(modelId)) {
+        modelHint.textContent = "当前模型支持图片问答。";
       } else {
-        document.getElementById("outputBox").value = "Error: " + data.error;
+        modelHint.textContent = "当前模型主要支持文本；上传图片时建议切换到 myQwen。";
+      }
+    }
+
+    async function loadModels() {
+      try {
+        const response = await fetch("/models");
+        const data = await response.json();
+        visionModels = data.visionModels || [];
+        populateModels(data.models || [], data.defaultModel);
+      } catch (error) {
+        populateModels(["myQwen", "myDeepSeek", "myDeepSeek_LoRA", "deepseek", "tongyi"], "myQwen");
+        setStatus("模型列表读取失败，已使用默认选项。");
+      }
+    }
+
+    function readImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function resizeImage(dataUrl, maxSide = 1024) {
+      return new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => {
+          const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+          const width = Math.max(1, Math.round(image.width * scale));
+          const height = Math.max(1, Math.round(image.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const context = canvas.getContext("2d");
+          context.fillStyle = "#ffffff";
+          context.fillRect(0, 0, width, height);
+          context.drawImage(image, 0, 0, width, height);
+          resolve(canvas.toDataURL("image/jpeg", 0.9));
+        };
+        image.onerror = reject;
+        image.src = dataUrl;
+      });
+    }
+
+    imageInput.addEventListener("change", async () => {
+      const file = imageInput.files && imageInput.files[0];
+      if (!file) {
+        imageDataUrl = "";
+        imagePreview.style.display = "none";
+        return;
+      }
+
+      if (!file.type.startsWith("image/")) {
+        setStatus("请选择图片文件。");
+        imageInput.value = "";
+        return;
+      }
+
+      setStatus("正在处理图片...");
+      try {
+        const rawDataUrl = await readImage(file);
+        imageDataUrl = await resizeImage(rawDataUrl);
+        imagePreview.src = imageDataUrl;
+        imagePreview.style.display = "block";
+        setStatus("图片已准备好。");
+      } catch (error) {
+        imageDataUrl = "";
+        imagePreview.style.display = "none";
+        setStatus("图片读取失败。");
       }
     });
+
+    clearImageButton.addEventListener("click", () => {
+      imageDataUrl = "";
+      imageInput.value = "";
+      imagePreview.removeAttribute("src");
+      imagePreview.style.display = "none";
+      setStatus("");
+    });
+
+    sendButton.addEventListener("click", () => {
+      const modelId = modelSelector.value;
+      const question = inputBox.value;
+      if (!question.trim() && !imageDataUrl) {
+        setStatus("请输入问题或上传图片。");
+        return;
+      }
+
+      sendButton.disabled = true;
+      outputBox.value = "";
+      setStatus("模型正在回答...");
+      socket.emit("chatMessage", {
+        modelId,
+        question,
+        imageDataUrl,
+      });
+    });
+
+    modelSelector.addEventListener("change", updateModelHint);
+
+    socket.on("chatResponse", (data) => {
+      sendButton.disabled = false;
+      setStatus("");
+      if (data.response) {
+        outputBox.value = data.response;
+      } else {
+        outputBox.value = "Error: " + (data.error || "没有返回内容");
+      }
+    });
+
+    socket.on("connect_error", () => {
+      sendButton.disabled = false;
+      setStatus("连接后端失败。");
+    });
+
+    loadModels();
   </script>
 </body>
 </html>
