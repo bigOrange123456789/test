@@ -158,12 +158,58 @@ def print_available_remote_models(config):
   print("\n==========================================\n")
 
 
+def is_vision_language_model(model_config):
+  model_type = str(getattr(model_config, "model_type", "")).lower()
+  architectures = getattr(model_config, "architectures", []) or []
+  architecture_text = " ".join(str(architecture).lower() for architecture in architectures)
+  return (
+    "vl" in model_type
+    or "vision" in model_type
+    or "visual" in model_type
+    or "vl" in architecture_text
+    or "vision" in architecture_text
+    or "image" in architecture_text
+  )
+
+
+def load_local_transformers_model(model_path):
+  from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer # pip install transformers torch accelerate
+
+  model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+  if is_vision_language_model(model_config):
+    try:
+      from transformers import AutoModelForImageTextToText
+    except ImportError as error:
+      raise ImportError(
+        "当前 transformers 版本不支持 AutoModelForImageTextToText，无法加载 Qwen3-VL。"
+        "请在 lab2_3 环境中升级 transformers，或使用支持 Qwen3-VL 的版本。"
+      ) from error
+
+    model = AutoModelForImageTextToText.from_pretrained(
+          model_path,
+          torch_dtype="auto",
+          device_map="cpu",
+          trust_remote_code=True,
+    )
+    # 这里默认只做文本对话。AutoProcessor 会加载图像/视频处理依赖，
+    # Qwen3-VL 的视频处理器需要 torchvision；纯文本场景用 tokenizer 即可。
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    return model, tokenizer, None, "vision_language"
+
+  model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype="auto",          # 自动选择最佳数据类型（如fp16）
+        device_map="cpu", #"cuda:0", #"auto",            # 自动分配到可用设备（GPU优先）
+        trust_remote_code=True,
+  )
+  tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+  return model, tokenizer, None, "causal_lm"
+
+
 def load_local_models(config):
   local_configs = [(model_id, cfg) for model_id, cfg in config.items() if is_local_config(model_id, cfg)]
   if not local_configs:
     return
-
-  from transformers import AutoModelForCausalLM, AutoTokenizer # pip install transformers torch accelerate
 
   try:
     from peft import PeftModel # pip install peft
@@ -178,12 +224,7 @@ def load_local_models(config):
       continue
 
     try:
-      model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype="auto",          # 自动选择最佳数据类型（如fp16）
-            device_map="cpu", #"cuda:0", #"auto",            # 自动分配到可用设备（GPU优先）
-      )
-      tokenizer = AutoTokenizer.from_pretrained(model_path)
+      model, tokenizer, processor, local_model_kind = load_local_transformers_model(model_path)
 
       lora_adapter = cfg.get("lora_adapter")
       if lora_adapter:
@@ -196,10 +237,12 @@ def load_local_models(config):
 
       cfg["model"] = model
       cfg["tokenizer"] = tokenizer
+      cfg["processor"] = processor
+      cfg["local_model_kind"] = local_model_kind
       cfg["resolved_model_path"] = model_path
       if cfg.get("lora_adapter"):
         cfg["resolved_lora_adapter"] = lora_adapter
-      print(f"[{model_id}] 本地模型加载完成：{model_path}")
+      print(f"[{model_id}] 本地模型加载完成：{model_path} ({local_model_kind})")
     except Exception as error:
       cfg["load_error"] = short_error_message(error)
       print(f"[{model_id}] 本地模型加载失败：{cfg['load_error']}")
@@ -217,6 +260,67 @@ def parse_args():
   parser.add_argument("--check-remote-models", action="store_true", help="启动时检查远程 API 当前配置模型是否可用。")
   parser.set_defaults(stream=True)
   return parser.parse_args()
+
+
+def build_local_model_inputs(cfg):
+  tokenizer = cfg["tokenizer"]
+  processor = cfg.get("processor")
+  messages = cfg["messages"]
+
+  if cfg.get("local_model_kind") == "vision_language":
+    if processor is not None and hasattr(processor, "apply_chat_template"):
+      text = processor.apply_chat_template(
+          messages,
+          tokenize=False,
+          add_generation_prompt=True
+      )
+    else:
+      text = tokenizer.apply_chat_template(
+          messages,
+          tokenize=False,
+          add_generation_prompt=True
+      )
+    if processor is not None:
+      return processor(text=[text], return_tensors="pt", padding=True)
+    return tokenizer(text, return_tensors="pt")
+
+  text = tokenizer.apply_chat_template(
+      messages,
+      tokenize=False,
+      add_generation_prompt=True
+  )
+  return tokenizer(text, return_tensors="pt")
+
+
+def decode_generated_tokens(cfg, outputs, inputs):
+  tokenizer = cfg["tokenizer"]
+  processor = cfg.get("processor")
+  input_length = inputs.input_ids.shape[1]
+  generated_ids = outputs[0][input_length:]
+
+  if cfg.get("local_model_kind") == "vision_language" and processor is not None and hasattr(processor, "batch_decode"):
+    return processor.batch_decode([generated_ids], skip_special_tokens=True)[0]
+
+  return tokenizer.decode(
+      generated_ids,
+      skip_special_tokens=True
+  )
+
+
+def local_generation_kwargs(cfg, inputs):
+  tokenizer = cfg["tokenizer"]
+  eos_token_id = getattr(tokenizer, "eos_token_id", None)
+  pad_token_id = getattr(tokenizer, "pad_token_id", None) or eos_token_id
+  return {
+      **inputs,
+      "max_new_tokens":param["max_new_tokens"],#256,#512      # 最大生成长度
+      "temperature":param["temperature"],#0.1,#0.6           # 控制随机性（0=确定性，越高越随机）
+      "top_p":param["top_p"],                  # 核采样阈值
+      "do_sample":param["temperature"] > 0,              # 启用采样（否则为贪心解码）
+      "repetition_penalty":param["repetition_penalty"],      # 重复惩罚
+      "pad_token_id":pad_token_id,
+      "eos_token_id":eos_token_id,
+  }
 
 
 configure_stdout()
@@ -254,23 +358,8 @@ def chat_with_model(modelId, question):
 
       model=cfg["model"]
       tokenizer=cfg["tokenizer"]
-      # 应用聊天模板生成模型输入
-      text = tokenizer.apply_chat_template(
-          cfg["messages"],#history,
-          tokenize=False,
-          add_generation_prompt=True   # 为模型回复添加生成提示
-      )
-      # 分词并转移到模型所在设备
-      inputs = tokenizer(text, return_tensors="pt").to(model.device)
-      generation_kwargs = {
-          **inputs,
-          "max_new_tokens":param["max_new_tokens"],#256,#512      # 最大生成长度
-          "temperature":param["temperature"],#0.1,#0.6           # 控制随机性（0=确定性，越高越随机）
-          "top_p":param["top_p"],                  # 核采样阈值
-          "do_sample":param["temperature"] > 0,              # 启用采样（否则为贪心解码）
-          "repetition_penalty":param["repetition_penalty"],      # 重复惩罚
-          "pad_token_id":tokenizer.eos_token_id #填充标记（
-      }
+      inputs = build_local_model_inputs(cfg).to(model.device)
+      generation_kwargs = local_generation_kwargs(cfg, inputs)
       if param["stream"]:
         from transformers import TextIteratorStreamer
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
@@ -289,10 +378,7 @@ def chat_with_model(modelId, question):
         # 生成回复
         outputs = model.generate(**generation_kwargs)
         # 解码生成部分（仅保留新生成的token）
-        response = tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True
-        )
+        response = decode_generated_tokens(cfg, outputs, inputs)
     else:
       import openai # pip install openai
 
@@ -360,7 +446,12 @@ def initUI2():
     emit("chatResponse", {"response": response})
   socketio.run(app, host="0.0.0.0", port=3000)
 while True:
-  prompt = input("   our:")
+  try:
+    prompt = input("   our:")
+  except EOFError:
+    break
+  if prompt.lower() in {"exit", "quit", "q"}:
+    break
   if len(prompt.split("switch-"))>1:
     str0 = prompt.split("switch-")[1]
     if str0 in config:
@@ -377,6 +468,5 @@ while True:
       exit(0)
     continue
   response = chat_with_model(modelId,prompt)
-  print("response",response)
   if not param["stream"]:
     print(" "+modelId+":", response)
