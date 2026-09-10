@@ -33,6 +33,9 @@ MODEL_ID_ALIASES = {
     "remote-api-2": "tongyi",
 }
 DEFAULT_PRELOAD_LOCAL_MODELS = "deepseek-original"
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_DATA_URL_CHARS = 30 * 1024 * 1024
+VISION_MODEL_IDS = {"tongyi"}
 
 REPORT_FIELD_ORDER = ("diagnosis", "findings", "analysis", "advice")
 REPORT_FIELD_ALIASES = {
@@ -264,7 +267,75 @@ def _field_lengths(report: dict[str, str]) -> str:
     return ", ".join(f"{field}={len(str(report.get(field) or ''))}" for field in REPORT_FIELD_ORDER)
 
 
-def _build_case_prompt(inputs: dict) -> str:
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_uploaded_image(payload: dict) -> dict | None:
+    image = payload.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, dict):
+        raise ValueError("image 字段必须是对象")
+
+    data_url = str(image.get("dataUrl") or image.get("data_url") or image.get("url") or "").strip()
+    if not data_url:
+        return None
+
+    name = _preview_text(str(image.get("name") or "未命名图片"), 90)
+    mime_type = str(image.get("type") or "").strip() or "image/*"
+    size = _safe_int(image.get("size"))
+    if size > MAX_IMAGE_BYTES:
+        raise ValueError(f"上传图片过大：{size} 字节，最大允许 {MAX_IMAGE_BYTES} 字节")
+
+    if data_url.startswith("data:"):
+        if not re.match(r"^data:image/[A-Za-z0-9.+-]+;base64,", data_url):
+            raise ValueError("上传图片必须是 image/* 类型的 Base64 Data URL")
+        if len(data_url) > MAX_IMAGE_DATA_URL_CHARS:
+            raise ValueError("上传图片 Base64 内容过大")
+    elif not data_url.startswith(("http://", "https://")):
+        raise ValueError("图片地址只支持浏览器上传生成的 Data URL 或公网 HTTP(S) URL")
+
+    return {
+        "name": name,
+        "type": mime_type,
+        "size": size,
+        "data_url": data_url,
+        "data_url_chars": len(data_url),
+    }
+
+
+def _image_log_summary(image: dict | None) -> str:
+    if not image:
+        return "none"
+    return (
+        f"name={image['name']!r} type={image['type']!r} size={image['size']} "
+        f"data_url_chars={image['data_url_chars']}"
+    )
+
+
+def _model_supports_image_input(model_id: str, cfg: dict) -> bool:
+    model_name = str(cfg.get("model") or "").lower()
+    image_markers = ("qwen3.7", "qwen-vl", "qwen2.5-vl", "vl-", "-vl", "vision", "omni")
+    return model_id in VISION_MODEL_IDS or any(marker in model_name for marker in image_markers)
+
+
+def _remote_user_message(prompt: str, image: dict | None, send_image: bool) -> dict:
+    if not image or not send_image:
+        return {"role": "user", "content": prompt}
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image["data_url"]}},
+        ],
+    }
+
+
+def _build_case_prompt(inputs: dict, image: dict | None = None, image_sent: bool = False) -> str:
     age = str(inputs.get("age") or "").strip()
     sex = str(inputs.get("sex") or "").strip()
     bmi = str(inputs.get("bmi") or "").strip()
@@ -275,6 +346,20 @@ def _build_case_prompt(inputs: dict) -> str:
     symptoms = str(inputs.get("symptoms") or "").strip()
     exams = str(inputs.get("exams") or "").strip()
     diagnosis_report = str(inputs.get("diagnosisReport") or "").strip()
+    if image:
+        image_handling = (
+            "图片内容已作为多模态 image_url 随请求发送，请结合可见影像线索分析。"
+            if image_sent
+            else "当前所选模型不会直接接收图片像素，请仅把已上传影像作为附件状态记录。"
+        )
+        image_section = f"""
+已上传图片：{image['name']}
+图片类型：{image['type']}
+图片大小：{image['size']} 字节
+处理方式：{image_handling}
+""".strip()
+    else:
+        image_section = "未上传图片。"
     return f"""
 请基于以下心血管病例材料完成结构化病例分析。
 
@@ -294,6 +379,9 @@ BMI：{bmi or "未填写"}
 血压：{blood_pressure or "未填写"}
 心率：{heart_rate or "未填写"}
 家族史：{family_history or "未填写"}
+
+医学影像附件：
+{image_section}
 
 病例输入：
 {case_input}
@@ -569,11 +657,12 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
     request_config = {model_id: copy.deepcopy(base_config[model_id])}
     module.initialize_conversations(request_config, ANALYSIS_SYSTEM_PROMPT)
 
-    prompt = _build_case_prompt(inputs)
-    print("prompt为:",prompt)
     args = _analysis_args()
     cfg = request_config[model_id]
     is_local = _is_local_model(model_id, cfg)
+    image = _extract_uploaded_image(payload)
+    image_sent = bool(image and not is_local and _model_supports_image_input(model_id, cfg))
+    prompt = _build_case_prompt(inputs, image=image, image_sent=image_sent)
     _analysis_log(
         f"frontend_model={frontend_model!r} resolved_model={model_id!r} local={is_local}",
         request_id,
@@ -589,6 +678,13 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
         f"temperature={args.temperature} stream={args.stream}",
         request_id,
     )
+    _analysis_log(
+        f"image={_image_log_summary(image)} image_sent_to_model={image_sent}",
+        request_id,
+    )
+    if image and not image_sent:
+        reason = "local_text_model" if is_local else "remote_model_not_marked_as_vision"
+        _analysis_log(f"image_not_sent_reason={reason}", request_id)
 
     started_at = time.perf_counter()
     if is_local:
@@ -615,7 +711,7 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
         except SystemExit as error:
             raise RuntimeError(f"本地模型 {model_id} 调用提前退出：{error.code}") from error
     else:
-        cfg["messages"].append({"role": "user", "content": prompt})
+        cfg["messages"].append(_remote_user_message(prompt, image, image_sent))
         _analysis_log(
             f"remote_call begin base_url={str(cfg.get('base_url') or '').rstrip('/')} model={cfg.get('model')}",
             request_id,
@@ -691,9 +787,14 @@ class CardioAIHandler(SimpleHTTPRequestHandler):
 
         input_payload = payload.get("inputs")
         input_count = len(input_payload) if isinstance(input_payload, dict) else 0
+        image_payload = payload.get("image")
+        image_present = isinstance(image_payload, dict) and bool(
+            image_payload.get("dataUrl") or image_payload.get("data_url") or image_payload.get("url")
+        )
         _analysis_log(
             f"payload model={payload.get('model')!r} top_keys={sorted(payload.keys())} "
-            f"inputs_type={type(input_payload).__name__} inputs_count={input_count}",
+            f"inputs_type={type(input_payload).__name__} inputs_count={input_count} "
+            f"image_present={image_present}",
             request_id,
         )
         self._send_sse_headers()
@@ -788,28 +889,28 @@ def main() -> None:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(
-        description="Run the cardiovascular AI diagnosis and knowledge fusion UI."
+        description="启动心血管疾病人工智能诊疗与知识融合平台。"
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Host address to bind.")
-    parser.add_argument("--port", type=int, default=8765, help="Preferred local port.")
+    parser.add_argument("--host", default="127.0.0.1", help="服务绑定地址。")
+    parser.add_argument("--port", type=int, default=8765, help="优先使用的本地端口。")
     parser.add_argument(
         "--no-open",
         action="store_true",
-        help="Print the local URL without opening a browser automatically.",
+        help="只打印本地链接，不自动打开浏览器。",
     )
     parser.add_argument(
         "--preload-local-models",
         default=DEFAULT_PRELOAD_LOCAL_MODELS,
         help=(
-            "Comma-separated frontend/backend local model ids to preload before serving. "
-            "Use 'all' to preload every local target, or 'none' to disable."
+            "服务启动前要预加载的本地模型 ID，多个模型用英文逗号分隔；"
+            "使用 all 预加载全部本地模型，使用 none 关闭预加载。"
         ),
     )
     args = parser.parse_args()
 
     if not APP_INDEX.exists():
         raise FileNotFoundError(
-            f"Front-end entry not found: {APP_INDEX}. Please keep cardio_ai_platform next to html.py."
+            f"前端入口文件不存在：{APP_INDEX}。请确认 cardio_ai_platform 目录与启动脚本放在同一项目目录下。"
         )
 
     print("")

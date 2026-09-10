@@ -21,6 +21,8 @@ const state = {
   typingField: "",
   reportGenerated: false,
   uploadState: "等待上传",
+  uploadedImage: null,
+  uploadError: "",
   paperFilter: "全部",
   paperSearch: "",
 };
@@ -30,12 +32,13 @@ let typewriterTimer = null;
 
 const ANALYSIS_API_URL = "/api/analyze";
 const ANALYSIS_DEBUG = true;
+const MAX_ANALYSIS_IMAGE_BYTES = 20 * 1024 * 1024;
 
 const analysisModels = [
   { id: "deepseek-original", label: "原本deepseek（本地）" },
   { id: "deepseek-finetuned", label: "微调deepseek（LoRA）" },
   { id: "remote-api-1", label: "远程 API-1（deepseek）" },
-  { id: "remote-api-2", label: "远程 API-2（通义）" },
+  { id: "remote-api-2", label: "远程 API-2（通义视觉）" },
 ];
 
 const analysisReportFields = [
@@ -71,7 +74,93 @@ function analysisPayloadSummary(payload) {
     model: payload?.model || "",
     inputKeys: Object.keys(payload?.inputs || {}),
     inputLengths: analysisInputLengths(payload?.inputs || {}),
+    image: payload?.image
+      ? {
+          name: payload.image.name,
+          type: payload.image.type,
+          size: payload.image.size,
+          dataUrlChars: String(payload.image.dataUrl || "").length,
+        }
+      : null,
   };
+}
+
+function selectedAnalysisModelSupportsImage(modelId = state.selectedAnalysisModel) {
+  return modelId === "remote-api-2";
+}
+
+function formatFileSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("读取图片失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleAnalysisImageUpload(input) {
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+
+  if (!file.type.startsWith("image/")) {
+    state.uploadError = "请选择图片文件。";
+    state.uploadState = "图片上传失败";
+    analysisDebug("image:invalid-type", { name: file.name, type: file.type });
+    render();
+    return;
+  }
+
+  if (file.size > MAX_ANALYSIS_IMAGE_BYTES) {
+    state.uploadError = `图片过大：${formatFileSize(file.size)}，请上传 20 MB 以内的图片。`;
+    state.uploadState = "图片上传失败";
+    analysisDebug("image:too-large", { name: file.name, size: file.size });
+    render();
+    return;
+  }
+
+  try {
+    state.uploadState = "正在读取图片...";
+    state.uploadError = "";
+    render();
+    const dataUrl = await readFileAsDataUrl(file);
+    state.uploadedImage = {
+      name: file.name,
+      type: file.type || "image/*",
+      size: file.size,
+      dataUrl,
+      uploadedAt: new Date().toISOString(),
+    };
+    state.uploadState = `已上传 ${file.name}`;
+    analysisDebug("image:uploaded", {
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      dataUrlChars: dataUrl.length,
+    });
+    render();
+  } catch (error) {
+    state.uploadedImage = null;
+    state.uploadState = "图片上传失败";
+    state.uploadError = error?.message || "读取图片失败。";
+    console.error("[CardioAI][病例分析] 图片读取失败：", error);
+    render();
+  }
+}
+
+function clearAnalysisImage() {
+  state.uploadedImage = null;
+  state.uploadState = "等待上传";
+  state.uploadError = "";
+  analysisDebug("image:cleared");
+  render();
 }
 
 const navGroups = [
@@ -559,7 +648,15 @@ function collectAnalysisPayload() {
   }
   const model =
     document.querySelector("[data-analysis-model]")?.value || state.selectedAnalysisModel;
-  return { model, inputs };
+  const image = state.uploadedImage
+    ? {
+        name: state.uploadedImage.name,
+        type: state.uploadedImage.type,
+        size: state.uploadedImage.size,
+        dataUrl: state.uploadedImage.dataUrl,
+      }
+    : null;
+  return { model, inputs, image };
 }
 
 function stringifyAnalysisValue(value) {
@@ -1054,15 +1151,7 @@ function renderDiagnosis() {
           </div>
           <div class="report-section">
             <h3>医学影像上传</h3>
-            <div class="upload-zone">
-              <div>
-                <strong>${h(state.uploadState)}</strong>
-                <span>支持 CT / 冠脉造影 / X-Ray / 透视截图，当前为前端占位。</span>
-                <div class="button-row" style="margin-top:12px;justify-content:center;">
-                  <button class="button secondary" data-action="mock-upload">模拟上传影像</button>
-                </div>
-              </div>
-            </div>
+            ${renderAnalysisImageUpload()}
           </div>
           <div class="report-section">
             <div class="field">
@@ -1150,6 +1239,48 @@ function renderStructuredReport() {
       `;
     })
     .join("");
+}
+
+function renderAnalysisImageUpload() {
+  const image = state.uploadedImage;
+  const imageWillSend = Boolean(image && selectedAnalysisModelSupportsImage());
+  const statusText = image
+    ? `${image.name} · ${formatFileSize(image.size)} · ${image.type || "image/*"}`
+    : "支持 PNG / JPG / JPEG / WEBP 等常见图片；不上传图片也可纯文字分析。";
+  const sendText = image
+    ? imageWillSend
+      ? "开始 AI 分析时会随病例文本发送给当前视觉模型。"
+      : "当前模型为文本模型，后端会保留附件信息但不发送图片像素。"
+    : "";
+  return `
+    <div class="upload-zone ${image ? "has-preview" : ""}">
+      <div class="upload-content">
+        <strong>${h(state.uploadState)}</strong>
+        <span>${h(statusText)}</span>
+        ${sendText ? `<span class="upload-hint">${h(sendText)}</span>` : ""}
+        ${state.uploadError ? `<p class="upload-error">${h(state.uploadError)}</p>` : ""}
+        ${
+          image
+            ? `
+              <figure class="upload-preview">
+                <img src="${h(image.dataUrl)}" alt="${h(image.name)}" />
+                <figcaption>${h(image.name)}</figcaption>
+              </figure>
+            `
+            : ""
+        }
+        <input class="hidden-file-input" type="file" accept="image/*" data-analysis-image-input />
+        <div class="button-row upload-actions">
+          <button class="button secondary" data-action="upload-image">上传影像</button>
+          ${
+            image
+              ? '<button class="button ghost" data-action="clear-image">清除影像</button>'
+              : ""
+          }
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderEvidence() {
@@ -1972,6 +2103,13 @@ function typeAnalysisResult(report, runId) {
 async function startAnalysis() {
   const payload = collectAnalysisPayload();
   const runId = state.analysisRunId + 1;
+  if (payload.image) {
+    analysisDebug("image:request-mode", {
+      runId,
+      model: payload.model,
+      imageWillBeSentToModel: selectedAnalysisModelSupportsImage(payload.model),
+    });
+  }
   stopAnalysisTimers();
   state.analysisRunId = runId;
   state.analyzing = true;
@@ -2206,9 +2344,12 @@ document.addEventListener("click", (event) => {
     render();
     return;
   }
-  if (action === "mock-upload") {
-    state.uploadState = "已接收 demo_angio_frame.png";
-    render();
+  if (action === "upload-image") {
+    document.querySelector("[data-analysis-image-input]")?.click();
+    return;
+  }
+  if (action === "clear-image") {
+    clearAnalysisImage();
     return;
   }
 
@@ -2275,6 +2416,11 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-analysis-image-input]")) {
+    handleAnalysisImageUpload(event.target);
+    return;
+  }
+
   if (event.target.matches("[data-analysis-model]")) {
     state.selectedAnalysisModel = event.target.value;
     render();
