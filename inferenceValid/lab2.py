@@ -301,6 +301,107 @@ def build_user_message(question, image=None):
   }
 
 
+def select_feature_model(model_id, require_image=False):
+  """优先使用对话模型，否则选择已加载的本地模型提取特征。"""
+  fallback_ids = sorted(
+      (key for key in config if key != model_id),
+      key=lambda key: config[key].get("local_model_kind") != "vision_language",
+  )
+  for source_id in [model_id] + fallback_ids:
+    cfg = config[source_id]
+    model = cfg.get("model")
+    if not is_local_config(source_id, cfg) or cfg.get("load_error"):
+      continue
+    if require_image:
+      if cfg.get("image_processor") is not None and callable(getattr(model, "get_image_features", None)):
+        return source_id, cfg
+    elif cfg.get("tokenizer") is not None and callable(getattr(model, "get_input_embeddings", None)):
+      return source_id, cfg
+  raise RuntimeError("没有已加载且支持该特征的本地模型；远程聊天 API 不返回内部特征向量。")
+
+
+def extract_text_feature_vector(cfg, question):
+  """仅对本次问题的有效 token 输入 Embedding 求均值，不包含历史和系统提示。"""
+  import torch
+
+  inputs = cfg["tokenizer"](
+      question, return_tensors="pt", add_special_tokens=False, truncation=False,
+  )
+  embedding_layer = cfg["model"].get_input_embeddings()
+  input_ids = inputs["input_ids"].to(embedding_layer.weight.device)
+  mask = inputs.get("attention_mask", torch.ones_like(input_ids)).to(input_ids.device).bool()
+  token_count = int(mask.sum().item())
+  if not token_count:
+    raise ValueError("问题没有可编码的文本 token。")
+  with torch.inference_mode():
+    embeddings = embedding_layer(input_ids)
+    vector = embeddings[mask].float().mean(dim=0).cpu()
+  return vector, token_count
+
+
+def extract_image_feature_vector(cfg, image):
+  """通过视觉编码器提取图片特征，对投影到语言空间的视觉 token 求均值。"""
+  import torch
+
+  model = cfg["model"]
+  inputs = cfg["image_processor"](images=[image], return_tensors="pt").to(model.device)
+  with torch.inference_mode():
+    outputs = model.get_image_features(
+        pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
+    )
+    # Transformers 新版返回 ModelOutput；旧版 Qwen 返回 (image_embeds, deepstack_features)。
+    features = getattr(outputs, "pooler_output", None)
+    if features is None and isinstance(outputs, (tuple, list)):
+      features = outputs[0]
+    if isinstance(features, (tuple, list)):
+      features = torch.cat(features, dim=0)
+    if not isinstance(features, torch.Tensor) or features.ndim != 2 or not features.shape[0]:
+      raise RuntimeError("视觉编码器未返回预期的 [视觉 token 数, 特征维度] 特征。")
+    vector = features.float().mean(dim=0).cpu()
+  return vector, int(features.shape[0])
+
+
+def print_feature_vector(label, source_id, cfg, vector, token_count, method):
+  """输出特征来源、形状和完整向量，避免 PyTorch 默认省略中间元素。"""
+  values = vector.tolist()
+  print(
+      f"[{label}] 特征来源模型={source_id}; "
+      f"路径={cfg.get('resolved_model_path', cfg.get('model_path', ''))}\n"
+      f"[{label}] 提取方式={method}; token 数={token_count}; "
+      f"token 特征形状=[{token_count}, {len(values)}]; 向量维度={len(values)}\n"
+      f"[{label}] 完整特征向量={json.dumps(values, allow_nan=False)}",
+      flush=True,
+  )
+
+
+def print_web_input_features(model_id, question, image=None):
+  """打印网页本次提交的文本和图片特征；提取失败仅记录原因，不中断回答。"""
+  print(f"\n========== 网页输入特征 | 对话目标={model_id} ==========", flush=True)
+  print(f"问题文本={question!r}", flush=True)
+  if not is_local_config(model_id, config[model_id]):
+    print("当前是远程 API 对话，下面使用已加载的本地模型提取特征，不代表远程模型内部向量。", flush=True)
+
+  if question and question.strip():
+    try:
+      source_id, cfg = select_feature_model(model_id)
+      vector, count = extract_text_feature_vector(cfg, question)
+      print_feature_vector("文本特征", source_id, cfg, vector, count, "输入 Embedding 均值（非上下文隐藏状态）")
+    except Exception as error:
+      print(f"[文本特征] 提取失败：{short_error_message(error)}", flush=True)
+  else:
+    print("[文本特征] 未提交问题文本，跳过；不将自动补充的提示语当作用户输入。", flush=True)
+
+  if image is not None:
+    print(f"[图片特征] 后端收到的图片尺寸={image.width}x{image.height}; 正在提取...", flush=True)
+    try:
+      source_id, cfg = select_feature_model(model_id, require_image=True)
+      vector, count = extract_image_feature_vector(cfg, image)
+      print_feature_vector("图片特征", source_id, cfg, vector, count, "视觉编码器输出经投影后的 token 均值")
+    except Exception as error:
+      print(f"[图片特征] 提取失败：{short_error_message(error)}", flush=True)
+  print("========== 网页输入特征输出结束 ==========\n", flush=True)
+
+
 def build_history_user_message(question, has_image=False):
   text = question.strip() if question and question.strip() else "请描述这张图片。"
   if has_image:
@@ -412,12 +513,15 @@ modelId=""
 for modelId in config:
   config[modelId]["messages"]=[{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
   # config[modelId]["messages"]=[{"role": "system", "content": "请专业且详细的回答用户的问题"}]
-def chat_with_model(modelId, question, image_data_url=None):
+def chat_with_model(modelId, question, image_data_url=None, print_features=False):
+  """调用本地模型或远程 API 回答问题，可选打印网页提交内容的特征向量。"""
   try:
     image = decode_image_data_url(image_data_url) if image_data_url else None
     if not question and image is None:
       return "Please enter a question~"
     cfg = config[modelId]
+    if print_features:
+      print_web_input_features(modelId, question, image=image)
     request_user_message = build_user_message(question, image=image)
     generation_messages = cfg["messages"] + [request_user_message]
     if is_local_config(modelId, cfg):
@@ -532,11 +636,12 @@ def initUI2():
     })
   @socketio.on("chatMessage")
   def handle_chat_message(data):
+    """接收网页问题和图片，在后端打印输入特征并返回模型回答。"""
     model_id = data["modelId"]
     question = data.get("question", "")
     image_data_url = data.get("imageDataUrl")
     try:
-      response = chat_with_model(model_id, question, image_data_url=image_data_url)
+      response = chat_with_model(model_id, question, image_data_url=image_data_url, print_features=True)
     except Exception as e:
       response = str(e)
     emit("chatResponse", {"response": response})

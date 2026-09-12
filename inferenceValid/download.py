@@ -29,8 +29,8 @@ from huggingface_hub import HfApi, snapshot_download
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REPO_ID = "Qwen/Qwen3-VL-2B-Instruct"
-DEFAULT_LOCAL_DIR = PROJECT_ROOT / "Qwen3-VL-2B-Instruct"
+DEFAULT_REPO_ID = "Qwen/Qwen3-VL-Embedding-2B"
+DEFAULT_LOCAL_DIR = PROJECT_ROOT / "Qwen3-VL-Embedding-2B"
 DEFAULT_CACHE_DIR = None
 
 
@@ -295,23 +295,24 @@ def download_with_retry(args: argparse.Namespace) -> str:
 
 def parse_args() -> argparse.Namespace:
     """解析下载参数，允许指定模型、保存目录、镜像站、缓存目录和重试策略。"""
-    parser = argparse.ArgumentParser(description="Download Hugging Face model snapshots with resume support.")
-    parser.add_argument("--repo-id", default=DEFAULT_REPO_ID, help="Hugging Face repo id.")
-    parser.add_argument("--local-dir", type=Path, default=DEFAULT_LOCAL_DIR, help="Directory to save model files.")
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR, help="Optional cache directory used for resumable downloads.")
-    parser.add_argument("--repo-type", default="model", choices=("model", "dataset", "space"), help="Hugging Face repo type.")
-    parser.add_argument("--revision", default=None, help="Branch, tag, or commit id to download.")
-    parser.add_argument("--endpoint", default=None, help="Optional Hugging Face endpoint, e.g. https://hf-mirror.com")
-    parser.add_argument("--token", default=None, help="Optional Hugging Face access token for private repos.")
-    parser.add_argument("--allow-patterns", default=None, help="Comma-separated file patterns to include.")
-    parser.add_argument("--ignore-patterns", default=None, help="Comma-separated file patterns to exclude.")
-    parser.add_argument("--max-workers", type=int, default=8, help="Parallel download worker count.")
-    parser.add_argument("--retries", type=int, default=3, help="Retry count after network errors.")
-    parser.add_argument("--retry-sleep", type=float, default=5.0, help="Seconds to wait between retries.")
-    parser.add_argument("--progress-interval", type=float, default=5.0, help="Seconds between big-file progress prints.")
-    parser.add_argument("--no-big-file-progress", action="store_false", dest="show_big_file_progress", help="Disable separate progress prints for the largest file.")
-    parser.add_argument("--force-download", action="store_true", help="Force redownload instead of reusing cache.")
-    parser.add_argument("--local-files-only", action="store_true", help="Use local cache only without network access.")
+    parser = argparse.ArgumentParser(description="下载 Hugging Face 仓库快照，支持断点续传。", add_help=False)
+    parser.add_argument("-h", "--help", action="help", help="显示帮助信息并退出。")
+    parser.add_argument("--repo-id", default=DEFAULT_REPO_ID, help="Hugging Face 仓库 ID，默认 Qwen/Qwen3-VL-Embedding-2B。")
+    parser.add_argument("--local-dir", type=Path, default=DEFAULT_LOCAL_DIR, help="下载文件的本地保存目录。")
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR, help="用于断点续传的缓存目录（可选）。")
+    parser.add_argument("--repo-type", default="model", choices=("model", "dataset", "space"), help="仓库类型：model（模型）、dataset（数据集）或 space（应用空间）。")
+    parser.add_argument("--revision", default=None, help="要下载的分支名、标签名或提交 ID。")
+    parser.add_argument("--endpoint", default=None, help="Hugging Face 服务或镜像地址（可选），例如 https://hf-mirror.com。")
+    parser.add_argument("--token", default=None, help="Hugging Face 访问令牌（可选，用于访问私有或受限仓库）。")
+    parser.add_argument("--allow-patterns", default=None, help="仅下载匹配这些通配符规则的文件，多个规则用英文逗号分隔。")
+    parser.add_argument("--ignore-patterns", default=None, help="跳过匹配这些通配符规则的文件，多个规则用英文逗号分隔。")
+    parser.add_argument("--max-workers", type=int, default=8, help="并行下载的工作线程数。")
+    parser.add_argument("--retries", type=int, default=3, help="下载失败后的重试次数。")
+    parser.add_argument("--retry-sleep", type=float, default=5.0, help="每次重试前的等待时间，单位为秒。")
+    parser.add_argument("--progress-interval", type=float, default=5.0, help="大文件下载进度的输出间隔，单位为秒。")
+    parser.add_argument("--no-big-file-progress", action="store_false", dest="show_big_file_progress", help="关闭最大文件的单独下载进度输出。")
+    parser.add_argument("--force-download", action="store_true", help="忽略已有缓存，强制重新下载。")
+    parser.add_argument("--local-files-only", action="store_true", help="仅使用本地缓存，不访问网络。")
     parser.set_defaults(show_big_file_progress=True)
     return parser.parse_args()
 
