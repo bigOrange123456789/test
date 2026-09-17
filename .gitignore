@@ -38,10 +38,16 @@ DeepSeek-Model/*
 Qwen3-VL-2B-Instruct/
 .hf_cache/
 
+# Downloaded Qwen3-VL embedding model assets.
+# Keep the accompanying Python integration script available for version control.
+Qwen3-VL-Embedding-2B/*
+!Qwen3-VL-Embedding-2B/
+!Qwen3-VL-Embedding-2B/scripts/
+!Qwen3-VL-Embedding-2B/scripts/**/*.py
+
 
 config.json
 files
 
 # Temporary or demo scripts
 test_hello_world.py
-

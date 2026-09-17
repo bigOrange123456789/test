@@ -754,6 +754,164 @@ a {
   gap: 10px;
 }
 
+.rag-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 100px;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 16px;
+}
+
+.rag-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.rag-toggle input {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  accent-color: var(--teal);
+}
+
+.rag-model-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--amber);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.rag-runtime, .rag-facts, .rag-match p, .rag-event-log {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.rag-workflow .workflow-step {
+  grid-template-columns: 28px minmax(0, 1fr) 42px;
+  gap: 9px;
+}
+
+.rag-step-content, .rag-matches, .rag-match {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rag-facts {
+  margin: 6px 0 0;
+}
+
+.rag-step-status {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rag-workflow .error {
+  border-color: var(--red);
+}
+
+.rag-workflow .running .step-index {
+  animation: rag-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rag-pulse {
+  50% { opacity: 0.5; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rag-workflow .running .step-index { animation: none; }
+}
+
+.rag-match {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.rag-event-log summary {
+  cursor: pointer;
+}
+
+.rag-match pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 8px 0 16px;
+  font: inherit;
+}
+
+.rag-match-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+}
+
+.rag-match-heading h4 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.rag-content-label {
+  margin: 14px 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.rag-images {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
+  gap: 12px;
+}
+
+.rag-image {
+  min-width: 0;
+  margin: 0;
+}
+
+.rag-image a {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 4 / 3;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.rag-image img {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+}
+
+.rag-image img[hidden] { display: none; }
+
+.rag-image figcaption {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.rag-image-error {
+  padding: 8px;
+  color: var(--red);
+  font-size: 12px;
+}
+
+.rag-event-log ol {
+  padding-left: 20px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
 .workflow-step {
   display: grid;
   grid-template-columns: 34px minmax(0, 1fr) auto;
@@ -840,6 +998,7 @@ a {
   min-height: 54px;
   margin: 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .structured-output.placeholder {

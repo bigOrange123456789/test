@@ -31,6 +31,38 @@ python inferenceValid/embed_mira_chroma.py
 这是 Transformers 加载完整 Qwen3-VL 处理器所需的依赖，脚本本身只使用图片和文字。
 使用 GPU 时，需要目标环境安装支持该 GPU 的 PyTorch/torchvision 配套版本。
 
+### 本机 GPU 环境 MLMtest
+
+环境路径：`D:\mySoftware2\anaconda3\envs\MLMtest`，独立于原有 `lab2_3` 环境。
+使用 Python 3.11、PyTorch 2.11.0 / torchvision 0.26.0（CUDA 12.8 版本）、
+Transformers 5.5.1 和 ChromaDB 1.5.9。以下命令在项目根目录执行：
+
+```powershell
+conda activate MLMtest
+python inferenceValid/embed_mira_chroma.py --device cuda:0 --batch-size 4 --commit-every 32
+```
+
+不指定 `--device` 时，脚本也会自动选择可用的 CUDA GPU；显式指定 `cuda:0` 可以在
+GPU 不可用时报错，避免不知情地退回 CPU。若后续较长图文导致显存不足，将
+`--batch-size` 降为 `1` 后重跑即可保留原断点；不要同时启动多个进程写同一库。
+
+重建环境时使用以下版本和官方 CUDA wheel 源，无需修改原来的 CPU 环境：
+
+```powershell
+conda create -n MLMtest python=3.11 pip -y
+conda activate MLMtest
+python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install transformers==5.5.1 chromadb==1.5.9 -r inferenceValid/requirements_mira.txt
+python -m pip check
+python -c "import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+```
+
+CUDA wheel 版本参考：[PyTorch 官方安装命令](https://pytorch.org/get-started/previous-versions/)。
+
+本机已验证 RTX 3090 的 CUDA 运算及 BF16 图文编码：真实数据先入库 4 条、重启后续跑 2 条，
+共 6 个 2048 维归一化向量，断点与数据库数量一致。`pip check` 和 9 项回归测试均通过。
+验证库位于 `C:\Users\HQ\Documents\ChatGPT\test\MLMtest_gpu_smoke`，未启动正式全量提取。
+
 常用选项：
 
 ```powershell
@@ -117,8 +149,32 @@ print(results)
 
 ## 验证
 
+### 查看已入库向量
+
+激活 `MLMtest` 后可运行以下查看脚本，不加载模型或使用 GPU，不新增/修改向量及编码断点：
+
 ```powershell
-python -m unittest discover -s inferenceValid/tests -p test_embed_mira_chroma.py -v
+python D:\Codex\MLMtest\inferenceValid\inspect_mira_chroma.py
+python D:\Codex\MLMtest\inferenceValid\inspect_mira_chroma.py --sample-size 5 --seed 42
+python D:\Codex\MLMtest\inferenceValid\inspect_mira_chroma.py --sample-size 1 --vector-values 0 --text-limit 0
+```
+
+默认查看正式数据库 `G:\Codex_dataset\MIRA-chroma` 中的 `mira_qwen3_vl_embedding` 集合。
+其他数据库使用 `--db-dir` 和 `--collection` 指定。路径或集合不存在时会报错，不创建空库。
+输出当前记录数、记录结构、随机 ID、向量形状/读取 dtype/L2 范数、向量数值、问答原文和图片路径等元数据。
+默认随机抽取 3 条且不重复，向量展示前 16 个数；`--vector-values 0` 展示完整向量。
+`--text-limit 0` 可展示完整问答和元数据。它只按随机偏移读取所需的记录，不将全部向量载入内存。
+
+抽样检查通过仅说明这些记录已保存且基本格式正常，不代表全量完成，也不代表检索效果合格。
+读取 dtype 是 SDK 返回数组的类型，不用于推断磁盘存储精度。若编码仍在运行，数量可能继续增长；
+需要稳定、可复现的结果时，先用 Ctrl+C 暂停编码，再查看，之后可继续原编码命令。
+脚本退出码为 0 表示抽样通过，1 表示异常或空库，130 表示手动中断。
+查询接口参考：[Chroma Get 官方文档](https://docs.trychroma.com/docs/querying-collections/query-and-get)。
+
+### 回归测试
+
+```powershell
+python -m unittest discover -s inferenceValid/tests -p "test_*mira_chroma.py" -v
 ```
 
 测试使用独立临时数据库和测试编码器，验证 CSV 多行字段、题目展开、行内续读、去重、

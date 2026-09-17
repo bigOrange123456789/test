@@ -7,18 +7,18 @@ import argparse
 import copy
 import importlib.util
 import json
+import queue
 import re
 import socket
 import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 import webbrowser
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -29,13 +29,14 @@ INFERENCE_CONFIG = ROOT_DIR / "inferenceValid" / "config.json"
 MODEL_ID_ALIASES = {
     "deepseek-original": "myDeepSeek",
     "deepseek-finetuned": "myDeepSeek_LoRA",
+    "qwen3-vl-local": "myQwen",
     "remote-api-1": "deepseek",
     "remote-api-2": "tongyi",
 }
 DEFAULT_PRELOAD_LOCAL_MODELS = "deepseek-original"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_DATA_URL_CHARS = 30 * 1024 * 1024
-VISION_MODEL_IDS = {"tongyi"}
+VISION_MODEL_IDS = {"tongyi", "myQwen"}
 
 REPORT_FIELD_ORDER = ("diagnosis", "findings", "analysis", "advice")
 REPORT_FIELD_ALIASES = {
@@ -54,6 +55,7 @@ REPORT_FIELD_ALIASES = {
 # )
 ANALYSIS_SYSTEM_PROMPT = (
     "你是一名谨慎的中文心血管医学病例分析助手。"
+    "你要综合分析输入的所有信息，给出诊断结果和临床建议。"
     "禁止输出思考过程、解释过程、步骤说明或 Markdown。"
     "你的回复第一个字符必须是 {，最后一个字符必须是 }。"
     'JSON 必须包含四个字符串字段："diagnosis"、"findings"、"analysis"、"advice"。'
@@ -110,6 +112,9 @@ def _load_inference_config() -> dict:
         raise FileNotFoundError(f"DeepSeek config not found: {INFERENCE_CONFIG}")
     module = _load_inference_module()
     _INFERENCE_CONFIG_CACHE = module.load_config(INFERENCE_CONFIG)
+    _INFERENCE_CONFIG_CACHE.setdefault("myQwen", {
+        "localhost": True, "model_path": "Qwen3-VL-2B-Instruct", "lora_adapter": None,
+    })
     return _INFERENCE_CONFIG_CACHE
 
 
@@ -214,6 +219,16 @@ def _preload_local_models(preload_spec: str) -> None:
             print(f"[CardioAI] 跳过远程模型预加载：{model_id}", flush=True)
             continue
 
+        if _is_local_qwen_model(model_id, cfg):
+            try:
+                from inferenceValid.local_qwen_vl import SERVICE
+                with _MODEL_CALL_LOCK:
+                    SERVICE.load(cfg)
+            except (Exception, SystemExit) as error:
+                print(f"[CardioAI] 本地 Qwen 预加载失败：{error}", flush=True)
+                traceback.print_exc()
+            continue
+
         lora_adapter = module.choose_lora_adapter(cfg, args)
         started_at = time.perf_counter()
         print(
@@ -249,6 +264,13 @@ def _resolve_model_id(frontend_model_id: str | None) -> str:
 def _is_local_model(model_id: str, cfg: dict) -> bool:
     module = _load_inference_module()
     return module.is_local_config(model_id, cfg)
+
+
+def _is_local_qwen_model(model_id: str, cfg: dict) -> bool:
+    """本地 Qwen-VL 采用视觉生成入口，不能交给 DeepSeek 的纯文本加载器。"""
+    return _is_local_model(model_id, cfg) and (
+        model_id == "myQwen" or cfg.get("model_type") == "qwen3_vl"
+    )
 
 
 def _analysis_log(message: str, request_id: str | None = None) -> None:
@@ -348,7 +370,7 @@ def _build_case_prompt(inputs: dict, image: dict | None = None, image_sent: bool
     diagnosis_report = str(inputs.get("diagnosisReport") or "").strip()
     if image:
         image_handling = (
-            "图片内容已作为多模态 image_url 随请求发送，请结合可见影像线索分析。"
+            "图片内容已作为多模态附件随请求提供，请结合可见影像线索分析。"
             if image_sent
             else "当前所选模型不会直接接收图片像素，请仅把已上传影像作为附件状态记录。"
         )
@@ -401,6 +423,7 @@ BMI：{bmi or "未填写"}
 
 
 def _call_remote_chat_completion(model_id: str, cfg: dict, args: SimpleNamespace) -> str:
+    from inferenceValid.remote_transport import post_json
     api_key = cfg.get("api_key")
     base_url = str(cfg.get("base_url") or "").rstrip("/")
     configured_model = cfg.get("model")
@@ -419,27 +442,9 @@ def _call_remote_chat_completion(model_id: str, cfg: dict, args: SimpleNamespace
     if isinstance(extra_body, dict):
         body.update(extra_body)
 
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=args.api_timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"远程模型 {model_id} 请求失败：HTTP {error.code} {error.reason}；{detail[:600]}"
-        ) from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"远程模型 {model_id} 网络请求失败：{error.reason}") from error
+    raw = post_json(endpoint, body, api_key, cfg, args.api_timeout,
+                    log=lambda message: _analysis_log(message, getattr(args, "request_id", None)),
+                    on_retry=getattr(args, "on_model_progress", None))
 
     try:
         payload = json.loads(raw)
@@ -645,7 +650,23 @@ def _complete_report(report: dict[str, str]) -> dict[str, str]:
     return completed
 
 
-def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str]:
+def _analyze_case(payload: dict, request_id: str | None = None, on_progress=None) -> dict[str, str]:
+    from inferenceValid.rag_mira import SERVICE, parse_options
+
+    rag_enabled, rag_k = parse_options(payload)
+    def progress(stage, status, message, details=None):
+        details = details or {}
+        _analysis_log(f"阶段={stage} 状态={status} {message}", request_id)
+        if details:
+            log_details = {key: value for key, value in details.items() if key != "matches"}
+            if "matches" in details:
+                log_details["matches"] = [{key: value for key, value in match.items() if key not in {"preview", "document", "images"}}
+                                          for match in details["matches"]]
+            _analysis_log(f"阶段详情={json.dumps(log_details, ensure_ascii=False)}", request_id)
+        if on_progress:
+            on_progress({"type": "progress", "stage": stage, "state": status,
+                         "message": message, "details": details})
+
     frontend_model = payload.get("model")
     model_id = _resolve_model_id(payload.get("model"))
     inputs = payload.get("inputs")
@@ -658,11 +679,39 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
     module.initialize_conversations(request_config, ANALYSIS_SYSTEM_PROMPT)
 
     args = _analysis_args()
+    args.request_id = request_id
+    args.on_model_progress = lambda message, details: progress("generation", "running", message, details)
     cfg = request_config[model_id]
     is_local = _is_local_model(model_id, cfg)
+    is_local_qwen = _is_local_qwen_model(model_id, cfg)
     image = _extract_uploaded_image(payload)
-    image_sent = bool(image and not is_local and _model_supports_image_input(model_id, cfg))
+    supports_images = is_local_qwen or (not is_local and _model_supports_image_input(model_id, cfg))
+    image_sent = bool(image and supports_images)
     prompt = _build_case_prompt(inputs, image=image, image_sent=image_sent)
+    progress("input", "complete", "已接收病例材料，开始分析。",
+             {"model": model_id, "rag_enabled": rag_enabled, "k": rag_k,
+              "image_count": int(image is not None), "text_chars": sum(len(str(v or "")) for v in inputs.values())})
+    reference_content = []
+    user_message = _remote_user_message(prompt, image, image_sent)
+    if rag_enabled:
+        groups = SERVICE.retrieve(inputs, image, rag_k, progress)
+        progress("context", "running", "正在组合原始病例与检索参考资料。")
+        original_prompt = prompt
+        prompt, reference_content = SERVICE.augment(prompt, groups, supports_images)
+        reference_images = sum(len(group["image_paths"]) for group in groups)
+        progress("context", "complete",
+                 f"已组装 {len(groups)} 组问答及 {reference_images} 张参考图片。" if supports_images else
+                 f"已组装 {len(groups)} 组完整问答；当前是文本生成模型，参考图片像素未发送。",
+                 {"groups": len(groups), "reference_images": reference_images,
+                  "images_sent": reference_images + int(image_sent) if supports_images else 0,
+                  "text_only_model": not supports_images, "prompt_chars": len(prompt)})
+        if supports_images:
+            # 原始病例和上传图片放在最前面，其后按组交错排列完整问答及全部参考图片。
+            user_message = _remote_user_message(original_prompt, image, image_sent)
+            content = user_message["content"]
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            user_message["content"] = content + reference_content
     _analysis_log(
         f"frontend_model={frontend_model!r} resolved_model={model_id!r} local={is_local}",
         request_id,
@@ -687,7 +736,14 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
         _analysis_log(f"image_not_sent_reason={reason}", request_id)
 
     started_at = time.perf_counter()
-    if is_local:
+    progress("generation", "running", f"正在调用 {model_id} 生成结构化分析结果。")
+    if is_local_qwen:
+        from inferenceValid.local_qwen_vl import SERVICE as QWEN_SERVICE
+        progress("generation", "running", "正在准备本地 Qwen 视觉生成模型。")
+        cfg["messages"].append(user_message)
+        with _MODEL_CALL_LOCK:
+            answer = QWEN_SERVICE.generate(cfg["messages"], cfg, args, args.on_model_progress)
+    elif is_local:
         lora_adapter = module.choose_lora_adapter(cfg, args)
         _analysis_log(
             f"local_prepare use_lora={lora_adapter is not None} adapter={str(lora_adapter) if lora_adapter else 'disabled'}",
@@ -711,7 +767,7 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
         except SystemExit as error:
             raise RuntimeError(f"本地模型 {model_id} 调用提前退出：{error.code}") from error
     else:
-        cfg["messages"].append(_remote_user_message(prompt, image, image_sent))
+        cfg["messages"].append(user_message if rag_enabled and supports_images else _remote_user_message(prompt, image, image_sent))
         _analysis_log(
             f"remote_call begin base_url={str(cfg.get('base_url') or '').rstrip('/')} model={cfg.get('model')}",
             request_id,
@@ -729,6 +785,8 @@ def _analyze_case(payload: dict, request_id: str | None = None) -> dict[str, str
         raise RuntimeError(answer)
 
     report = _complete_report(_normalize_model_answer(answer, inputs))
+    progress("generation", "complete", "模型已返回结果，四个诊疗字段已完成解析。",
+             {"elapsed_seconds": round(elapsed, 2), "answer_chars": len(answer)})
     _analysis_log(f"normalized_report field_lengths={{ {_field_lengths(report)} }}", request_id)
     return report
 
@@ -740,7 +798,7 @@ def _error_report(error: Exception) -> dict[str, str]:
         "diagnosis": "后端分析失败。",
         "findings": "未生成关键发现。",
         "analysis": message[:800] or "未知错误。",
-        "advice": "请检查 inferenceValid/config.json、模型路径/API Key、依赖安装和控制台日志；最终判断需由临床医生结合实际检查复核。",
+        "advice": "请检查 inferenceValid/config.json、rag_config.json、模型路径、向量库、API Key 和控制台日志；最终判断需由临床医生结合实际检查复核。",
     }
 
 
@@ -750,9 +808,41 @@ class CardioAIHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
+        if path == "/api/rag/image":
+            return self._send_rag_image()
         if path in {"", "/"}:
             self.path = "/cardio_ai_platform/index.html"
         return super().do_GET()
+
+    def _send_rag_image(self):
+        """提供已入库参考资料的图片预览，点击后可读取完整尺寸图片。"""
+        from inferenceValid.rag_mira import SERVICE
+
+        query = parse_qs(urlsplit(self.path).query)
+        try:
+            record_id = query.get("id", [""])[0]
+            index = int(query.get("index", ["0"])[0])
+            body, content_type = SERVICE.read_display_image(record_id, index, query.get("full") == ["1"])
+        except ValueError as error:
+            self._send_json({"error": str(error)}, status=400)
+            return
+        except FileNotFoundError as error:
+            self._send_json({"error": str(error)}, status=404)
+            return
+        except Exception as error:
+            print(f"[CardioAI][RAG图片] 读取失败：{error}", flush=True)
+            traceback.print_exc()
+            self._send_json({"error": "参考图片暂时无法读取，请查看后端日志。"}, status=500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def do_OPTIONS(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
@@ -799,24 +889,43 @@ class CardioAIHandler(SimpleHTTPRequestHandler):
         )
         self._send_sse_headers()
         self._write_sse({"status": "started", "request_id": request_id})
-        try:
-            report = _analyze_case(payload, request_id=request_id)
-        except SystemExit as error:
-            message = f"模型调用提前退出：{error.code}；请查看控制台中的依赖检查或模型加载日志。"
-            _analysis_log(f"failed: {message}", request_id)
-            report = _error_report(RuntimeError(message))
-        except Exception as error:
-            _analysis_log(f"failed: {error}", request_id)
-            report = _error_report(error)
+        events = queue.Queue()
 
-        _analysis_log(f"sse_report field_lengths={{ {_field_lengths(report)} }}", request_id)
-        for field in REPORT_FIELD_ORDER:
-            self._write_sse({"delta": {field: report[field]}})
-            _analysis_log(f"sse_delta_sent field={field} chars={len(report[field])}", request_id)
-            time.sleep(0.04)
-        self._write_sse(report)
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        def analyze_worker():
+            try:
+                result = _analyze_case(payload, request_id=request_id, on_progress=events.put)
+                events.put({"type": "result", "report": result})
+            except (Exception, SystemExit) as error:
+                _analysis_log(f"分析失败：{error}", request_id)
+                traceback.print_exc()
+                events.put({"type": "error", "message": str(error) or "模型调用提前退出。"})
+
+        threading.Thread(target=analyze_worker, daemon=True).start()
+        try:
+            while True:
+                try:
+                    event = events.get(timeout=10)
+                except queue.Empty:
+                    elapsed = round(time.perf_counter() - request_started_at, 1)
+                    _analysis_log(f"仍在处理，已耗时 {elapsed} 秒", request_id)
+                    self._write_sse({"type": "heartbeat", "elapsed_seconds": elapsed})
+                    continue
+                event["request_id"] = request_id
+                event["elapsed_seconds"] = round(time.perf_counter() - request_started_at, 2)
+                if event["type"] == "result":
+                    report = event["report"]
+                    break
+                self._write_sse(event)
+                if event["type"] == "error":
+                    report = _error_report(RuntimeError(event["message"]))
+                    break
+            for field in REPORT_FIELD_ORDER:
+                self._write_sse({"delta": {field: report[field]}})
+            self._write_sse(report)
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            _analysis_log("浏览器已断开连接，停止发送结果。", request_id)
         _analysis_log(
             f"completed elapsed={time.perf_counter() - request_started_at:.2f}s",
             request_id,
@@ -893,6 +1002,7 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1", help="服务绑定地址。")
     parser.add_argument("--port", type=int, default=8765, help="优先使用的本地端口。")
+    parser.add_argument("--no-preload-rag", action="store_true", help="关闭启动时的 RAG 后台预加载，首次开启 RAG 时再加载。")
     parser.add_argument(
         "--no-open",
         action="store_true",
@@ -916,6 +1026,17 @@ def main() -> None:
     print("")
     print("正在初始化心血管疾病人工智能诊疗与知识融合平台...")
     _preload_local_models(args.preload_local_models)
+    if not args.no_preload_rag:
+        def preload_rag():
+            try:
+                from inferenceValid.rag_mira import SERVICE
+                SERVICE.preload(lambda stage, status, message, details:
+                                print(f"[CardioAI][RAG预加载] {stage} {status} {message}", flush=True))
+                print("[CardioAI][RAG预加载] 编码器已就绪，后续请求将复用模型。", flush=True)
+            except (Exception, SystemExit) as error:
+                print(f"[CardioAI][RAG预加载] 失败：{error}；普通病例分析仍可使用，RAG 请求时将重试。", flush=True)
+                traceback.print_exc()
+        threading.Thread(target=preload_rag, daemon=True).start()
 
     port = pick_port(args.host, args.port)
     server = ThreadingHTTPServer((args.host, port), CardioAIHandler)

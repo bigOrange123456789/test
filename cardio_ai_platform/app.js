@@ -8,6 +8,13 @@ const state = {
   analyzing: false,
   analysisStatus: "idle",
   selectedAnalysisModel: "deepseek-original",
+  ragEnabled: false,
+  ragK: 3,
+  analysisRagEnabled: null,
+  analysisProgress: {},
+  analysisProgressLog: [],
+  ragMatches: [],
+  analysisElapsed: 0,
   analysisInputs: null,
   analysisResult: null,
   analysisDraft: {
@@ -37,6 +44,7 @@ const MAX_ANALYSIS_IMAGE_BYTES = 20 * 1024 * 1024;
 const analysisModels = [
   { id: "deepseek-original", label: "原本deepseek（本地）" },
   { id: "deepseek-finetuned", label: "微调deepseek（LoRA）" },
+  { id: "qwen3-vl-local", label: "Qwen3-VL-2B-Instruct（本地视觉）" },
   { id: "remote-api-1", label: "远程 API-1（deepseek）" },
   { id: "remote-api-2", label: "远程 API-2（通义视觉）" },
 ];
@@ -72,6 +80,7 @@ function analysisReportLengths(report = {}) {
 function analysisPayloadSummary(payload) {
   return {
     model: payload?.model || "",
+    rag: payload?.rag || { enabled: false },
     inputKeys: Object.keys(payload?.inputs || {}),
     inputLengths: analysisInputLengths(payload?.inputs || {}),
     image: payload?.image
@@ -86,7 +95,7 @@ function analysisPayloadSummary(payload) {
 }
 
 function selectedAnalysisModelSupportsImage(modelId = state.selectedAnalysisModel) {
-  return modelId === "remote-api-2";
+  return modelId === "remote-api-2" || modelId === "qwen3-vl-local";
 }
 
 function formatFileSize(bytes) {
@@ -656,7 +665,7 @@ function collectAnalysisPayload() {
         dataUrl: state.uploadedImage.dataUrl,
       }
     : null;
-  return { model, inputs, image };
+  return { model, inputs, image, rag: { enabled: state.ragEnabled, k: state.ragK } };
 }
 
 function stringifyAnalysisValue(value) {
@@ -749,7 +758,7 @@ function parseAnalysisStreamPayload(text) {
       const report = extractAnalysisReport(payload);
       if (report) mergedReport = mergeAnalysisReports(mergedReport, report);
     } catch (error) {
-      // Partial stream chunks are expected to be invalid JSON until enough text arrives.
+      // 流式分块可能还不是完整 JSON，等待后续内容到达。
     }
   }
   return mergedReport;
@@ -772,7 +781,7 @@ function parseAnalysisResponseText(text, contentType = "") {
   }
 }
 
-async function readAnalysisResponse(response) {
+async function readAnalysisResponse(response, onEvent = () => {}) {
   const contentType = response.headers?.get("Content-Type") || "";
   const reader = response.body?.getReader();
   analysisDebug("response:body-reader", {
@@ -785,30 +794,63 @@ async function readAnalysisResponse(response) {
       chars: text.length,
       preview: text.slice(0, 320),
     });
+    for (const candidate of collectJsonCandidates(text)) {
+      let event;
+      try { event = JSON.parse(candidate); } catch { continue; }
+      if (event.type === "error" || event.error) throw new Error(event.message || String(event.error));
+      if (event.type === "progress" || event.type === "heartbeat") onEvent(event);
+    }
     return parseAnalysisResponseText(text, contentType);
   }
 
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let eventBuffer = "";
   let latestReport = null;
   let chunkIndex = 0;
-
-  while (true) {
+  function consumeEvent(block) {
+    const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart()).join("\n");
+    if (!data || data.trim() === "[DONE]") return;
+    let event;
+    try { event = JSON.parse(data); }
+    catch (error) { throw new Error(`无法解析后端事件：${error.message}`); }
+    if (event.type === "error" || event.error) throw new Error(event.message || String(event.error));
+    if (event.type === "progress" || event.type === "heartbeat") onEvent(event);
+    const report = extractAnalysisReport(event);
+    if (report) latestReport = mergeAnalysisReports(latestReport, report);
+  }
+  try {
+   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
     chunkIndex += 1;
-    buffer += decoder.decode(value, { stream: true });
-    const streamedReport = parseAnalysisStreamPayload(buffer);
-    if (streamedReport) latestReport = mergeAnalysisReports(latestReport, streamedReport);
+    const chunk = decoder.decode(value, { stream: true });
+    buffer += chunk;
+    eventBuffer += chunk;
+    // 只消费完整 SSE 事件，保留跨网络分块的 UTF-8 字符和 CRLF 边界。
+    let boundary;
+    while ((boundary = /\r?\n\r?\n/.exec(eventBuffer))) {
+      consumeEvent(eventBuffer.slice(0, boundary.index));
+      eventBuffer = eventBuffer.slice(boundary.index + boundary[0].length);
+    }
     analysisDebug("stream:chunk", {
       chunkIndex,
       bytes: value?.byteLength || 0,
       bufferChars: buffer.length,
       latestFieldLengths: latestReport ? analysisReportLengths(latestReport) : null,
     });
+   }
+   const tail = decoder.decode();
+   buffer += tail;
+   eventBuffer += tail;
+   if (eventBuffer.trim()) consumeEvent(eventBuffer);
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-
-  buffer += decoder.decode();
   const finalReport = parseAnalysisStreamPayload(buffer);
   analysisDebug("stream:done", {
     chunks: chunkIndex,
@@ -833,7 +875,7 @@ async function readAnalysisResponse(response) {
   return parseAnalysisResponseText(buffer, contentType);
 }
 
-async function requestAnalysis(payload) {
+async function requestAnalysis(payload, onEvent) {
   const startedAt = performance.now();
   analysisDebug("request:start", {
     url: ANALYSIS_API_URL,
@@ -862,7 +904,7 @@ async function requestAnalysis(payload) {
       }`
     );
   }
-  const report = await readAnalysisResponse(response);
+  const report = await readAnalysisResponse(response, onEvent);
   analysisDebug("request:complete", {
     elapsedMs: Math.round(performance.now() - startedAt),
     fieldLengths: analysisReportLengths(report),
@@ -1080,6 +1122,7 @@ function renderDashboard() {
 
 function renderDiagnosis() {
   const item = currentCase();
+  const showRag = state.analysisRagEnabled ?? state.ragEnabled;
   const finished = state.analysisIndex >= workflow.length;
   const analysisBusy = state.analysisStatus === "running" || state.analysisStatus === "typing";
   const statusLabel =
@@ -1156,7 +1199,7 @@ function renderDiagnosis() {
           <div class="report-section">
             <div class="field">
               <label for="analysis-model">AI 模型</label>
-              <select id="analysis-model" class="select" data-analysis-model>
+              <select id="analysis-model" class="select" data-analysis-model ${analysisBusy ? "disabled" : ""}>
                 ${analysisModels
                   .map(
                     (model) => `
@@ -1165,6 +1208,17 @@ function renderDiagnosis() {
                   .join("")}
               </select>
             </div>
+          </div>
+          <div class="report-section rag-controls">
+            <label class="rag-toggle" for="analysis-rag">
+              <input id="analysis-rag" type="checkbox" data-analysis-rag ${state.ragEnabled ? "checked" : ""} ${analysisBusy ? "disabled" : ""} />
+              RAG 检索增强
+            </label>
+            <div class="field rag-k-field">
+              <label for="analysis-rag-k">参考组数 K</label>
+              <input id="analysis-rag-k" class="input" type="number" min="1" max="10" step="1" value="${h(state.ragK)}" data-rag-k ${!state.ragEnabled || analysisBusy ? "disabled" : ""} />
+            </div>
+            ${state.ragEnabled && !selectedAnalysisModelSupportsImage() ? '<p class="rag-model-note">当前为文本模型：检索使用图文，生成仅使用问答。完整图文参考请选择通义视觉或本地 Qwen。</p>' : ""}
           </div>
           <div class="button-row">
             <button class="button" data-action="start-analysis" ${analysisBusy ? "disabled" : ""}>开始 AI 分析</button>
@@ -1175,11 +1229,11 @@ function renderDiagnosis() {
           <div class="panel-header">
             <div>
               <h2 class="panel-title">中间：AI 医学分析过程</h2>
-              <p class="panel-kicker">从输入解析到证据检查的医学推理流程可视化。</p>
+              <p class="panel-kicker">${showRag ? "MIRA 图文检索与病例分析" : "从输入解析到证据检查的医学推理流程可视化。"}</p>
             </div>
             <span class="tag ${finished ? "" : "gray"}">${h(statusLabel)}</span>
           </div>
-          <div class="workflow-list">
+          ${showRag ? '<div data-rag-progress>' + renderRagProgress() + '</div>' : `<div class="workflow-list">
             ${workflow
               .map(([title, copy, confidence], index) => {
                 const status =
@@ -1200,7 +1254,7 @@ function renderDiagnosis() {
                   </div>`;
               })
               .join("")}
-          </div>
+          </div>`}
         </div>
         <div class="panel">
           <div class="panel-header">
@@ -1209,12 +1263,134 @@ function renderDiagnosis() {
               <p class="panel-kicker">由后端返回的 diagnosis / findings / analysis / advice 字段生成。</p>
             </div>
           </div>
-          ${renderStructuredReport()}
+          <div data-structured-report>${renderStructuredReport()}</div>
         </div>
       </section>
     </div>
   `;
 }
+
+const ragStages = [
+  ["input", "接收病例材料"],
+  ["index", "连接 MIRA 向量库"],
+  ["embedding", "Qwen3-VL 图文编码"],
+  ["retrieval", "检索 Top-K 相似数据"],
+  ["sources", "读取完整问答与图片"],
+  ["context", "组装检索增强上下文"],
+  ["generation", "生成结构化诊疗结果"],
+];
+
+function renderRagProgress() {
+  return `<div data-rag-steps>${renderRagSteps()}</div>
+    <div data-rag-matches>${renderRagMatches()}</div>
+    <div data-rag-log>${renderRagLog()}</div>`;
+}
+
+function renderRagSteps() {
+  const statusLabels = { complete: "已完成", running: "进行中", error: "失败" };
+  return `
+    <p class="rag-runtime" data-rag-elapsed>已耗时 ${state.analysisElapsed.toFixed(1)} 秒</p>
+    <div class="workflow-list rag-workflow">
+      ${ragStages.map(([key, title], index) => {
+        const entry = state.analysisProgress[key];
+        const status = entry?.state || "";
+        const details = entry?.details || {};
+        const facts = [];
+        if (details.count !== undefined) facts.push(`${Number(details.count).toLocaleString()} 组可检索`);
+        if (details.index_complete === false) facts.push("数据集尚未全部入库");
+        if (details.device) facts.push(`设备 ${details.device}`);
+        if (details.text_chars !== undefined) facts.push(`${details.text_chars} 字符`);
+        if (details.image_count !== undefined) facts.push(`${details.image_count} 张输入图片`);
+        if (details.dimension) facts.push(`${details.dimension} 维`);
+        if (details.norm !== undefined) facts.push(`L2 范数 ${Number(details.norm).toFixed(6)}`);
+        if (details.images_sent !== undefined) facts.push(`生成模型接收 ${details.images_sent} 张图片`);
+        if (details.prompt_chars) facts.push(`上下文 ${details.prompt_chars} 字符`);
+        return `<div class="workflow-step ${status === "complete" ? "completed" : h(status)}">
+          <div class="step-index">${index + 1}</div>
+          <div class="rag-step-content">
+            <h3 class="step-title">${h(title)}</h3>
+            <p class="step-copy">${h(entry?.message || "等待处理")}</p>
+            ${facts.length ? `<p class="rag-facts">${h(facts.join(" · "))}</p>` : ""}
+          </div>
+          <span class="rag-step-status">${h(statusLabels[status] || "待开始")}</span>
+        </div>`;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderRagMatches() {
+  if (!state.ragMatches.length) return "";
+  return `<div class="report-section rag-matches">
+      <h3>检索命中 · ${state.ragMatches.length} 组</h3>
+      ${state.ragMatches.map((match) => `<article class="rag-match" data-rag-match="${h(match.id)}">
+        <div class="rag-match-heading">
+          <h4>[MIRA-${h(match.rank)}]</h4>
+          <span>余弦相似度 ${Number(match.similarity).toFixed(4)} · ${h(match.image_count)} 张图片</span>
+        </div>
+        <p>${h(match.id)}</p>
+        <p>${h(match.source_csv)} · 数据行 ${Number(match.source_row) + 1} · ${h(match.category)}</p>
+        <h5 class="rag-content-label">问答文本</h5>
+        <pre class="rag-document">${h(match.document ?? match.preview ?? "未提供问答文本。")}</pre>
+        <h5 class="rag-content-label">对应图片</h5>
+        <div class="rag-images">
+          ${(match.images || []).map((image, index) => {
+            const url = typeof image.url === "string" && image.url.startsWith("/api/rag/image?") ? image.url : "";
+            if (!url) return '<p class="rag-image-error">图片地址不可用。</p>';
+            return `<figure class="rag-image">
+              <a href="${h(url + "&full=1")}" target="_blank" rel="noopener" title="查看完整图片">
+                <img src="${h(url)}" alt="${h(`[MIRA-${match.rank}] 图片 ${index + 1}：${image.name || "参考影像"}`)}" loading="lazy" decoding="async" data-rag-image />
+                <span class="rag-image-error" hidden>图片暂时无法加载</span>
+              </a>
+              <figcaption>图片 ${index + 1} · ${h(image.name || "参考影像")}</figcaption>
+            </figure>`;
+          }).join("")}
+          ${!match.images?.length ? '<p class="rag-image-error">未收到对应图片。</p>' : ""}
+        </div>
+      </article>`).join("")}
+    </div>`;
+}
+
+function renderRagLog() {
+  return state.analysisProgressLog.length ? `<details class="report-section rag-event-log">
+      <summary>处理日志 · ${state.analysisProgressLog.length} 条</summary>
+      <ol>${state.analysisProgressLog.map((entry) => `<li>${Number(entry.elapsed_seconds || 0).toFixed(1)}s · ${h(entry.message)}</li>`).join("")}</ol>
+    </details>` : "";
+}
+
+function handleAnalysisEvent(event, runId) {
+  if (runId !== state.analysisRunId) return;
+  state.analysisElapsed = Number(event.elapsed_seconds || 0);
+  if (event.type === "heartbeat") {
+    const elapsed = document.querySelector("[data-rag-elapsed]");
+    if (elapsed) elapsed.textContent = `已耗时 ${state.analysisElapsed.toFixed(1)} 秒，后端仍在处理`;
+    return;
+  }
+  if (event.type !== "progress" || !ragStages.some(([key]) => key === event.stage)) return;
+  const previous = state.analysisProgress[event.stage];
+  state.analysisProgress[event.stage] = { ...event, details: { ...(previous?.details || {}), ...event.details } };
+  state.analysisProgressLog.push(event);
+  if (event.details?.matches) state.ragMatches = event.details.matches;
+  analysisDebug("流程进度", event);
+  const panel = document.querySelector("[data-rag-progress]");
+  if (panel) {
+    panel.querySelector("[data-rag-steps]").innerHTML = renderRagSteps();
+    // 后续生成进度只刷新步骤和日志，保留正在查看的问答及已经加载的图片。
+    if (event.details?.matches) panel.querySelector("[data-rag-matches]").innerHTML = renderRagMatches();
+    const log = panel.querySelector("[data-rag-log]");
+    const wasOpen = log.querySelector("details")?.open;
+    log.innerHTML = renderRagLog();
+    if (wasOpen && log.querySelector("details")) log.querySelector("details").open = true;
+  }
+}
+
+document.addEventListener("error", (event) => {
+  if (!event.target.matches?.("[data-rag-image]")) return;
+  event.target.hidden = true;
+  const message = event.target.parentElement.querySelector(".rag-image-error");
+  if (message) message.hidden = false;
+  console.error("[CardioAI][RAG] 参考图片加载失败：", event.target.src);
+}, true);
 
 function renderStructuredReport() {
   const report = state.analysisDraft || emptyAnalysisReport();
@@ -1250,7 +1426,7 @@ function renderAnalysisImageUpload() {
   const sendText = image
     ? imageWillSend
       ? "开始 AI 分析时会随病例文本发送给当前视觉模型。"
-      : "当前模型为文本模型，后端会保留附件信息但不发送图片像素。"
+      : state.ragEnabled ? "上传图片参与 RAG 图文检索；当前文本生成模型不接收图片像素。" : "当前模型为文本模型，后端会保留附件信息但不发送图片像素。"
     : "";
   return `
     <div class="upload-zone ${image ? "has-preview" : ""}">
@@ -2063,6 +2239,7 @@ function typeAnalysisResult(report, runId) {
     state.analysisDraft = emptyAnalysisReport();
     state.analysisStatus = "typing";
     state.typingField = analysisReportFields[0]?.key || "";
+    render();
     let fieldIndex = 0;
     let charIndex = 0;
 
@@ -2095,12 +2272,17 @@ function typeAnalysisResult(report, runId) {
         charIndex = 0;
       }
 
-      render();
+      const output = document.querySelector("[data-structured-report]");
+      if (output) output.innerHTML = renderStructuredReport();
     }, 22);
   });
 }
 
 async function startAnalysis() {
+  if (state.analysisStatus === "running" || state.analysisStatus === "typing") return;
+  const kInput = document.querySelector("[data-rag-k]");
+  if (state.ragEnabled && kInput && !kInput.reportValidity()) return;
+  if (state.ragEnabled && kInput) state.ragK = Number(kInput.value);
   const payload = collectAnalysisPayload();
   const runId = state.analysisRunId + 1;
   if (payload.image) {
@@ -2120,15 +2302,20 @@ async function startAnalysis() {
   state.analysisResult = null;
   state.analysisDraft = emptyAnalysisReport();
   state.analysisError = "";
+  state.analysisRagEnabled = payload.rag.enabled;
+  state.analysisProgress = {};
+  state.analysisProgressLog = [];
+  state.ragMatches = [];
+  state.analysisElapsed = 0;
   state.typingField = "";
   render();
 
-  const requestPromise = requestAnalysis(payload);
+  const requestPromise = requestAnalysis(payload, (event) => handleAnalysisEvent(event, runId));
   analysisDebug("request:dispatched", {
     runId,
     note: "fetch 已在中间动画启动前派发，模型推理不会等待动画结束。",
   });
-  const workflowPromise = runAnalysisWorkflow(runId);
+  const workflowPromise = payload.rag.enabled ? Promise.resolve() : runAnalysisWorkflow(runId);
   try {
     const report = await requestPromise;
     analysisDebug("request:report-ready", {
@@ -2148,12 +2335,15 @@ async function startAnalysis() {
     state.analyzing = false;
     state.analysisStatus = "error";
     state.analysisError = error?.message || "未知错误";
-    const friendlyError = state.analysisError.split("：")[0];
+    for (const entry of Object.values(state.analysisProgress)) {
+      if (entry.state === "running") entry.state = "error";
+    }
+    state.analysisProgressLog.push({ message: state.analysisError, elapsed_seconds: state.analysisElapsed });
     state.analysisDraft = {
       diagnosis: "",
       findings: "",
-      analysis: `AI 分析请求失败：${friendlyError}`,
-      advice: "请确认 /api/analyze 后端服务已启动、接口路径一致，并查看浏览器控制台中的错误详情。",
+      analysis: `AI 分析请求失败：${state.analysisError}`,
+      advice: "请核对模型、向量库和图片路径配置，并查看后端同一请求的处理日志。",
     };
     render();
   }
@@ -2328,6 +2518,11 @@ document.addEventListener("click", (event) => {
       state.analysisStatus = "idle";
       state.analysisDraft = emptyAnalysisReport();
       state.analysisIndex = -1;
+      state.analysisRagEnabled = null;
+      state.analysisProgress = {};
+      state.analysisProgressLog = [];
+      state.ragMatches = [];
+      state.analysisElapsed = 0;
     }
     if (sourceId) state.selectedSourceId = sourceId;
     setRoute(routeButton.getAttribute("data-route"));
@@ -2365,6 +2560,11 @@ document.addEventListener("click", (event) => {
       state.analysisStatus = "idle";
       state.analysisDraft = emptyAnalysisReport();
       state.analysisIndex = -1;
+      state.analysisRagEnabled = null;
+      state.analysisProgress = {};
+      state.analysisProgressLog = [];
+      state.ragMatches = [];
+      state.analysisElapsed = 0;
     }
     render();
     return;
@@ -2416,6 +2616,16 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-analysis-rag]")) {
+    state.ragEnabled = event.target.checked;
+    state.analysisRagEnabled = null;
+    render();
+    return;
+  }
+  if (event.target.matches("[data-rag-k]")) {
+    if (event.target.checkValidity()) state.ragK = Number(event.target.value);
+    return;
+  }
   if (event.target.matches("[data-analysis-image-input]")) {
     handleAnalysisImageUpload(event.target);
     return;

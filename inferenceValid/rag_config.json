@@ -1,0 +1,11 @@
+{
+  "data_root": "G:/Codex_dataset/MIRA-data",
+  "db_dir": "G:/Codex_dataset/MIRA-chroma",
+  "collection": "mira_qwen3_vl_embedding",
+  "model_dir": "Qwen3-VL-Embedding-2B",
+  "device": "auto",
+  "max_seq_length": 8192,
+  "max_k": 10,
+  "max_context_chars": 200000,
+  "max_reference_image_bytes": 67108864
+}
