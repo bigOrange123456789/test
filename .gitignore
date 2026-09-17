@@ -30,6 +30,9 @@ dataset/**/*.tsv
 /script/mira_split_ids.json
 /script/evaluate_rag.json
 
+# Qwen3-VL LoRA adapters and Trainer checkpoints
+/script/qwen3_vl_2b_lora_adapter/
+
 # Large local model assets, caches, and fine-tuning outputs.
 # Keep only the local training scripts and their dependency file.
 DeepSeek-Model/*
