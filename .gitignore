@@ -26,6 +26,10 @@ dataset/**/*.parquet
 dataset/**/*.csv
 dataset/**/*.tsv
 
+# Local MIRA sampling results and evaluation configuration
+/script/mira_split_ids.json
+/script/evaluate_rag.json
+
 # Large local model assets, caches, and fine-tuning outputs.
 # Keep only the local training scripts and their dependency file.
 DeepSeek-Model/*

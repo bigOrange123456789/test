@@ -29,6 +29,9 @@ class SampleMiraIdsTests(unittest.TestCase):
         embedded_patch = patch.object(sample_mira_ids, "load_embedded_ids", return_value=set())
         self.embedded_ids = embedded_patch.start()
         self.addCleanup(embedded_patch.stop)
+        keywords_patch = patch.object(sample_mira_ids, "load_keywords", return_value=["hypertension"])
+        self.keywords = keywords_patch.start()
+        self.addCleanup(keywords_patch.stop)
         self.console = io.StringIO()
         console_patch = redirect_stdout(self.console)
         console_patch.__enter__()
@@ -231,6 +234,90 @@ class SampleMiraIdsTests(unittest.TestCase):
         sample_dataset(self.root, 2, 1)
         self.embedded_ids.assert_called_once_with(self.root.parent / "MIRA-chroma", "mira_qwen3_vl_embedding")
 
+    def keyword_rows(self, texts):
+        return [{
+            "image_path": f"images/{index}.png",
+            "caption": "A caption",
+            "vqa_json": {"open_ended": [{"question": text, "answer": "Answer"}]},
+        } for index, text in enumerate(texts)]
+
+    def test_default_keywords_file_is_configured_dataset_sibling(self):
+        result = sample_dataset(self.root, 2, 1)
+        expected = self.root.parent / "MIRA_myConfig" / "cardiovascular_ai_keywords2.txt"
+        self.keywords.assert_called_once_with(expected.resolve())
+        self.assertEqual(result["keywords_file"], str(expected.resolve()))
+        self.assertEqual(result["keywords"], ["hypertension"])
+
+    def test_both_conditions_then_embedded_then_keyword_then_neither(self):
+        self.write_split("train", self.keyword_rows(
+            ["Hypertension"] * 3 + ["Neutral"] * 3 + ["Hypertension"] * 3 + ["Neutral"] * 3))
+        ids = self.ids_for()
+        both, embedded_only, keyword_only, neither = map(set, (ids[:3], ids[3:6], ids[6:9], ids[9:]))
+        self.embedded_ids.return_value = both | embedded_only
+        result = sample_dataset(self.root, 5, 2, seed=21)
+        training, testing = set(result["train_ids"]), set(result["test_ids"])
+        self.assertTrue(testing.issubset(both))
+        self.assertEqual(training & both, both - testing)
+        self.assertTrue(embedded_only.issubset(training))
+        self.assertEqual(len(training & keyword_only), 1)
+        self.assertTrue((training | testing).isdisjoint(neither))
+        self.assertEqual(result["keyword_samples"], 6)
+        self.assertEqual(result["keyword_embedded_samples"], 3)
+        self.assertEqual(result["selected_keyword_counts"], {"train": 2, "test": 2})
+        self.assertEqual(result["selected_keyword_embedding_counts"], {"train": 1, "test": 2})
+        self.assertEqual(result["selected_embedding_counts"], {"train": 4, "test": 2})
+        repeated = sample_dataset(self.root, 5, 2, seed=21)
+        self.assertEqual(result["train_ids"], repeated["train_ids"])
+        self.assertEqual(result["test_ids"], repeated["test_ids"])
+
+    def test_keyword_shortage_falls_back_without_duplicate_ids(self):
+        self.write_split("train", self.keyword_rows(["hypertension", "Neutral", "hypertension", "Neutral"]))
+        ids = self.ids_for()
+        self.embedded_ids.return_value = set(ids[:2])
+        result = sample_dataset(self.root, 2, 2)
+        self.assertEqual(set(result["test_ids"]), set(ids[:2]))
+        self.assertEqual(set(result["train_ids"]), set(ids[2:]))
+        self.assertEqual(result["selected_keyword_counts"], {"train": 1, "test": 1})
+        self.assertEqual(result["selected_keyword_embedding_counts"], {"train": 0, "test": 1})
+
+    def test_keyword_coverage_counts_qas_once_and_audits_all_splits(self):
+        rows = self.keyword_rows(["Hypertension hypertension", "Neutral"])
+        rows[0]["caption"] = "hypertension"
+        rows[0]["vqa_json"]["open_ended"][0]["answer"] = "hypertension"
+        rows[0]["vqa_json"]["open_ended"].append({"question": "Neutral sibling", "answer": "Answer"})
+        self.write_split("train", rows)
+        self.write_split("validation", self.keyword_rows(["hypertension", "Neutral"]))
+        self.write_split("test", self.keyword_rows(["hypertension"]))
+        self.embedded_ids.return_value = {self.ids_for()[0], self.ids_for("validation")[0]}
+        result = sample_dataset(self.root, 1, 1)
+        self.assertEqual(result["keyword_coverage"], {
+            "keyword_count": 1,
+            "matched_samples": 3,
+            "matched_embedded_samples": 2,
+            "splits": {
+                "train": {"matched_samples": 1, "matched_embedded_samples": 1},
+                "validation": {"matched_samples": 1, "matched_embedded_samples": 1},
+                "test": {"matched_samples": 1, "matched_embedded_samples": 0},
+            },
+        })
+        self.assertEqual(result["total_samples"], 3)
+        self.assertEqual(result["embedding_coverage"]["total_samples"], 6)
+        self.assertEqual(result["keyword_samples"], 1)
+        self.assertEqual(result["keyword_embedded_samples"], 1)
+        self.assertEqual(result["sample_unit"], "question_answer")
+        self.assertIn("Groups matching at least one keyword: 3", self.console.getvalue())
+        self.assertIn("Keyword-matching groups with stored embeddings: 2", self.console.getvalue())
+
+    def test_shared_image_exclusion_overrides_keyword_embedding_priority(self):
+        rows = self.keyword_rows(["hypertension", "hypertension", "Neutral", "Neutral"])
+        rows[1]["image_path"] = rows[0]["image_path"]
+        self.write_split("train", rows)
+        self.embedded_ids.return_value = set(self.ids_for())
+        result = sample_dataset(self.root, 2, 1, exclude_shared_images=True)
+        self.assertTrue(self.images_for(result["train_ids"]).isdisjoint(self.images_for(result["test_ids"])))
+        self.assertEqual(result["selected_keyword_embedding_counts"], {"train": 0, "test": 1})
+        self.assertEqual(result["excluded_shared_image_samples"], 1)
+
     def run_cli(self, output, train_count, test_count):
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -255,6 +342,75 @@ class SampleMiraIdsTests(unittest.TestCase):
         process = self.run_cli(output, 0, 2)
         self.assertNotEqual(process.returncode, 0)
         self.assertFalse(output.exists())
+
+    def test_cli_accepts_explicit_keywords_file(self):
+        output = self.root / "split.json"
+        keywords_file = self.root / "custom-keywords.txt"
+        returncode = sample_mira_ids.main([
+            "--data-root", str(self.root), "--train-count", "2", "--test-count", "1",
+            "--keywords-file", str(keywords_file), "--output", str(output),
+        ])
+        self.assertEqual(returncode, 0)
+        self.keywords.assert_called_once_with(keywords_file.resolve())
+        result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(result["keywords_file"], str(keywords_file.resolve()))
+        self.assertIn("keyword_coverage", result)
+
+
+class KeywordMatchingTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def sample(self, **overrides):
+        fields = {"question": "Neutral", "options": None, "answer": "Answer", "extra": {},
+                  "caption": "Hypertension", "images": ["images/Hypertension.png"]}
+        return SimpleNamespace(**(fields | overrides))
+
+    def test_load_keywords_normalizes_whitespace_deduplicates_and_skips_comments(self):
+        path = self.root / "keywords.txt"
+        path.write_text("\ufeff# Cardiovascular terms\n  Hypertension  \n\n  # More terms\n"
+                        "HYPERTENSION\nHeart\t failure\n", encoding="utf-8")
+        self.assertEqual(sample_mira_ids.load_keywords(path), ["Hypertension", "Heart failure"])
+
+    def test_missing_and_empty_keyword_files_are_rejected(self):
+        path = self.root / "keywords.txt"
+        with self.assertRaises(FileNotFoundError):
+            sample_mira_ids.load_keywords(path)
+        path.write_text("\n# Comments only\n \n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            sample_mira_ids.load_keywords(path)
+
+    def test_keyword_and_abbreviation_boundaries_are_case_insensitive(self):
+        pattern = sample_mira_ids.compile_keywords(["myocardial infarction (MI)", "hypertension"])
+        for text in ("MI", "Prior mi.", "MYOCARDIAL\n  INFARCTION", "Hypertension."):
+            with self.subTest(text=text):
+                self.assertTrue(sample_mira_ids.matches_keywords(self.sample(question=text), pattern))
+        for text in ("similar", "mild pain", "BMI", "prehypertension", "hypertensions", "infarctions"):
+            with self.subTest(text=text):
+                self.assertFalse(sample_mira_ids.matches_keywords(self.sample(question=text), pattern))
+
+    def test_nested_qa_values_match_without_metadata_or_dictionary_key_leakage(self):
+        pattern = sample_mira_ids.compile_keywords(["hypertension"])
+        for fields in (
+            {"question": "History of hypertension"},
+            {"options": {"A": "Hypertension", "B": "Other"}},
+            {"answer": {"explanations": [None, 3, {"finding": "hypertension"}]}},
+            {"extra": {"rationale": [{"text": "hypertension"}]}},
+        ):
+            with self.subTest(fields=fields):
+                self.assertTrue(sample_mira_ids.matches_keywords(self.sample(**fields), pattern))
+        self.assertFalse(sample_mira_ids.matches_keywords(self.sample(), pattern))
+        self.assertFalse(sample_mira_ids.matches_keywords(
+            self.sample(answer={"hypertension": "Absent"}, extra={"hypertension": False}), pattern))
+
+    def test_phrase_cannot_span_unrelated_qa_fields(self):
+        pattern = sample_mira_ids.compile_keywords(["heart failure"])
+        self.assertFalse(sample_mira_ids.matches_keywords(
+            self.sample(question="heart", answer="failure"), pattern))
+        self.assertTrue(sample_mira_ids.matches_keywords(
+            self.sample(question="heart\t\n failure"), pattern))
 
 
 class LoadEmbeddedIdsTests(unittest.TestCase):
