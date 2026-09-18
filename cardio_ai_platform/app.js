@@ -1,3 +1,6 @@
+// 启动脚本在 HTML 入口中设置模板；直接静态访问时仍使用原版。
+const frontendTemplate = document.documentElement?.dataset?.frontendTemplate || "original";
+
 const state = {
   activeRoute: location.hash.replace("#", "") || "dashboard",
   selectedCaseId: "CV-DEMO-001",
@@ -1122,6 +1125,12 @@ function renderDashboard() {
 
 function renderDiagnosis() {
   const item = currentCase();
+  const compact = frontendTemplate === "compact";
+  const imageUpload = `
+    <div class="report-section">
+      <h3>医学影像上传</h3>
+      ${renderAnalysisImageUpload()}
+    </div>`;
   const showRag = state.analysisRagEnabled ?? state.ragEnabled;
   const finished = state.analysisIndex >= workflow.length;
   const analysisBusy = state.analysisStatus === "running" || state.analysisStatus === "typing";
@@ -1143,7 +1152,7 @@ function renderDiagnosis() {
         <strong>AI-generated / Research Demo</strong>
         <span>病例分析模块已接入 /api/analyze，当前输出由后端返回的结构化 JSON 动态驱动。</span>
       </div>
-      <section class="diagnosis-layout">
+      <section class="diagnosis-layout${compact ? " diagnosis-layout-compact" : ""}">
         <div class="panel">
           <div class="panel-header">
             <div>
@@ -1151,6 +1160,7 @@ function renderDiagnosis() {
               <p class="panel-kicker">支持结构化信息、报告文本和医学影像上传入口。</p>
             </div>
           </div>
+          ${compact ? imageUpload : ""}
           <div class="input-grid">
             <div class="field"><label>年龄</label><input class="input" data-analysis-meta="age" value="${h(analysisInputValue("age", item))}" /></div>
             <div class="field"><label>性别</label><select class="select" data-analysis-meta="sex">
@@ -1192,10 +1202,7 @@ function renderDiagnosis() {
             <h3>病例诊断报告</h3>
             <textarea class="textarea" data-analysis-input="diagnosisReport">${h(analysisInputValue("diagnosisReport", item))}</textarea>
           </div>
-          <div class="report-section">
-            <h3>医学影像上传</h3>
-            ${renderAnalysisImageUpload()}
-          </div>
+          ${compact ? "" : imageUpload}
           <div class="report-section">
             <div class="field">
               <label for="analysis-model">AI 模型</label>
@@ -1225,7 +1232,7 @@ function renderDiagnosis() {
             <button class="button secondary" data-route="cases">选择病例</button>
           </div>
         </div>
-        <div class="panel">
+        ${compact ? "" : `<div class="panel">
           <div class="panel-header">
             <div>
               <h2 class="panel-title">中间：AI 医学分析过程</h2>
@@ -1255,7 +1262,7 @@ function renderDiagnosis() {
               })
               .join("")}
           </div>`}
-        </div>
+        </div>`}
         <div class="panel">
           <div class="panel-header">
             <div>

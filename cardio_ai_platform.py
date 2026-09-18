@@ -15,7 +15,9 @@ import threading
 import time
 import traceback
 import webbrowser
+from functools import partial
 from importlib import metadata
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -23,6 +25,10 @@ from urllib.parse import parse_qs, urlsplit
 
 ROOT_DIR = Path(__file__).resolve().parent
 APP_INDEX = ROOT_DIR / "cardio_ai_platform" / "index.html"
+FRONTEND_TEMPLATES = {
+    "original": "原版（三栏病例分析）",
+    "compact": "精简版（两栏病例分析，影像上传置顶）",
+}
 INFERENCE_SCRIPT = ROOT_DIR / "inferenceValid" / "inferenceLoRa.py"
 INFERENCE_CONFIG = ROOT_DIR / "inferenceValid" / "config.json"
 
@@ -803,8 +809,32 @@ def _error_report(error: Exception) -> dict[str, str]:
 
 
 class CardioAIHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, frontend_template="original", **kwargs):
+        self.frontend_template = frontend_template
         super().__init__(*args, directory=str(ROOT_DIR), **kwargs)
+
+    def send_head(self):
+        # 同时覆盖 GET / HEAD 和前端入口的直接访问，不修改磁盘上的模板。
+        path = urlsplit(self.path).path
+        if path not in {"/", "/cardio_ai_platform/", "/cardio_ai_platform/index.html"}:
+            return super().send_head()
+        try:
+            html = APP_INDEX.read_text(encoding="utf-8")
+        except OSError:
+            self.send_error(404, "Front-end entry not found")
+            return None
+        body = html.replace(
+            'data-frontend-template="original"',
+            f'data-frontend-template="{self.frontend_template}"',
+            1,
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # 重启后切换模板时，不复用浏览器缓存中的旧入口。
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return BytesIO(body)
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
@@ -1002,6 +1032,12 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1", help="服务绑定地址。")
     parser.add_argument("--port", type=int, default=8765, help="优先使用的本地端口。")
+    parser.add_argument(
+        "--template",
+        choices=tuple(FRONTEND_TEMPLATES),
+        default="original",
+        help="前端模板：original 保留原版（默认）；compact 移除病例分析中间栏，并将影像上传置顶。",
+    )
     parser.add_argument("--no-preload-rag", action="store_true", help="关闭启动时的 RAG 后台预加载，首次开启 RAG 时再加载。")
     parser.add_argument(
         "--no-open",
@@ -1039,12 +1075,14 @@ def main() -> None:
         threading.Thread(target=preload_rag, daemon=True).start()
 
     port = pick_port(args.host, args.port)
-    server = ThreadingHTTPServer((args.host, port), CardioAIHandler)
+    handler = partial(CardioAIHandler, frontend_template=args.template)
+    server = ThreadingHTTPServer((args.host, port), handler)
     display_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     url = f"http://{display_host}:{port}/"
 
     print("")
     print("心血管疾病人工智能诊疗与知识融合平台已启动")
+    print(f"前端模板: {args.template} · {FRONTEND_TEMPLATES[args.template]}")
     print(f"本地链接: {url}")
     print("按 Ctrl+C 停止服务")
     print("")

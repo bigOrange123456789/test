@@ -605,6 +605,10 @@ a {
   align-items: start;
 }
 
+.diagnosis-layout-compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .input-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1397,7 +1401,7 @@ canvas {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 
-  .diagnosis-layout > .panel:last-child {
+  .diagnosis-layout:not(.diagnosis-layout-compact) > .panel:last-child {
     grid-column: 1 / -1;
   }
 

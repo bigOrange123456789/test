@@ -8,6 +8,18 @@ cd D:\Codex\MLMtest
 python cardio_ai_platform.py
 ```
 
+启动时可用 `--template` 选择前端模板（仅改变「病例分析」页面）：
+
+```powershell
+# 原版，默认值；省略 --template 时也是原版
+python cardio_ai_platform.py --template original
+
+# 精简版：移除中间「AI 医学分析过程」，将「医学影像上传」置于病例输入最前面
+python cardio_ai_platform.py --template compact
+```
+
+精简版保留病例输入和结构化诊疗结果两栏，小屏幕时自动纵向排列。模型选择、影像上传、RAG 检索与分析接口保持不变，但不显示中间栏的流程和检索资料；其余页面不变。切换模板需要停止服务，再用对应参数重新启动。
+
 进入「病例分析」，勾选「RAG 检索增强」，设置参考组数 K（默认 3，范围 1 到 10），选择生成模型后开始分析。不上传图片时，使用病例文本检索；关闭 RAG 时不查询向量库。
 
 通义视觉和本地 `Qwen3-VL-2B-Instruct` 会接收当前病例、上传图片以及每个命中组的完整问答和全部图片。原本 DeepSeek、LoRA DeepSeek 和远程文本 DeepSeek 不支持图片输入：它们可使用图文检索得到的问答文本，但不会接收图片像素。需要完整图文 RAG 时请选择通义视觉或本地 Qwen。
