@@ -48,9 +48,12 @@ class MiraEvaluationDataTests(unittest.TestCase):
         self.assertEqual(json.loads(rows[1]["question"].split("\nOptions: ", 1)[1]), options)
         self.assertEqual(rows[2]["reference"], "false")
         for row in rows:
-            self.assertEqual(set(row), {"id", "question", "reference", "images"})
+            self.assertEqual(set(row), {"id", "question", "reference", "images", "question_type", "options", "answer"})
             self.assertNotIn("SECRET", row["question"])
             self.assertNotIn("完整解释", row["question"])
+        self.assertEqual(rows[1]["question_type"], "multiple_choice")
+        self.assertEqual(rows[1]["answer"], answer)
+        self.assertEqual(rows[1]["options"], options)
 
     def test_missing_images_are_not_opened_and_paths_are_shared(self):
         self.write_split("train", [{"open_ended": [

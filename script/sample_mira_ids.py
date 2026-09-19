@@ -8,7 +8,7 @@
 JSON 参数说明（路径可为绝对路径，相对路径以 JSON 所在目录为基准）：
     train_count / test_count：训练集 / 测试集的问答数量，均为正整数。
     data_root：MIRA 数据目录。
-    keywords_file：关键词文件；null 使用数据目录旁的 MIRA_myConfig 中的默认文件。
+    keywords_file：关键词文件；设为 null 时不做关键词过滤，所有问答都视为关键词命中。
     db_dir：已有 Chroma 目录；null 使用数据目录旁的 MIRA-chroma。
     collection：Chroma 集合名。
     splits：抽样来源列表，支持 train、validation、test；默认只从 train.csv 抽样。
@@ -25,8 +25,9 @@ JSON 参数说明（路径可为绝对路径，相对路径以 JSON 所在目录
 数量以一个问答对为单位。先选测试题，再选训练题，优先级依次为：
 关键词与向量均匹配、仅有向量、仅匹配关键词、两者均不满足。
 会核查所有已有 train/validation/test CSV，但只从 splits 指定的来源抽样。
-关键词匹配问题、选项、答案和额外问答文本，不匹配共用图片标题；忽略大小写，
-使用词边界并允许短语内不同空白，括号中的缩写也可匹配。每道题只统计一次。
+指定关键词文件时，匹配问题、选项、答案和额外问答文本，不匹配共用图片标题；
+忽略大小写，使用词边界并允许短语内不同空白，括号中的缩写也可匹配。每道题只
+统计一次。keywords_file 为 null 时跳过关键词文件读取，所有问答均算作匹配。
 只使用标准库，并只读访问 Chroma 元数据；向量覆盖表示存在对应编号，不代表向量质量。
 """
 
@@ -175,7 +176,8 @@ def image_keys(data_root: Path, names: list[str]) -> set[str]:
 def sample_dataset(data_root: Path, train_count: int, test_count: int, *,
                    splits: list[str] | None = None, seed: int = 42,
                    exclude_shared_images: bool = False, db_dir: Path | None = None,
-                   collection: str = DEFAULT_COLLECTION, keywords_file: Path | None = None) -> dict:
+                   collection: str = DEFAULT_COLLECTION, keywords_file: Path | None = None,
+                   all_samples_match_keywords: bool = False) -> dict:
     """Audit all splits and prefer keyword-matching QAs with stored embeddings."""
     if train_count <= 0 or test_count <= 0:
         raise ValueError("train-count and test-count must be positive integers.")
@@ -188,11 +190,18 @@ def sample_dataset(data_root: Path, train_count: int, test_count: int, *,
         if not source.is_file():
             raise FileNotFoundError(f"Dataset CSV not found: {source}")
 
-    keywords_file = (Path(keywords_file) if keywords_file is not None
-                     else data_root.parent / "MIRA_myConfig" / KEYWORDS_FILENAME).expanduser().resolve()
-    keywords = load_keywords(keywords_file)
-    keyword_pattern = compile_keywords(keywords)
-    LOGGER.info("Loaded %d keywords from %s", len(keywords), keywords_file)
+    if all_samples_match_keywords:
+        if keywords_file is not None:
+            raise ValueError("全量关键词命中模式不能同时指定 keywords_file。")
+        keywords = []
+        keyword_pattern = None
+        LOGGER.info("keywords_file 为 null：所有问答均视为关键词命中。")
+    else:
+        keywords_file = (Path(keywords_file) if keywords_file is not None
+                         else data_root.parent / "MIRA_myConfig" / KEYWORDS_FILENAME).expanduser().resolve()
+        keywords = load_keywords(keywords_file)
+        keyword_pattern = compile_keywords(keywords)
+        LOGGER.info("Loaded %d keywords from %s", len(keywords), keywords_file)
     db_dir = (Path(db_dir) if db_dir is not None else data_root.parent / "MIRA-chroma").expanduser().resolve()
     embedded_ids = load_embedded_ids(db_dir, collection)
     coverage_splits = [split for split in SPLITS if (data_root / f"{split}.csv").is_file()]
@@ -212,7 +221,7 @@ def sample_dataset(data_root: Path, train_count: int, test_count: int, *,
             keyword_counts = {"matched_samples": 0, "matched_embedded_samples": 0}
             for sample in iter_samples(data_root, split):
                 embedded = sample.id in embedded_ids
-                matched = matches_keywords(sample, keyword_pattern)
+                matched = all_samples_match_keywords or matches_keywords(sample, keyword_pattern)
                 counts["total_samples"] += 1
                 counts["embedded_samples"] += embedded
                 keyword_counts["matched_samples"] += matched
@@ -314,9 +323,11 @@ def sample_dataset(data_root: Path, train_count: int, test_count: int, *,
         "data_root": str(data_root),
         "db_dir": str(db_dir),
         "chroma_collection": collection,
-        "keywords_file": str(keywords_file),
+        "keywords_file": str(keywords_file) if keywords_file is not None else None,
         "keywords": keywords,
-        "keyword_matching": "case_insensitive_whole_phrase_or_abbreviation",
+        "keyword_matching": ("all_samples" if all_samples_match_keywords
+                             else "case_insensitive_whole_phrase_or_abbreviation"),
+        "all_samples_match_keywords": all_samples_match_keywords,
         "keyword_text_fields": ["question", "options", "answer", "extra"],
         "sampling_priority": list(PRIORITY_ORDER),
         "source_splits": splits,
@@ -356,6 +367,7 @@ def _validated_config(payload: dict, config_path: Path) -> argparse.Namespace:
         raise ValueError(f"抽样配置包含未知字段：{sorted(unknown)}")
     if "_说明" in payload and not isinstance(payload["_说明"], str):
         raise ValueError("_说明 必须是中文说明字符串。")
+    keywords_explicitly_disabled = "keywords_file" in payload and payload["keywords_file"] is None
     settings = defaults | {key: value for key, value in payload.items() if key != "_说明"}
     for key in ("train_count", "test_count"):
         value = settings.get(key)
@@ -384,12 +396,14 @@ def _validated_config(payload: dict, config_path: Path) -> argparse.Namespace:
     data_root = settings["data_root"]
     if settings["db_dir"] is None:
         settings["db_dir"] = data_root.parent / "MIRA-chroma"
-    if settings["keywords_file"] is None:
+    if settings["keywords_file"] is None and not keywords_explicitly_disabled:
         settings["keywords_file"] = data_root.parent / "MIRA_myConfig" / KEYWORDS_FILENAME
     output = settings["output"]
     if output.suffix.lower() != ".json":
         raise ValueError("output 必须使用 .json 扩展名。")
-    protected = {config_path, DEFAULT_CONFIG_PATH.resolve(), settings["keywords_file"]}
+    protected = {config_path, DEFAULT_CONFIG_PATH.resolve()}
+    if settings["keywords_file"] is not None:
+        protected.add(settings["keywords_file"])
     if output in protected:
         raise ValueError("output 不能覆盖抽样配置文件或关键词文件，请指定独立的 ID 清单路径。")
     return argparse.Namespace(config=config_path, **settings)
@@ -460,7 +474,9 @@ def main(argv: list[str] | None = None) -> int:
         result = sample_dataset(args.data_root, args.train_count, args.test_count,
                                 splits=args.splits, seed=args.seed,
                                 exclude_shared_images=args.exclude_shared_images,
-                                db_dir=args.db_dir, collection=args.collection, keywords_file=args.keywords_file)
+                                db_dir=args.db_dir, collection=args.collection,
+                                keywords_file=args.keywords_file,
+                                all_samples_match_keywords=args.keywords_file is None)
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(result, stream, ensure_ascii=False, indent=2)

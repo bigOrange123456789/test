@@ -166,21 +166,27 @@ class SampleMiraIdsConfigurationTests(unittest.TestCase):
         self.assertIs(args.check_config, False)
         self.assertEqual(Path(args.output).name, "mira_split_ids.json")
 
-    def test_null_db_and_keywords_choose_sibling_defaults(self):
+    def test_null_db_uses_sibling_default_and_null_keywords_enable_match_all(self):
         self.write_config(dict(self.payload, db_dir=None, keywords_file=None))
         args = self.resolve()
         self.assertEqual(Path(args.db_dir), self.root / "MIRA-chroma")
-        self.assertEqual(Path(args.keywords_file),
-                         self.root / "MIRA_myConfig" / sampling.KEYWORDS_FILENAME)
+        self.assertIsNone(args.keywords_file)
 
-    def test_null_path_defaults_follow_explicit_cli_data_root(self):
+    def test_null_db_default_follows_cli_data_root_but_null_keywords_stay_disabled(self):
         self.write_config(dict(self.payload, db_dir=None, keywords_file=None))
         data_root = self.root / "cli_parent" / "mira_data"
         args = self.resolve(["--data-root", str(data_root)])
         self.assertEqual(Path(args.data_root), data_root)
         self.assertEqual(Path(args.db_dir), data_root.parent / "MIRA-chroma")
-        self.assertEqual(Path(args.keywords_file),
-                         data_root.parent / "MIRA_myConfig" / sampling.KEYWORDS_FILENAME)
+        self.assertIsNone(args.keywords_file)
+
+    def test_null_keywords_are_forwarded_as_match_all_mode(self):
+        self.write_config(dict(self.payload, keywords_file=None))
+        code, calls, count, _, errors = self.run_main()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(count, 1)
+        self.assertIsNone(calls[0]["keywords_file"])
+        self.assertIs(calls[0]["all_samples_match_keywords"], True)
 
     def test_optional_chinese_description_and_explicit_false_boolean_override(self):
         self.write_config(dict(self.payload, _说明="这里修改训练集和测试集数量。"))

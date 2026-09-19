@@ -77,7 +77,8 @@ def _record(data_root: Path, identifier: str, question, answer, options, paths,
             image_cache[name] = os.path.abspath(image_path(data_root, name))
         images.append(image_cache[name])
     return {"id": identifier, "question": question, "images": images,
-            "reference": answer if isinstance(answer, str) else json_text(answer)}
+            "reference": answer if isinstance(answer, str) else json_text(answer),
+            "question_type": identifier.split(":")[3], "options": options, "answer": answer}
 
 
 def _load_selected_mira(data_root: Path, identifiers: list) -> list[dict]:
@@ -172,8 +173,12 @@ def _load_jsonl(path: Path) -> list[dict]:
                         image = Path(raw).expanduser()
                         image_cache[raw] = str((image if image.is_absolute() else path.parent / image).resolve())
                     images.append(image_cache[raw])
-                rows.append({"id": row["id"], "question": row["question"],
-                             "images": images, "reference": row["reference"]})
+                record = {"id": row["id"], "question": row["question"],
+                          "images": images, "reference": row["reference"]}
+                # JSONL 可补充结构化答案；原有四字段文件继续兼容。
+                record.update({field: row[field] for field in ("question_type", "options", "answer")
+                               if field in row})
+                rows.append(record)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{path}:{line_number}: {exc}") from exc
     if not rows:

@@ -248,6 +248,23 @@ class SampleMiraIdsTests(unittest.TestCase):
         self.assertEqual(result["keywords_file"], str(expected.resolve()))
         self.assertEqual(result["keywords"], ["hypertension"])
 
+    def test_all_samples_keyword_mode_skips_file_and_marks_every_qa_as_matched(self):
+        ids = self.ids_for()
+        embedded = set(ids[:3])
+        self.embedded_ids.return_value = embedded
+        result = sample_dataset(
+            self.root, 5, 2, all_samples_match_keywords=True, keywords_file=None)
+        self.keywords.assert_not_called()
+        self.assertIsNone(result["keywords_file"])
+        self.assertEqual(result["keywords"], [])
+        self.assertEqual(result["keyword_matching"], "all_samples")
+        self.assertIs(result["all_samples_match_keywords"], True)
+        self.assertEqual(result["keyword_samples"], len(ids))
+        self.assertEqual(result["keyword_embedded_samples"], len(embedded))
+        self.assertEqual(result["keyword_coverage"]["matched_samples"], len(ids))
+        self.assertEqual(result["keyword_coverage"]["matched_embedded_samples"], len(embedded))
+        self.assertEqual(result["selected_keyword_counts"], {"train": 5, "test": 2})
+
     def test_both_conditions_then_embedded_then_keyword_then_neither(self):
         self.write_split("train", self.keyword_rows(
             ["Hypertension"] * 3 + ["Neutral"] * 3 + ["Hypertension"] * 3 + ["Neutral"] * 3))

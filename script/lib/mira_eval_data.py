@@ -70,7 +70,9 @@ def load_mira_dataset(data_root: Path, source_splits=("train",)) -> list[dict]:
                     image_cache[name] = os.path.abspath(image_path(data_root, name))
                 images.append(image_cache[name])
             rows.append({"id": sample.id, "question": question,
-                         "images": images, "reference": reference})
+                         "images": images, "reference": reference,
+                         "question_type": sample.category, "options": sample.options,
+                         "answer": sample.answer})
             accepted += 1
         LOGGER.info("MIRA %s.csv：读取 %d 条可评估问答。", split, accepted)
     if skipped:
