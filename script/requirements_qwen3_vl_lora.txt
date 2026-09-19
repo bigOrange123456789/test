@@ -1,8 +1,0 @@
-# Install in the CUDA-enabled environment used for local Qwen inference.
-torch>=2.6
-torchvision>=0.21
-transformers>=4.57.3,<5
-peft>=0.17,<0.19
-accelerate>=1.2,<2
-safetensors>=0.4.3
-Pillow>=10

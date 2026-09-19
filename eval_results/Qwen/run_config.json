@@ -1,0 +1,72 @@
+{
+  "schema_version": "rag-evaluation-v4-model-suite-lora",
+  "arguments": {
+    "config": "D:\\Codex\\MLMtest\\script\\evaluate_rag.json",
+    "check_config": false,
+    "check_data": false,
+    "model": "Qwen3-VL-2B-Instruct",
+    "dataset_path": "G:\\Codex_dataset\\MIRA-data",
+    "source_splits": [
+      "train"
+    ],
+    "N": null,
+    "knowledge_size": null,
+    "top_k": 5,
+    "eval_config": "[{\"name\": \"no_rag\", \"use_rag\": false}]",
+    "output_dir": "D:\\Codex\\MLMtest\\eval_results\\Qwen",
+    "export_only": false,
+    "model_path": "D:\\Codex\\MLMtest\\Qwen3-VL-2B-Instruct",
+    "embedding_model_path": "D:\\Codex\\MLMtest\\Qwen3-VL-Embedding-2B",
+    "seed": 42,
+    "exclude_shared_images": false,
+    "device": "auto",
+    "dtype": "auto",
+    "attn_implementation": "sdpa",
+    "embedding_batch_size": 1,
+    "max_new_tokens": 512,
+    "max_input_tokens": 16384,
+    "max_embedding_tokens": 8192,
+    "min_pixels": 4096,
+    "max_pixels": 262144,
+    "factscore_method": "llm",
+    "factscore_source": "reference",
+    "bleu_smoothing": "none",
+    "cache_dir": null,
+    "resume": false,
+    "cache_only": false,
+    "model_revision": "main",
+    "embedding_revision": "main",
+    "cache_tag": "v1",
+    "chroma_db_dir": "G:\\Codex_dataset\\MIRA-chroma",
+    "chroma_collection": "mira_qwen3_vl_embedding",
+    "chroma_id_prefix": "mira:",
+    "chroma_chunk_size": 5000,
+    "lora_path": null,
+    "dataset_filter": "D:\\Codex\\MLMtest\\script\\mira_split_ids.json",
+    "run_name": "Qwen",
+    "suite_output_dir": "D:\\Codex\\MLMtest\\eval_results"
+  },
+  "eval_config": [
+    {
+      "name": "no_rag",
+      "use_rag": false,
+      "top_k": 5
+    }
+  ],
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "transformers": "4.57.3",
+    "qwen-vl-utils": "0.0.14",
+    "jieba": "0.42.1",
+    "nltk": "3.10.3",
+    "rouge-score": "0.1.2",
+    "numpy": "2.4.6",
+    "Pillow": "12.3.0",
+    "peft": "0.18.0"
+  },
+  "generation_fingerprints": {
+    "no_rag": "fb2bc10bdfbbcb5737f54a37586d9ed87b2b69222d8ed0f5e2c20ce451259316"
+  },
+  "status": "running"
+}

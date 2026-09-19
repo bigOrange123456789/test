@@ -1,0 +1,13 @@
+{
+  "model": "DeepSeek-Model",
+  "model_arguments": {
+    "DeepSeek-Model": {
+      "epochs": 1,
+      "device": "auto"
+    },
+    "Qwen3-VL-2B-Instruct": {
+      "epochs": 1,
+      "device": "auto"
+    }
+  }
+}

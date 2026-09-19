@@ -1,14 +1,54 @@
-"""Train a text-only DeepSeek LoRA adapter on MIRA manifest train_ids.
+"""使用 MIRA 问答对为本地 DeepSeek 文本模型训练 LoRA adapter。
 
-Run from the project root:
+本文件同时承担原 README 和 requirements 文件的说明作用。建议在项目根目录
+``D:\\Codex\\MLMtest``、CUDA 版 ``MLMtest`` 环境中运行：
+
     python script/finetune_deepseek_mira_lora.py --check-env
     python script/finetune_deepseek_mira_lora.py --dry-run
     python script/finetune_deepseek_mira_lora.py --check-data
-    python script/finetune_deepseek_mira_lora.py --epochs 1
+    python script/finetune_deepseek_mira_lora.py --device cuda --epochs 1
 
-Images, captions and extra answer hints are not model inputs. Only the selected
-assistant answers (including EOS) contribute to loss. The base model stays
-frozen and unchanged on disk; all adapters/checkpoints use a separate directory.
+环境与依赖：
+    - Python 环境必须包含 CUDA 版 PyTorch；脚本不会自动安装依赖。
+    - 最低版本：torch 2.1、transformers 4.44（小于 6）、peft 0.12
+      （小于 0.21）、accelerate 0.33（小于 2）、safetensors 0.4.3。
+    - 安装命令：python -m pip install "torch>=2.1" "transformers>=4.44,<6"
+      "peft>=0.12,<0.21" "accelerate>=0.33,<2" "safetensors>=0.4.3"
+    - 本机曾验证的解释器为
+      ``D:\\mySoftware2\\anaconda3\\envs\\MLMtest\\python.exe``；若 ``python``
+      指向其他环境，可显式使用该解释器。``--device auto`` 优先使用 CUDA，
+      否则退回 CPU；显式指定 CUDA 但不可用时会报错。
+
+数据与监督规则：
+    - 默认基座模型为项目根目录 ``DeepSeek-Model``，默认 ID 清单为
+      ``script/mira_split_ids.json``，只按顺序使用 ``train_ids``；重复 ID、
+      与 ``test_ids`` 重叠或无法回源的 ID 都会报错。
+    - 数据目录优先级为 ``--data-root``、清单中的 ``data_root``、最后是
+      ``G:\\Codex_dataset\\MIRA-data``。一条训练样本对应一个 MIRA 问答。
+    - 模型输入只有问题和选项，不读取图片、caption 或额外提示。结构化答案会
+      完整序列化为 JSON，仅作为 assistant 标签，避免答案信息泄漏到输入。
+    - 只对 assistant 答案及末尾 EOS 计算损失；system、问题、选项和 padding
+      标签均为 -100。过长样本不会被静默截断，而会报告 ID 并要求调整长度。
+
+训练与输出：
+    - 默认 1 epoch、batch size 1、梯度累积 8、最大长度 2048、学习率 2e-4；
+      LoRA rank 16、alpha 32、dropout 0.05，目标为 attention/MLP 投影层。
+      基座权重始终冻结；这不是 4-bit QLoRA。CUDA 优先 BF16，其次 FP16，
+      CPU 使用 FP32。脚本按优化器步输出 loss、速度、耗时和预计剩余时间。
+    - 快速试跑示例：``--limit 16 --max-steps 2 --output-dir
+      script/deepseek_mira_smoke_adapter``。显存不足时保持 batch size 1，并可降低
+     最大长度，但应先用 ``--check-data`` 确认完整答案仍能容纳。
+    - 默认输出 ``script/deepseek_mira_lora_adapter``，包含 adapter、tokenizer、
+      training_metadata.json、trainer_state.json 和定期 checkpoint。输出目录必须
+      不存在或为空，且不得是基座模型目录、其父目录或子目录；不会覆盖原模型。
+    - adapter 不是完整模型。推理时先加载同一 DeepSeek 基座，再通过
+      ``PeftModel.from_pretrained(base, adapter_dir)`` 加载 adapter。比较微调前后
+      应使用相同问题、直接回答前缀和生成参数，避免聊天模板额外插入 <think>。
+      MIRA 的结构化答案仍是原始标注格式，并非前端要求的四字段病例 JSON。
+
+检查模式：``--check-env`` 检查依赖/CUDA；``--dry-run`` 仅用标准库核对清单与
+CSV；``--check-data`` 使用真实 tokenizer 检查所有训练标签和长度，但不加载模型
+权重、不训练也不写输出文件。
 """
 
 from __future__ import annotations
@@ -334,7 +374,9 @@ def train(args):
     print("\n".join(lines), flush=True)
     if problems:
         raise RuntimeError("Missing/incompatible training dependencies: " + ", ".join(problems) +
-                           ". Run: python -m pip install -r script/requirements_deepseek_mira_lora.txt")
+                           ". Install: python -m pip install \"torch>=2.1\" "
+                           "\"transformers>=4.44,<6\" \"peft>=0.12,<0.21\" "
+                           "\"accelerate>=0.33,<2\" \"safetensors>=0.4.3\"")
     import torch
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM, Trainer, TrainerCallback, TrainingArguments, set_seed
@@ -493,7 +535,9 @@ def main(argv=None):
             lines, problems = dependency_report()
             print("\n".join(lines))
             if problems:
-                print("Install with: python -m pip install -r script/requirements_deepseek_mira_lora.txt")
+                print('Install with: python -m pip install "torch>=2.1" '
+                      '"transformers>=4.44,<6" "peft>=0.12,<0.21" '
+                      '"accelerate>=0.33,<2" "safetensors>=0.4.3"')
             return 1 if problems else 0
         validate_args(args)
         if args.dry_run or args.check_data:

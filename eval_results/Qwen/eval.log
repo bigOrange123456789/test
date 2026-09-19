@@ -1,0 +1,12 @@
+2026-09-19 16:04:20,198 WARNING rag_eval: 未找到可选 rag_reports 模块，将保存 JSON/JSONL 指标与对比结果，跳过 Excel/图表。
+2026-09-19 16:04:20,206 INFO rag_eval: 评估模型=Qwen3-VL-2B-Instruct；路径=D:\Codex\MLMtest\Qwen3-VL-2B-Instruct；生成输入=文本与图片
+2026-09-19 16:04:20,207 INFO rag_eval: 评估名称=Qwen；LoRA=无（原始模型）；测试集=50，知识库=0。
+2026-09-19 16:04:20,220 INFO rag_eval: 测试 ID 已保存: D:\Codex\MLMtest\eval_results\Qwen\test_ids.json（50 条）；知识库 ID 已保存: D:\Codex\MLMtest\eval_results\Qwen\knowledge_ids.json（0 条）
+2026-09-19 16:04:25,399 INFO rag_eval: 模型运行设备=cuda，dtype=torch.bfloat16
+2026-09-19 16:04:25,399 INFO rag_eval: 加载生成/事实核验模型: D:\Codex\MLMtest\Qwen3-VL-2B-Instruct
+2026-09-19 16:05:30,455 WARNING rag_eval: 生成达到 max_new_tokens=1024；输出可能被截断。
+2026-09-19 16:05:30,456 WARNING rag_eval: FactScore 原子事实 JSON 解析失败，第 1 次。
+2026-09-19 16:05:39,459 DEBUG jieba: Building prefix dict from the default dictionary ...
+2026-09-19 16:05:39,976 DEBUG jieba: Dumping model to file cache D:\Codex\MLMtest\eval_results\Qwen\jieba.cache
+2026-09-19 16:05:40,024 DEBUG jieba: Loading model cost 0.564 seconds.
+2026-09-19 16:05:40,025 DEBUG jieba: Prefix dict has been built successfully.

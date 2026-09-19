@@ -1,16 +1,49 @@
-"""LoRA fine-tuning for the local Qwen3-VL-2B-Instruct model on MIRA IDs.
+"""使用 MIRA 图文问答为本地 Qwen3-VL-2B-Instruct 训练 LoRA adapter。
 
-The script reads the ``train_ids`` list from ``script/mira_split_ids.json`` and
-resolves each ID back to one QA in the MIRA CSV files. Images are processed in
-the collator, so the dataset keeps QA records and paths rather than a second
-copy of all image tensors. Only PEFT adapter files are saved; the base model
-directory is never written to.
-
-Typical commands (run with the environment that has torch/transformers/peft):
+本文件同时承担原 README 和 requirements 文件的说明作用。在项目根目录和
+CUDA 版 ``MLMtest`` 环境中运行：
 
     python script/finetune_qwen3_vl_lora.py --check-env
-    python script/finetune_qwen3_vl_lora.py --max-steps 10
-    python script/finetune_qwen3_vl_lora.py --epochs 1 --output-dir script/qwen3_vl_lora_adapter
+    python script/finetune_qwen3_vl_lora.py --dry-run
+    python script/finetune_qwen3_vl_lora.py --epochs 1
+
+环境与依赖：
+    - 最低版本：torch 2.6、torchvision 0.21、transformers 4.57.3（小于 5）、
+      peft 0.17（小于 0.19）、accelerate 1.2（小于 2）、safetensors 0.4.3、
+      Pillow 10。应安装在本地 Qwen 推理所用的 CUDA 环境中。
+    - 安装命令：python -m pip install "torch>=2.6" "torchvision>=0.21"
+      "transformers>=4.57.3,<5" "peft>=0.17,<0.19" "accelerate>=1.2,<2"
+      "safetensors>=0.4.3" "Pillow>=10"
+    - 本机曾验证的解释器为
+      ``D:\\mySoftware2\\anaconda3\\envs\\MLMtest\\python.exe``。
+
+数据与监督规则：
+    - 默认基座是项目根目录 ``Qwen3-VL-2B-Instruct``。从
+      ``script/mira_split_ids.json`` 读取 ``train_ids`` 并回源到 MIRA CSV；
+      保持清单顺序，拒绝重复 ID 或与 ``test_ids`` 重叠，不在训练中使用测试集。
+    - 一条样本包含一个问答及其全部图片。用户输入仅含问题、选项和图片；
+      caption 与其他源字段不会作为提示。结构化答案和嵌套解释会完整保留。
+    - 缺少问题或答案的问答会显式跳过并记录；缺失 ID/图片会报错。图片在
+      collator 中处理，数据集只保存记录和路径，避免长期复制全部图像张量。
+    - 只对 assistant 答案和回合结束 token 计算损失，图片、system、user 和
+      padding token 的标签为 -100。超长样本会报告 ID，不截断图片或答案。
+
+训练与输出：
+    - 默认 1 epoch、batch size 1、梯度累积 8、学习率 2e-4；LoRA rank 16、
+      alpha 32、dropout 0.05，启用 SDPA 和梯度检查点。只训练语言解码器投影层
+      adapter，基座和视觉权重保持冻结。CUDA 优先 BF16，否则 FP16；CPU FP32。
+    - 快速试跑：``--limit 16 --max-steps 2 --output-dir
+      script/qwen3_vl_lora_smoke``。显存不足时保持 batch size 1，可将
+      ``--max-pixels`` 降至 131072；默认每图像素预算为 4096～262144。
+    - 默认输出 ``script/qwen3_vl_2b_lora_adapter``，包含 adapter、processor、
+      tokenizer、training_metadata.json、trainer_state.json 和 checkpoint。脚本
+      不会向原模型目录写入或合并权重，非空输出目录默认被拒绝。
+    - 可用 ``--resume-from-checkpoint`` 恢复训练，但应保持相同清单、模型、数据
+      和训练设置。最终 adapter 不是独立完整模型；推理时需加载同一 Qwen3-VL
+      基座，再用 ``PeftModel.from_pretrained`` 加载 adapter。
+
+每个优化器步骤会输出速度、约 QA/s、耗时和 ETA；最后不足一个有效批量时
+QA/s 是近似值，ETA 也不包含最终保存时间。
 """
 
 from __future__ import annotations
@@ -104,7 +137,9 @@ def ensure_dependencies() -> None:
         raise RuntimeError(
             "Missing or outdated packages: " + ", ".join(problems) +
             ". Install them in the same environment, for example: "
-            "python -m pip install -r script/requirements_qwen3_vl_lora.txt")
+            "python -m pip install \"torch>=2.6\" \"torchvision>=0.21\" "
+            "\"transformers>=4.57.3,<5\" \"peft>=0.17,<0.19\" "
+            "\"accelerate>=1.2,<2\" \"safetensors>=0.4.3\" \"Pillow>=10\"")
 
 
 def load_split_manifest(path: Path) -> tuple[list[str], dict[str, Any]]:
