@@ -1,11 +1,11 @@
 """使用 MIRA 图文问答为本地 Qwen3-VL-2B-Instruct 训练 LoRA adapter。
 
-本文件同时承担原 README 和 requirements 文件的说明作用。在项目根目录和
-CUDA 版 ``MLMtest`` 环境中运行：
+本文件是统一入口调用的 Qwen3-VL 训练后端，不建议直接运行。在项目根目录和
+CUDA 版 ``MLMtest`` 环境中使用统一入口：
 
-    python script/finetune_qwen3_vl_lora.py --check-env
-    python script/finetune_qwen3_vl_lora.py --dry-run
-    python script/finetune_qwen3_vl_lora.py --epochs 1
+    python script/finetune_mira_lora.py -- --check-env
+    python script/finetune_mira_lora.py -- --dry-run
+    python script/finetune_mira_lora.py -- --epochs 1
 
 环境与依赖：
     - 最低版本：torch 2.6、torchvision 0.21、transformers 4.57.3（小于 5）、
@@ -63,7 +63,8 @@ from pathlib import Path
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = SCRIPT_DIR.parent
 INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
 if str(INFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(INFERENCE_DIR))
@@ -635,7 +636,7 @@ def train(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Define safe defaults for the local model, manifest, and adapter output."""
-    script_dir = Path(__file__).resolve().parent
+    script_dir = SCRIPT_DIR
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check-env", action="store_true", help="Only report dependencies and CUDA; do not load weights.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve IDs and print counts without loading the model.")

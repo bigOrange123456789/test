@@ -15,7 +15,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from script import finetune_deepseek_mira_lora as finetune
+from script.lib import finetune_deepseek_mira_lora as finetune
 
 try:
     import torch

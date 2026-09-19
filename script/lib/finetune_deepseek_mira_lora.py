@@ -1,12 +1,12 @@
 """使用 MIRA 问答对为本地 DeepSeek 文本模型训练 LoRA adapter。
 
-本文件同时承担原 README 和 requirements 文件的说明作用。建议在项目根目录
-``D:\\Codex\\MLMtest``、CUDA 版 ``MLMtest`` 环境中运行：
+本文件是统一入口调用的 DeepSeek 训练后端，不建议直接运行。请在项目根目录
+``D:\\Codex\\MLMtest``、CUDA 版 ``MLMtest`` 环境中使用统一入口：
 
-    python script/finetune_deepseek_mira_lora.py --check-env
-    python script/finetune_deepseek_mira_lora.py --dry-run
-    python script/finetune_deepseek_mira_lora.py --check-data
-    python script/finetune_deepseek_mira_lora.py --device cuda --epochs 1
+    python script/finetune_mira_lora.py -- --check-env
+    python script/finetune_mira_lora.py -- --dry-run
+    python script/finetune_mira_lora.py -- --check-data
+    python script/finetune_mira_lora.py -- --device cuda --epochs 1
 
 环境与依赖：
     - Python 环境必须包含 CUDA 版 PyTorch；脚本不会自动安装依赖。
@@ -69,7 +69,8 @@ from pathlib import Path
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = SCRIPT_DIR.parent
 DEFAULT_DATA_ROOT = Path(r"G:\Codex_dataset\MIRA-data")
 DEFAULT_SYSTEM_PROMPT = (
     "You are a medical question-answering assistant. Answer the question using "
@@ -472,9 +473,9 @@ def build_parser():
     mode.add_argument("--dry-run", action="store_true", help="Validate all selected IDs/QA text, without ML dependencies.")
     mode.add_argument("--check-data", action="store_true", help="Validate IDs and actual tokenizer labels/lengths, without model weights.")
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "DeepSeek-Model")
-    parser.add_argument("--split-manifest", type=Path, default=Path(__file__).resolve().parent / "mira_split_ids.json")
+    parser.add_argument("--split-manifest", type=Path, default=SCRIPT_DIR / "mira_split_ids.json")
     parser.add_argument("--data-root", type=Path, help="Default: manifest data_root, then G:/Codex_dataset/MIRA-data.")
-    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "deepseek_mira_lora_adapter")
+    parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR / "deepseek_mira_lora_adapter")
     parser.add_argument("--limit", type=int, default=0, help="First N train_ids for a short experiment; 0 uses all.")
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=-1, help="Positive value overrides epochs.")

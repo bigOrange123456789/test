@@ -3,8 +3,8 @@
 DeepSeek 文本模型与 Qwen3-VL 视觉语言模型的数据管线差异较大，不适合把内部
 实现合并成一个充满模型判断的脚本。本入口采用“统一配置、独立后端”的结构：
 
-* ``DeepSeek-Model`` 仍由 ``finetune_deepseek_mira_lora.py`` 执行；
-* ``Qwen3-VL-2B-Instruct`` 仍由 ``finetune_qwen3_vl_lora.py`` 执行。
+* ``DeepSeek-Model`` 由 ``lib/finetune_deepseek_mira_lora.py`` 后端执行；
+* ``Qwen3-VL-2B-Instruct`` 由 ``lib/finetune_qwen3_vl_lora.py`` 后端执行。
 
 因为最终调用的是原后端的 ``main(argv)``，未重新实现训练过程，所以相同参数下
 的数据选择、提示词、token/图片处理、随机种子、LoRA 层、优化器和输出均与直接
@@ -48,8 +48,8 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "finetune_mira_lora.json"
 BACKENDS = {
-    "DeepSeek-Model": "finetune_deepseek_mira_lora",
-    "Qwen3-VL-2B-Instruct": "finetune_qwen3_vl_lora",
+    "DeepSeek-Model": "lib.finetune_deepseek_mira_lora",
+    "Qwen3-VL-2B-Instruct": "lib.finetune_qwen3_vl_lora",
 }
 
 
@@ -162,7 +162,8 @@ def main(argv: list[str] | None = None) -> int:
         # 先解析一次以验证 JSON 与临时参数组合；真正执行时后端会再次解析同一 argv。
         backend.build_parser().parse_args(backend_argv)
         print(f"微调模型：{payload['model']}", flush=True)
-        print(f"执行后端：{BACKENDS[payload['model']]}.py", flush=True)
+        backend_path = BACKENDS[payload["model"]].replace(".", "/") + ".py"
+        print(f"执行后端：{backend_path}", flush=True)
         if args.check_config:
             print("配置检查通过；未加载数据、模型，也未写入训练结果。", flush=True)
             return 0
