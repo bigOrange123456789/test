@@ -9,9 +9,9 @@ both conditions are met:
   2. generated answer similarity >= --target-similarity
 
 Examples from the project root:
-    python DeepSeek-Model/finetune_huatuo_lora2.py --dry-run
-    python DeepSeek-Model/finetune_huatuo_lora2.py --sample-index 3
-    python DeepSeek-Model/finetune_huatuo_lora2.py --selection random --seed 7
+    python DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora2.py --dry-run
+    python DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora2.py --sample-index 3
+    python DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora2.py --selection random --seed 7
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def ensure_dependencies() -> None:
             print(f"  - {line}")
         print()
         print("Install/update dependencies, then rerun training. For example:")
-        print("  pip install -r DeepSeek-Model/requirements-lora.txt")
+        print("  pip install -r DeepSeek-R1-Distill-Qwen-1.5B/requirements-lora.txt")
         raise SystemExit(1)
 
 

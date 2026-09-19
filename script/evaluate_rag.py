@@ -16,25 +16,32 @@ datasetFilter 指向包含 test_ids 的 JSON，仅评估这些问答，不使用
 为 null 时，MIRA 目录使用整个原始 test.csv（JSONL 则使用该文件全部记录）。
 默认不限制题数；显式 --N 仅取固定测试集前 N 题，便于小规模试运行。
 相同数据共用读取结果；每组完成后释放模型，再加载下一组。
-结果默认保存在项目 eval_results_v2/<name>；suite_comparison.md/json 为总览。
+结果由 JSON 的 outputDir 指定；当前配置写入 output/evaluation_prima/<name>。
+suite_comparison.md/json 为总览；未配置 outputDir 时仍使用项目 eval_results_v2。
 重复运行会更新同名结果，需要保留多轮实验时请指定不同 --output_dir。
 命令行显式参数统一覆盖配置中的所有组；--resume 不会改变当前筛选清单。
 
 测试 reference 只用于评分，不进入查询或答案生成。
 所有被测模型先依次生成回答并卸载，再统一加载一次固定的原版裁判。
-单选、多选和是非题优先核对明确的最终答案；多选必须完整匹配选项集合。
-开放题使用固定裁判对照参考答案给出 0/0.5/1 分，一题一次简短评分，至多重试一次。
-这叫“参考答案语义评分”，不等同于旧 FactScore 或独立医学正确率。
+evaluation.prima.enabled=true：按PRIMA论文的四类题型分别测试、保存明细和汇总。
+单选、多选和是非题核对最终答案，Accuracy以百分比展示；多选必须完整匹配选项集合。
+开放题使用参考答案版FActScore：拆分候选回答的原子事实，再逐条进行支持/不支持二元核验。
+解释ROUGE-L只比较明确的解释；不使用think或visual_evidence，不把开放题全文当作解释。
+缺少参考解释记null；有参考但没有生成解释记0。所有原始指标在JSON内部仍为0～1。
+prima.enabled=false：回到原来的一次性参考语义评分（0/0.5/1），不等同于FActScore。
+论文未给出FActScore裁判与证据库实现细节；本地实现不能声称完整复现论文数值。
 格式/推理失败记为 null，报告有效题数和覆盖率；不会伪装为 0 分。
-新评分方案与旧指标不能直接比较，旧结果保留在原 eval_results 目录。
+新评分方案与旧指标不能直接比较；当前配置使用新的结果目录保留旧实验。
 千问生成时接收图片；DeepSeek 只接收文本，横向比较时需注明输入模态差别。
 实现基于 Transformers 4.57.x，不需要克隆 Qwen SDK。
 
 运行配置：
     - 默认读取本脚本同目录的 ``evaluate_rag.json``，与启动时工作目录无关。
       JSON 可为一个对象或非空对象数组；数组每项对应一组评估，按顺序执行。
-    - ``model`` 支持 ``Qwen3-VL-2B-Instruct`` 和 ``DeepSeek-Model``，默认权重
-      位于项目根目录的同名文件夹。``useRAG`` 为 false/true 时分别只评估无/有
+    - ``model`` 支持 ``Qwen3-VL-2B-Instruct`` 和 ``DeepSeek-Model``。
+      DeepSeek-Model 是配置选择标识，其默认权重位于项目根目录的
+      ``DeepSeek-R1-Distill-Qwen-1.5B``；千问默认使用同名模型文件夹。
+      ``useRAG`` 为 false/true 时分别只评估无/有
       RAG；省略时默认同时运行 no_rag 和 rag_top5。``pathLora`` 指定已有 LoRA
       目录，null 表示原始模型；``name`` 决定结果子目录，组名必须唯一。
     - 命令行参数优先于 JSON。``--config`` 是运行配置；旧参数 ``--eval_config``
@@ -49,6 +56,15 @@ datasetFilter 指向包含 test_ids 的 JSON，仅评估这些问答，不使用
       本地默认原版目录，不加载 LoRA；judgeScope 默认 open_ended（仅开放题），
       all 评所有题，none 只算客观指标；judgeMaxNewTokens 默认256、judgeRetries默认1。
       bootstrapSamples 默认1000。四组 evaluation 必须完全相同，保证裁判和口径一致。
+    - evaluation.prima.enabled 总开关默认false（当前JSON已设true）。子参数：
+      separateQuestionTypes=true 按题型分组执行并写独立目录；false关闭独立目录。
+      announceQuestionType=true 明确告知题型，尤其区分单选和多选，不透露正确答案个数。
+      questionTypes 默认四类，可只列 open_ended/closed_ended/single_choice/multiple_choice 中需要的类型。
+      factScore=true 给开放题做原子事实核验；false关闭该指标，不回退为旧语义分。
+      explanationRougeL=true 请求简短最终解释并计算解释ROUGE-L；false关闭该指标及解释格式提示。
+      factScoreMaxNewTokens 默认1024；factScoreBatchSize默认8，每批核验8条事实，绝不截掉剩余事实。
+      judgeRetries 同样用于FActScore每阶段，最多重试一次；judgeScope/judgeMaxNewTokens只用于旧语义评分。
+      新协议的详细使用说明见本目录 README_evaluate_prima.md。
 
 数据与隔离：
     - ``datasetPath`` 可指向 MIRA CSV 目录或 JSONL；JSONL 每行必须包含
@@ -64,11 +80,13 @@ datasetFilter 指向包含 test_ids 的 JSON，仅评估这些问答，不使用
       Qwen3-VL-Embedding 完成并读取当前图片。关闭 RAG 时不会加载嵌入模型。
 
 结果、指标与缓存：
-    - 默认写入 ``eval_results_v2/<name>``，包含运行配置、测试/知识库 ID、
+    - outputDir 下每个 name 子目录包含运行配置、测试/知识库 ID、
       comparison.json，以及各模式的 generations.jsonl、predictions.jsonl 和
       summary.json。总目录的 suite_comparison.md/json 汇总四组指标及微调前后
       的逐题差值；测试内容不一致时不计算配对差值。``--output_dir`` 指定结果根目录。
-    - 指标包括客观题准确率、选项集合 F1、答案文本 BLEU-4/ROUGE-L 和参考语义评分。
+    - PRIMA协议的主指标为FActScore、Accuracy和解释ROUGE-L，按题型分别汇总；
+      by_question_type/<题型>/ 保存独立predictions、summary、test_ids和复核清单。
+      关闭PRIMA后指标包括客观题准确率、选项集合 F1、答案文本 BLEU-4/ROUGE-L 和参考语义评分。
       文本相似度只比较答案字段，不计 JSON 外壳、完整思考块或附带视觉证据字段。
       BLEU/ROUGE 是辅助文字指标，不代表医学正确率；短于4个词元的正确答案也可能 BLEU-4 接近0。
       小型本地裁判仍可能误判，且对同家族模型有偏好，不能代替医学专家。
@@ -80,7 +98,7 @@ datasetFilter 指向包含 test_ids 的 JSON，仅评估这些问答，不使用
     - ``rag_reports`` 是可选 Excel/图表模块；缺失时核心 JSON/JSONL 结果仍会
       保存。新版始终使用自带 Markdown/JSON 总览，旧插件只用于 --export_only 导出旧结果。
     - 断点恢复分别缓存生成回答和成功的裁判评分，相同题目/参考/回答可跨模型共用裁判缓存。
-      返回码0表示完整完成；1表示运行失败；2表示语义评分有失败，需查看覆盖率和人工复核清单。
+      返回码0表示完整完成；1表示运行失败；2表示裁判评分有失败，需查看覆盖率和人工复核清单。
 
 开发验证：
     python -m unittest script.tests.test_evaluate_rag_suite script.tests.test_evaluation_data script.tests.test_eval_lora -v
@@ -129,13 +147,15 @@ from tqdm import tqdm
 try:
     from .lib.eval_lora import adapter_identity, load_lora_adapter, validate_lora_path
     from .lib.evaluation_data import prepare_evaluation_data
-    from .lib.answer_metrics import score_answer
+    from .lib.answer_metrics import score_answer, question_type_for_sample
+    from .lib.atomic_factscore import AtomicFactScorer
     from .lib.reference_judge import ReferenceJudge
     from .lib.evaluation_statistics import summarize_values, paired_summary
 except ImportError:
     from lib.eval_lora import adapter_identity, load_lora_adapter, validate_lora_path
     from lib.evaluation_data import prepare_evaluation_data
-    from lib.answer_metrics import score_answer
+    from lib.answer_metrics import score_answer, question_type_for_sample
+    from lib.atomic_factscore import AtomicFactScorer
     from lib.reference_judge import ReferenceJudge
     from lib.evaluation_statistics import summarize_values, paired_summary
 
@@ -144,16 +164,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("evaluate_rag.json")
 MODEL_DIRECTORIES = {
     "Qwen3-VL-2B-Instruct": PROJECT_ROOT / "Qwen3-VL-2B-Instruct",
-    "DeepSeek-Model": PROJECT_ROOT / "DeepSeek-Model",
+    "DeepSeek-Model": PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B",
 }
-SCHEMA_VERSION = "rag-evaluation-v5-reference-scoring"
+SCHEMA_VERSION = "rag-evaluation-v6-prima-protocol"
 METRICS = ("answer_accuracy", "choice_f1", "bleu4", "rouge_l", "semantic_score")
+PRIMA_METRICS = ("factscore", "answer_accuracy", "explanation_rouge_l")
+QUESTION_TYPE_ORDER = ("open_ended", "closed_ended", "single_choice", "multiple_choice")
+QUESTION_TYPE_LABELS = {"open_ended": "开放式问题", "closed_ended": "封闭式问题",
+                        "single_choice": "单选题", "multiple_choice": "多选题"}
 METRIC_LABELS = {"answer_accuracy": "客观题准确率", "choice_f1": "选项F1",
-                 "bleu4": "BLEU-4", "rouge_l": "ROUGE-L", "semantic_score": "参考语义评分"}
+                 "bleu4": "BLEU-4", "rouge_l": "ROUGE-L", "semantic_score": "参考语义评分",
+                 "factscore": "FActScore（参考答案核验）", "explanation_rouge_l": "解释ROUGE-L"}
+PRIMA_DEFAULTS = {
+    "enabled": False, "separateQuestionTypes": True, "announceQuestionType": True,
+    "questionTypes": list(QUESTION_TYPE_ORDER), "factScore": True, "explanationRougeL": True,
+    "factScoreMaxNewTokens": 1024, "factScoreBatchSize": 8,
+}
 EVALUATION_DEFAULTS = {
     "judgeModel": "Qwen3-VL-2B-Instruct", "judgeModelPath": None,
     "judgeScope": "open_ended", "judgeMaxNewTokens": 256, "judgeRetries": 1,
     "bootstrapSamples": 1000,
+    "prima": PRIMA_DEFAULTS,
 }
 FACT_LABELS = {"支持": 1.0, "部分支持": 0.5, "不支持": 0.0}
 ANSWER_SYSTEM = (
@@ -175,6 +206,18 @@ ANSWER_FORMATS = {
     "closed_ended": "请直接给出最终答案；若是是非题，首行使用 Answer: Yes 或 Answer: No，然后可简短解释。不要输出思考过程。",
     "open_ended": "请直接、完整地回答问题，保留必要结论、条件、否定和数值；不要输出思考过程。",
 }
+PRIMA_TYPE_PROMPTS = {
+    "open_ended": "题型：开放式问题（open-ended）。请直接回答问题并给出简短医学依据。",
+    "closed_ended": "题型：封闭式问题（closed-ended）。请明确回答 Yes 或 No，并给出简短依据。",
+    "single_choice": "题型：单选题（single-choice）。只有一个正确选项，必须且只能选择一个字母，并简短解释选择依据。",
+    "multiple_choice": "题型：多选题（multiple-choice）。请选择全部正确选项，可以选择多个字母；少选、多选或错选均不算完全正确。请简短解释。",
+}
+PRIMA_EXPLANATION_PROMPT = (
+    "请把最终回答与解释分开：首行 Answer: 后写答案（选择题写所选字母），"
+    "另起一行 Explanation: 后写可供读者核对的简短医学解释。"
+    "只输出最终答案和解释，不输出内部思考过程或 <think>。"
+    "若使用 JSON，分别用 answer（选择题可用 correct_option/correct_options）和 explanation 字段。"
+)
 QUERY_INSTRUCTION = (
     "Given a question and its images, retrieve relevant question-answer examples "
     "that help answer the question."
@@ -203,6 +246,25 @@ def canonical_id(value: Any) -> str:
     if not key:
         raise ValueError("id 不能为空。")
     return key
+
+
+def prima_settings(args) -> dict:
+    return getattr(args, "evaluation", {}).get("prima", PRIMA_DEFAULTS)
+
+
+def _prima_enabled(evaluation: dict) -> bool:
+    return evaluation.get("prima", {}).get("enabled", False)
+
+
+def metrics_for(evaluation: dict) -> tuple:
+    return PRIMA_METRICS if _prima_enabled(evaluation) else METRICS
+
+
+def _judge_enabled(args) -> bool:
+    prima = prima_settings(args)
+    if prima["enabled"]:
+        return prima["factScore"] and "open_ended" in prima["questionTypes"]
+    return args.evaluation["judgeScope"] != "none"
 
 
 def resolve_run_configs(args):
@@ -240,7 +302,23 @@ def resolve_run_configs(args):
         evaluation = settings.get("evaluation", {})
         if not isinstance(evaluation, dict) or set(evaluation) - set(EVALUATION_DEFAULTS):
             raise ValueError(f"evaluation 必须是配置对象，可选字段：{list(EVALUATION_DEFAULTS)}")
-        job.evaluation = EVALUATION_DEFAULTS | evaluation
+        job.evaluation = copy.deepcopy(EVALUATION_DEFAULTS | evaluation)
+        prima = evaluation.get("prima", {})
+        if not isinstance(prima, dict) or set(prima) - set(PRIMA_DEFAULTS):
+            raise ValueError(f"evaluation.prima 必须是配置对象，可选字段：{list(PRIMA_DEFAULTS)}")
+        job.evaluation["prima"] = copy.deepcopy(PRIMA_DEFAULTS | prima)
+        prima = job.evaluation["prima"]
+        for field in ("enabled", "separateQuestionTypes", "announceQuestionType", "factScore", "explanationRougeL"):
+            if type(prima[field]) is not bool:
+                raise ValueError(f"evaluation.prima.{field} 必须为 JSON true/false。")
+        selected_types = prima["questionTypes"]
+        if (not isinstance(selected_types, list) or not selected_types
+                or any(not isinstance(kind, str) or kind not in QUESTION_TYPE_ORDER for kind in selected_types)
+                or len(set(selected_types)) != len(selected_types)):
+            raise ValueError(f"evaluation.prima.questionTypes 必须是非空且不重复的题型列表：{list(QUESTION_TYPE_ORDER)}")
+        for field, minimum, maximum in (("factScoreMaxNewTokens", 128, 8192), ("factScoreBatchSize", 1, 32)):
+            if type(prima[field]) is not int or not minimum <= prima[field] <= maximum:
+                raise ValueError(f"evaluation.prima.{field} 必须是 {minimum}～{maximum} 的整数。")
         if not isinstance(job.evaluation["judgeModel"], str) or job.evaluation["judgeModel"] not in MODEL_DIRECTORIES:
             raise ValueError("evaluation.judgeModel 必须是支持的模型类型。")
         if not isinstance(job.evaluation["judgeScope"], str) or job.evaluation["judgeScope"] not in {"open_ended", "all", "none"}:
@@ -275,6 +353,7 @@ def resolve_run_configs(args):
         # 旧快速检查参数只关闭语义裁判，不再用词重叠冒充事实正确性。
         if getattr(args, "factscore_method", None) == "keyword":
             job.evaluation["judgeScope"] = "none"
+            job.evaluation["prima"]["factScore"] = False
         job.config = str(config_path) if config_path.is_file() else None
         job.model = args.model or settings.get("model", "Qwen3-VL-2B-Instruct")
         job.model_path = args.model_path or str(MODEL_DIRECTORIES[job.model])
@@ -927,9 +1006,14 @@ def generate_answer(sample: dict, evidence: list[dict], llm: QwenGenerator) -> s
         content.append({"type": "text", "text": "以下是当前问题的图片："})
         content.extend(_image_blocks(sample["images"], llm.args))
     content.append({"type": "text", "text": "请回答当前问题：\n" + sample["question"]})
-    question_type = sample.get("question_type")
-    if question_type in ANSWER_FORMATS:
+    question_type = question_type_for_sample(sample)
+    prima = prima_settings(llm.args)
+    if prima["enabled"] and prima["announceQuestionType"]:
+        content.append({"type": "text", "text": PRIMA_TYPE_PROMPTS[question_type]})
+    elif sample.get("question_type") in ANSWER_FORMATS:
         content.append({"type": "text", "text": ANSWER_FORMATS[question_type]})
+    if prima["enabled"] and prima["explanationRougeL"]:
+        content.append({"type": "text", "text": PRIMA_EXPLANATION_PROMPT})
     system = ANSWER_SYSTEM if llm.supports_images else TEXT_ANSWER_SYSTEM
     return llm.chat([{"role": "system", "content": [{"type": "text", "text": system}]},
                      {"role": "user", "content": content}], llm.args.max_new_tokens)
@@ -1076,6 +1160,10 @@ def generation_fingerprint(args, config: dict, data_hash: str,
         "settings": {k: getattr(args, k) for k in fields},
         "prompts": [TEXT_ANSWER_SYSTEM if args.model == "DeepSeek-Model" or getattr(args, "text_only", False) else ANSWER_SYSTEM,
                     QUERY_INSTRUCTION, DOCUMENT_INSTRUCTION, ANSWER_FORMATS],
+        "prima_prompts": {
+            "question_type": PRIMA_TYPE_PROMPTS if prima_settings(args)["enabled"] and prima_settings(args)["announceQuestionType"] else None,
+            "explanation": PRIMA_EXPLANATION_PROMPT if prima_settings(args)["enabled"] and prima_settings(args)["explanationRougeL"] else None,
+        },
         "runtime_versions": {k: versions[k] for k in
                              ("torch", "torchvision", "transformers", "qwen-vl-utils", "Pillow")}
     }
@@ -1459,6 +1547,13 @@ def _metric_text(summary: dict) -> str:
     return f"{summary['mean']:.4f} ± {summary['std']:.4f} (n={summary['n']})"
 
 
+def _percent_text(summary: dict) -> str:
+    """内部保留0～1；表格按百分尺度展示，±为样本得分总体标准差而非多次实验标准差。"""
+    if summary["mean"] is None:
+        return "—"
+    return f"{100 * summary['mean']:.2f} ± {100 * summary['std']:.2f} (n={summary['n']})"
+
+
 def _metric_applies(row: dict, metric: str) -> bool:
     """分母按题型确定；参考无效/裁判失败保留在适用题数内，以覆盖率反映缺失。"""
     question_type = row["answer_details"]["question_type"]
@@ -1467,16 +1562,20 @@ def _metric_applies(row: dict, metric: str) -> bool:
     if metric == "choice_f1":
         return question_type in {"single_choice", "multiple_choice"}
     if metric == "semantic_score":
-        return row["judge_required"]
+        return row["judge_required"] and row.get("judge_metric", "semantic_score") == "semantic_score"
+    if metric == "factscore":
+        return row["judge_required"] and row.get("judge_metric") == "factscore"
+    if metric == "explanation_rouge_l":
+        return row.get("explanation_enabled", False)
     return True
 
 
-def _paired_metrics(after: dict, before: dict, *, seed: int, bootstrap_samples: int) -> dict:
+def _paired_metrics(after: dict, before: dict, *, seed: int, bootstrap_samples: int, metric_names=METRICS) -> dict:
     """同题、同适用范围计算差值；开放题不会压低客观题的有效配对覆盖率。"""
     if after.keys() != before.keys():
         raise ValueError("配对差值要求两组测试编号完全一致。")
     result = {}
-    for metric in METRICS:
+    for metric in metric_names:
         keys = [key for key in sorted(after)
                 if _metric_applies(after[key], metric) and _metric_applies(before[key], metric)]
         result[metric] = paired_summary([after[key][metric] for key in keys],
@@ -1489,16 +1588,19 @@ def update_summary(summary: dict, rows: list[dict], args) -> None:
     """按适用题型统计，失败保留为缺失，并输出可复核的覆盖率。"""
     def metrics(records):
         result = {}
-        for metric in METRICS:
+        for metric in metrics_for(args.evaluation):
             selected = [r for r in records if _metric_applies(r, metric)]
             result[metric] = summarize_values([r.get(metric) for r in selected], seed=args.seed,
                                               bootstrap_samples=args.evaluation["bootstrapSamples"],
                                               binary=metric == "answer_accuracy")
         return result
     summary["metrics"] = metrics(rows)
+    prima = prima_settings(args)
+    grouped_types = (QUESTION_TYPE_ORDER if prima["enabled"] else
+                     sorted({r["answer_details"]["question_type"] for r in rows}))
     summary["by_question_type"] = {
         question_type: {"num_samples": len(group), "metrics": metrics(group)}
-        for question_type in sorted({r["answer_details"]["question_type"] for r in rows})
+        for question_type in grouped_types
         for group in [[r for r in rows if r["answer_details"]["question_type"] == question_type]]
     }
     summary["answer_parse_failures"] = sum(r["answer_details"]["parse_status"] == "prediction_unparseable" for r in rows)
@@ -1506,22 +1608,42 @@ def update_summary(summary: dict, rows: list[dict], args) -> None:
                                               and _metric_applies(r, "answer_accuracy") for r in rows)
     summary["invalid_references"] = sum(r["answer_details"]["parse_status"] == "invalid_reference" for r in rows)
     summary["judge_required"] = sum(r["judge_required"] for r in rows)
-    summary["judge_failures"] = sum(r["semantic_details"]["status"] == "judge_failed" for r in rows)
-    summary["judge_pending"] = sum(r["semantic_details"]["status"] == "pending" for r in rows)
+    summary["judge_failures"] = sum(_judge_details(r)["status"] == "judge_failed" for r in rows)
+    summary["judge_pending"] = sum(_judge_details(r)["status"] == "pending" for r in rows)
     summary["possible_truncations"] = sum(r.get("generation_info", {}).get("hit_token_limit", False) for r in rows)
-    summary["review_count"] = sum(r["semantic_details"]["status"] == "judge_failed"
-                                  or r["answer_details"]["parse_status"] in {"prediction_unparseable", "invalid_reference"}
-                                  or r.get("generation_info", {}).get("hit_token_limit", False) for r in rows)
+    summary["review_count"] = sum(_needs_review(r) for r in rows)
+    summary["missing_reference_explanations"] = sum(r.get("explanation_enabled", False)
+                                                     and not r["answer_details"]["explanation_eligible"] for r in rows)
     summary["generation_seconds_excluding_load"] = sum(
         r.get("generation_info", {}).get("elapsed_seconds", 0.0) for r in rows if not r["generation_from_cache"])
-    summary["judge_model_calls"] = sum(len(r["semantic_details"].get("attempts", [])) for r in rows
-                                        if not r["semantic_details"].get("from_cache", False))
-    summary["cached_judgements"] = sum(r["semantic_details"].get("from_cache", False) for r in rows)
+    summary["judge_model_calls"] = sum(len(_judge_details(r).get("attempts", [])) for r in rows
+                                        if not _judge_details(r).get("from_cache", False))
+    summary["cached_judgements"] = sum(_judge_details(r).get("from_cache", False) for r in rows)
     summary["scoring_status"] = ("pending" if summary["judge_pending"] else
                                  "needs_review" if summary["judge_failures"] else "complete")
 
 
-def save_scored_rows(directory: Path, summary: dict, rows: list[dict]) -> None:
+def _judge_details(row: dict) -> dict:
+    return row["factscore_details"] if row.get("judge_metric") == "factscore" else row["semantic_details"]
+
+
+def _needs_review(row: dict) -> bool:
+    return bool(_judge_details(row)["status"] == "judge_failed"
+                or row["answer_details"]["parse_status"] in {"prediction_unparseable", "invalid_reference"}
+                or row.get("generation_info", {}).get("hit_token_limit", False)
+                or (row.get("explanation_enabled", False)
+                    and row["answer_details"]["explanation_status"] != "ok"))
+
+
+def _archive_inactive_report(path: Path) -> None:
+    """配置切换后归档不再更新的旧报告，避免被误认为本轮结果；保留可恢复副本。"""
+    if path.exists():
+        archive = path.parent / "_previous_reports"
+        archive.mkdir(parents=True, exist_ok=True)
+        path.rename(archive / f"{path.name}-{time.time_ns()}")
+
+
+def save_scored_rows(directory: Path, summary: dict, rows: list[dict], *, write_groups=True) -> None:
     temp = directory / "predictions.jsonl.tmp"
     with temp.open("w", encoding="utf-8") as handle:
         for row in rows:
@@ -1529,10 +1651,21 @@ def save_scored_rows(directory: Path, summary: dict, rows: list[dict]) -> None:
     os.replace(temp, directory / "predictions.jsonl")
     _write_json(directory / "summary.json", summary)
     # 单独输出需人工检查的问题，避免失败隐藏在平均分里。
-    review = [r for r in rows if r["semantic_details"]["status"] == "judge_failed"
-              or r["answer_details"]["parse_status"] in {"prediction_unparseable", "invalid_reference"}
-              or r.get("generation_info", {}).get("hit_token_limit", False)]
+    review = [r for r in rows if _needs_review(r)]
     _write_json(directory / "review_needed.json", review)
+    prima = summary["evaluation"]["prima"]
+    if write_groups and prima["enabled"] and prima["separateQuestionTypes"]:
+        for question_type in QUESTION_TYPE_ORDER:
+            group = [r for r in rows if r["answer_details"]["question_type"] == question_type]
+            group_dir = directory / "by_question_type" / question_type
+            group_dir.mkdir(parents=True, exist_ok=True)
+            group_summary = {**summary, "question_type": question_type, "num_samples": len(group),
+                             "included": question_type in prima["questionTypes"]}
+            update_summary(group_summary, group, argparse.Namespace(seed=summary["seed"], evaluation=summary["evaluation"]))
+            save_scored_rows(group_dir, group_summary, group, write_groups=False)
+            _write_json(group_dir / "test_ids.json", [r["id"] for r in group])
+    elif write_groups:
+        _archive_inactive_report(directory / "by_question_type")
 
 
 def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
@@ -1554,9 +1687,19 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
     test_ids = {canonical_id(row["id"]) for row in test}
     results = []
     output_temp = directory / "predictions.jsonl.tmp"
+    prima = prima_settings(args)
+    groups = ([(kind, [s for s in test if question_type_for_sample(s) == kind]) for kind in QUESTION_TYPE_ORDER]
+              if prima["enabled"] and prima["separateQuestionTypes"] else [(None, test)])
+
+    def iter_test_groups():
+        for kind, samples in groups:
+            if samples:
+                description = f"{config['name']} / {QUESTION_TYPE_LABELS[kind]}" if kind else config["name"]
+                yield from tqdm(samples, desc=description)
+
     with generation_path.open("a", encoding="utf-8") as generations, \
             output_temp.open("w", encoding="utf-8") as predictions:
-        for sample in tqdm(test, desc=config["name"]):
+        for sample in iter_test_groups():
             key = canonical_id(sample["id"])
             if key in cached:
                 prediction = cached[key]["prediction"]
@@ -1575,17 +1718,29 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
                     "generation_fingerprint": fingerprint, "prediction": prediction,
                     "retrieved_evidence": evidence, "generation_info": generation_info})
             answers = score_answer(sample, prediction)
-            judge_required = args.evaluation["judgeScope"] == "all" or (
-                args.evaluation["judgeScope"] == "open_ended" and answers["question_type"] == "open_ended")
+            if prima["enabled"]:
+                judge_metric = "factscore"
+                judge_required = prima["factScore"] and answers["question_type"] == "open_ended"
+            else:
+                judge_metric = "semantic_score"
+                judge_required = args.evaluation["judgeScope"] == "all" or (
+                    args.evaluation["judgeScope"] == "open_ended" and answers["question_type"] == "open_ended")
+            explanation_enabled = prima["enabled"] and prima["explanationRougeL"]
+            explanation_score = (compute_rouge_l(answers["prediction_explanation"], answers["reference_explanation"])
+                                 if explanation_enabled and answers["explanation_eligible"] else None)
             row = {**sample, "prediction": prediction,
+                   "question_type": answers["question_type"],
                    "normalized_prediction": answers["normalized_prediction"],
                    "normalized_reference": answers["normalized_reference"],
                    "answer_details": answers, "answer_accuracy": answers["answer_accuracy"],
                    "choice_f1": answers["choice_f1"],
                    "bleu4": compute_bleu4(answers["normalized_prediction"], answers["normalized_reference"], args.bleu_smoothing),
                    "rouge_l": compute_rouge_l(answers["normalized_prediction"], answers["normalized_reference"]),
-                   "semantic_score": None, "judge_required": judge_required,
-                   "semantic_details": {"score": None, "status": "pending" if judge_required else "not_applicable"},
+                   "semantic_score": None, "factscore": None,
+                   "explanation_rouge_l": explanation_score, "explanation_enabled": explanation_enabled,
+                   "judge_required": judge_required, "judge_metric": judge_metric,
+                   "semantic_details": {"score": None, "status": "pending" if judge_required and judge_metric == "semantic_score" else "not_applicable"},
+                   "factscore_details": {"score": None, "status": "pending" if judge_required and judge_metric == "factscore" else "not_applicable"},
                    "retrieved_evidence": evidence, "retrieved_count": len(evidence),
                    "config_name": config["name"], "generation_fingerprint": fingerprint,
                    "generation_from_cache": key in cached, "generation_info": generation_info}
@@ -1609,24 +1764,42 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
         "metric_scale": "0-1", "std_ddof": 0, "aggregation": "macro average over test samples",
         "bleu_smoothing": args.bleu_smoothing, "rouge_tokenizer": "jieba + whitespace",
         "evaluation": args.evaluation, "scoring_version": SCHEMA_VERSION,
+        "protocol": "prima" if prima["enabled"] else "reference_semantic",
         "generation_settings": {"max_new_tokens": args.max_new_tokens, "max_input_tokens": args.max_input_tokens},
         "cached_generations": sum(r["generation_from_cache"] for r in results),
         "dataset_fingerprint": data_hash, "generation_fingerprint": fingerprint,
-        "note": "客观题以明确最终答案评分；开放题为固定裁判的参考答案语义评分，非医学正确率，非旧FactScore。"
+        "note": ("PRIMA题型协议：开放题按支持的原子事实数/全部事实数计算参考答案版FActScore；"
+                 "其余题Accuracy，多选精确集合匹配；解释ROUGE-L只使用明确解释，缺参考记null。"
+                 if prima["enabled"] else "客观题以明确最终答案评分；开放题为固定裁判的参考答案语义评分，非医学正确率，非旧FactScore。")
     }
     update_summary(summary, results, args)
     save_scored_rows(directory, summary, results)
     LOGGER.info("%s 完成，n=%d；%s", config["name"], len(results),
-                "；".join(f"{METRIC_LABELS[m]}={_metric_text(summary['metrics'][m])}" for m in METRICS))
+                "；".join(f"{METRIC_LABELS[m]}={_metric_text(summary['metrics'][m])}" for m in metrics_for(args.evaluation)))
     return summary, results
 
 
 def print_comparison(summaries: list[dict]) -> None:
     """控制台表格；列内为均值 +/- 总体标准差。"""
-    headers = ["任务", "N"] + [METRIC_LABELS[m] for m in METRICS]
-    rows = [[s["name"], str(s["num_samples"])] + [
-        _metric_text(s['metrics'][m]) for m in METRICS]
-        for s in summaries]
+    if not summaries:
+        return
+    if _prima_enabled(summaries[0]["evaluation"]):
+        headers = ["任务", "题型", "N", "FActScore (%)", "Accuracy (%)", "解释ROUGE-L (%)", "有效解释/题数"]
+        rows = []
+        for summary in summaries:
+            groups = (summary["by_question_type"] if summary["evaluation"]["prima"]["separateQuestionTypes"]
+                      else {"all": summary})
+            for kind, group in groups.items():
+                metrics = group["metrics"]
+                rows.append([summary["name"], QUESTION_TYPE_LABELS.get(kind, "合并"), str(group["num_samples"]),
+                             _percent_text(metrics["factscore"]), _percent_text(metrics["answer_accuracy"]),
+                             _percent_text(metrics["explanation_rouge_l"]),
+                             f"{metrics['explanation_rouge_l']['n']}/{metrics['explanation_rouge_l']['total']}"])
+    else:
+        headers = ["任务", "N"] + [METRIC_LABELS[m] for m in METRICS]
+        rows = [[s["name"], str(s["num_samples"])] + [
+            _metric_text(s['metrics'][m]) for m in METRICS]
+            for s in summaries]
     widths = [max(len(str(row[i])) for row in [headers] + rows) for i in range(len(headers))]
     print("\n" + " | ".join(s.ljust(w) for s, w in zip(headers, widths)))
     print("-+-".join("-" * w for w in widths))
@@ -1836,7 +2009,7 @@ def run_evaluation(args, prepared=None) -> int:
         LOGGER.info("评估模型=%s；路径=%s；生成输入=%s", args.model, args.model_path,
                     "纯文本（忽略当前及参考图片）" if args.model == "DeepSeek-Model" or args.text_only else "文本与图片")
         # 即使 --resume，也以当前筛选文件为准；旧 test_ids.json 不能覆盖新配置。
-        test, knowledge, selection = prepared if prepared is not None else prepare_evaluation_data(args, configs)
+        test, knowledge, selection = prepared if prepared is not None else prepare_protocol_data(args, configs)
         knowledge_candidates = selection["knowledge_candidates"]
         excluded_shared_image_samples = selection["excluded_shared_image_samples"]
         test_ids = {canonical_id(s["id"]) for s in test}
@@ -1878,8 +2051,9 @@ def run_evaluation(args, prepared=None) -> int:
                        if len(caches[c["name"]]) != len(test)}
             if missing:
                 raise ValueError(f"缓存不足，已在加载模型前终止: {missing}")
-        LOGGER.info("评分方案：按题型核对答案；固定裁判范围=%s；生成阶段不进行自评。",
-                    args.evaluation["judgeScope"])
+        LOGGER.info("评分方案：%s；生成阶段不进行自评。",
+                    "PRIMA：开放题FActScore，其余Accuracy，解释ROUGE-L" if prima_settings(args)["enabled"]
+                    else f"按题型核对答案；固定裁判范围={args.evaluation['judgeScope']}")
         split_metadata = {
             **selection,
             "training_overlap_audit": training_audit,
@@ -1933,7 +2107,8 @@ def run_evaluation(args, prepared=None) -> int:
                 comparison["paired_deltas"].append({
                     "name": config["name"], "baseline": baseline,
                     "metrics": _paired_metrics(by_config[config["name"]], by_config[baseline], seed=args.seed,
-                                                bootstrap_samples=args.evaluation["bootstrapSamples"])})
+                                                bootstrap_samples=args.evaluation["bootstrapSamples"],
+                                                metric_names=metrics_for(args.evaluation))})
         _write_json(output / "comparison.json", comparison)
         metrics_complete = True
         run_manifest["status"] = "generated" if any(s["judge_pending"] for s in summaries) else "complete"
@@ -1944,7 +2119,7 @@ def run_evaluation(args, prepared=None) -> int:
         if baseline:
             for delta in comparison["paired_deltas"]:
                 print(f"{delta['name']} 相对 {baseline} 的平均变化: " +
-                      ", ".join(f"{METRIC_LABELS[m]} {_metric_text(delta['metrics'][m])}" for m in METRICS))
+                      ", ".join(f"{METRIC_LABELS[m]} {_metric_text(delta['metrics'][m])}" for m in metrics_for(args.evaluation)))
         llm.close()
         llm = None
         # 旧 Excel 插件只认识旧 FactScore，不能将新版指标伪装成旧指标交给它。
@@ -1977,6 +2152,26 @@ def run_evaluation(args, prepared=None) -> int:
                 handler.close()
 
 
+def prepare_protocol_data(args, configs):
+    """先固定完整测试清单，再按题型筛选；未选中的测试题依旧不得进入RAG知识库。"""
+    prima = prima_settings(args)
+    if not prima["enabled"]:
+        return prepare_evaluation_data(args, configs)
+    full_args = copy.deepcopy(args)
+    full_args.N = None
+    test, knowledge, metadata = prepare_evaluation_data(full_args, configs)
+    counts = {kind: sum(question_type_for_sample(sample) == kind for sample in test) for kind in QUESTION_TYPE_ORDER}
+    selected = [sample for sample in test if question_type_for_sample(sample) in prima["questionTypes"]]
+    if args.N is not None:
+        selected = selected[:args.N]
+    if not selected:
+        raise ValueError(f"所选 questionTypes 没有可评估问答；原测试集题型数量：{counts}")
+    return selected, knowledge, {**metadata, "question_type_counts_before_filter": counts,
+                                "selected_question_types": prima["questionTypes"],
+                                "excluded_by_question_type": sum(count for kind, count in counts.items()
+                                                                  if kind not in prima["questionTypes"])}
+
+
 def _selection_key(args, configs) -> str:
     """相同数据只回源一次；文件修改或筛选变化时重新读取。"""
     source = Path(args.dataset_path).expanduser().resolve()
@@ -1991,6 +2186,7 @@ def _selection_key(args, configs) -> str:
         "use_rag": any(config["use_rag"] for config in configs),
         "knowledge_size": args.knowledge_size, "seed": args.seed,
         "exclude_shared_images": args.exclude_shared_images,
+        "question_types": prima_settings(args)["questionTypes"] if prima_settings(args)["enabled"] else None,
     })
 
 
@@ -2014,9 +2210,11 @@ def _read_jsonl(path: Path) -> list[dict]:
 def run_semantic_scoring(jobs, runs) -> None:
     """先结束全部答案生成，再只加载一次固定裁判。裁判缓存可跨模型共用。"""
     eligible_runs = [(job, run) for job, run in zip(jobs, runs) if run["status"] != "failed"]
-    if not eligible_runs or jobs[0].evaluation["judgeScope"] == "none":
+    if not eligible_runs or not _judge_enabled(jobs[0]):
         return
     args = jobs[0]
+    prima = prima_settings(args)
+    use_atomic = prima["enabled"]
     judge_args = judge_arguments(args)
     identity = {"model": _model_identity(judge_args.model_path, judge_args.model_revision),
                 "model_type": judge_args.model, "lora": None,
@@ -2039,18 +2237,24 @@ def run_semantic_scoring(jobs, runs) -> None:
                 required = [row for row in rows if row["judge_required"]]
                 if required and scorer is None:
                     judge_model = create_generator(judge_args)
-                    scorer = ReferenceJudge(judge_model, Path(args.suite_output_dir) / "judge_cache",
-                                            identity, max_new_tokens=args.evaluation["judgeMaxNewTokens"],
-                                            retries=args.evaluation["judgeRetries"])
-                    print(f"\n统一评分：固定原版 {judge_args.model}，每题一次参考答案比较；"
-                          "相同题目与回答可复用评分缓存。", flush=True)
-                for row in tqdm(required, desc=f"{job.run_name} 语义评分"):
+                    if use_atomic:
+                        scorer = AtomicFactScorer(judge_model, Path(args.suite_output_dir) / "judge_cache",
+                                                 identity, max_new_tokens=prima["factScoreMaxNewTokens"],
+                                                 batch_size=prima["factScoreBatchSize"], retries=args.evaluation["judgeRetries"])
+                    else:
+                        scorer = ReferenceJudge(judge_model, Path(args.suite_output_dir) / "judge_cache",
+                                                identity, max_new_tokens=args.evaluation["judgeMaxNewTokens"],
+                                                retries=args.evaluation["judgeRetries"])
+                    print(f"\n统一评分：固定原版 {judge_args.model}；" +
+                          ("开放题拆分原子事实，再按参考答案逐条二元核验。" if use_atomic else "每题一次参考答案比较。") +
+                          "相同内容复用评分缓存。", flush=True)
+                for row in tqdm(required, desc=f"{job.run_name} {'FActScore' if use_atomic else '语义评分'}"):
                     answers = row["answer_details"]
                     # 文字相似度只比较答案字段；语义裁判还检查医学解释，不能仅把选项字母交给它。
                     sample = {**row, "evaluation_reference": answers["semantic_reference"]}
                     details = scorer.score(sample, answers["semantic_prediction"])
-                    row["semantic_details"] = details
-                    row["semantic_score"] = details["score"]
+                    row["factscore_details" if use_atomic else "semantic_details"] = details
+                    row["factscore" if use_atomic else "semantic_score"] = details["score"]
                 summary["judge_identity"] = identity
                 update_summary(summary, rows, job)
                 save_scored_rows(directory, summary, rows)
@@ -2061,7 +2265,8 @@ def run_semantic_scoring(jobs, runs) -> None:
             for delta in comparison["paired_deltas"]:
                 after, before = rows_by_mode[delta["name"]], rows_by_mode[baseline]
                 delta["metrics"] = _paired_metrics(after, before, seed=job.seed,
-                                                   bootstrap_samples=job.evaluation["bootstrapSamples"])
+                                                   bootstrap_samples=job.evaluation["bootstrapSamples"],
+                                                   metric_names=metrics_for(job.evaluation))
             _write_json(output / "comparison.json", comparison)
             run["status"] = "complete"
             run["scoring_status"] = "needs_review" if total_failures else "complete"
@@ -2076,7 +2281,7 @@ def run_semantic_scoring(jobs, runs) -> None:
     finally:
         if judge_model is not None:
             judge_model.close()
-        LOGGER.info("统一语义评分总耗时 %.1f 秒。", time.perf_counter() - started)
+        LOGGER.info("统一裁判评分总耗时 %.1f 秒。", time.perf_counter() - started)
 
 
 def write_suite_comparison(root: Path, runs: list[dict], *, status: str, elapsed: float) -> dict:
@@ -2117,11 +2322,21 @@ def write_suite_comparison(root: Path, runs: list[dict], *, status: str, elapsed
             after, before = predictions[fine["output_dir"]], predictions[base["output_dir"]]
             if after.keys() != before.keys():
                 raise ValueError("汇总时发现微调前后测试编号不一致，拒绝计算配对差值。")
-            paired.append({
+            paired_entry = {
                 "name": fine["name"], "baseline": base["name"], "num_samples": len(after),
                 "metrics": _paired_metrics(after, before,
-                                            bootstrap_samples=fine["evaluation"]["bootstrapSamples"], seed=fine["seed"]),
-            })
+                                            bootstrap_samples=fine["evaluation"]["bootstrapSamples"], seed=fine["seed"],
+                                            metric_names=metrics_for(fine["evaluation"])),
+            }
+            if _prima_enabled(fine["evaluation"]):
+                paired_entry["by_question_type"] = {
+                    kind: _paired_metrics(
+                        {key: row for key, row in after.items() if row["answer_details"]["question_type"] == kind},
+                        {key: row for key, row in before.items() if row["answer_details"]["question_type"] == kind},
+                        bootstrap_samples=fine["evaluation"]["bootstrapSamples"], seed=fine["seed"], metric_names=PRIMA_METRICS)
+                    for kind in QUESTION_TYPE_ORDER
+                }
+            paired.append(paired_entry)
     same_data = len({entry["test_fingerprint"] for entry in summaries}) <= 1 if summaries else None
     note = ("客观题准确率只核对最终选项或Yes/No，不评价解释质量；多选题要求集合完全一致。"
             "开放题以固定原版裁判对照参考答案评分，不使用旧自评FactScore。"
@@ -2132,6 +2347,9 @@ def write_suite_comparison(root: Path, runs: list[dict], *, status: str, elapsed
     result = {"schema_version": SCHEMA_VERSION, "status": status, "runs": runs,
               "elapsed_seconds": elapsed, "same_test_data": same_data,
               "summaries": summaries, "paired_deltas": paired, "note": note}
+    if summaries and _prima_enabled(summaries[0]["evaluation"]):
+        return write_prima_comparison(root, result)
+    _archive_inactive_report(root / "question_type_comparison.json")
     _write_json(root / "suite_comparison.json", result)
     lines = ["# 模型评估对比", "", f"状态：{status}；总耗时：{elapsed:.1f} 秒。", "",
              "指标范围为 0～1，越高越好；n为有效题数，—表示没有可用评分。", "",
@@ -2164,6 +2382,72 @@ def write_suite_comparison(root: Path, runs: list[dict], *, status: str, elapsed
     return result
 
 
+def write_prima_comparison(root: Path, result: dict) -> dict:
+    """对齐论文Table II的按题型指标，不将整体语义分或答案文字相似度冒充新指标。"""
+    summaries = result["summaries"]
+    settings = summaries[0]["evaluation"]["prima"]
+    result["protocol"] = "prima"
+    result["display_scale"] = "0-100；JSON中的原始得分与置信区间仍为0-1"
+    result["note"] = (
+        "参照PRIMA第7页指标说明和第8页Table II；这是本地参考答案版FActScore，不是论文结果的完整复现。"
+        "FActScore=参考答案支持的候选原子事实数/全部候选原子事实数，按题求均值，衡量事实精度而非要点召回；"
+        "证据不足记不支持，空最终回答/无事实记0，拆分或核验失败记null。固定原版裁判共享，未使用被测LoRA自评。"
+        "封闭/单选/多选Accuracy核对最终答案；多选完全匹配选项集合，少选/多选/错选均为0。"
+        "解释ROUGE-L只比较明确的最终解释；不计think或visual_evidence，不用整段开放题答案代替解释。"
+        "缺少有效参考解释记null；有参考解释但模型未给解释计0。"
+        "表中±是有效题目得分的总体标准差，不是论文多次实验的标准差；95%区间见JSON。"
+        "本地2B裁判与不完整参考可能导致偏差，不能直接与论文数值比较。"
+    )
+    rows = []
+    for summary in summaries:
+        groups = summary["by_question_type"] if settings["separateQuestionTypes"] else {"all": summary}
+        for kind, group in groups.items():
+            rows.append({"name": summary["name"], "question_type": kind, "num_samples": group["num_samples"],
+                         "generation_input_mode": summary["generation_input_mode"], "metrics": group["metrics"]})
+    result["question_type_comparison"] = rows
+    _write_json(root / "suite_comparison.json", result)
+    _write_json(root / "question_type_comparison.json", {"protocol": "prima", "rows": rows, "note": result["note"]})
+    lines = ["# PRIMA题型评估", "", f"状态：{result['status']}；总耗时：{result['elapsed_seconds']:.1f} 秒。", "",
+             "FActScore、Accuracy 和解释 ROUGE-L 均按 0～100 展示；—表示不适用、已关闭或没有有效评分。", "",
+             "| 评估名称 | 题型 | 题数 | FActScore (%) | Accuracy (%) | 解释 ROUGE-L (%) | FAct有效/适用 | 解释有效/适用 |",
+             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for row in rows:
+        metrics = row["metrics"]
+        lines.append("| " + " | ".join([
+            row["name"], QUESTION_TYPE_LABELS.get(row["question_type"], "合并"), str(row["num_samples"]),
+            *[_percent_text(metrics[key]) for key in PRIMA_METRICS],
+            f"{metrics['factscore']['n']}/{metrics['factscore']['total']}",
+            f"{metrics['explanation_rouge_l']['n']}/{metrics['explanation_rouge_l']['total']}",
+        ]) + " |")
+    if result["paired_deltas"]:
+        lines.extend(["", "同题微调前后变化（百分点；括号为95%配对bootstrap区间）：", ""])
+        for delta in result["paired_deltas"]:
+            groups = delta["by_question_type"] if settings["separateQuestionTypes"] else {"all": delta["metrics"]}
+            for kind, metrics in groups.items():
+                changes = []
+                for key, value in metrics.items():
+                    if value["mean"] is not None:
+                        interval = [round(number * 100, 2) if number is not None else None for number in value["ci95"]]
+                        changes.append(f"{METRIC_LABELS[key]} {value['mean'] * 100:+.2f}，区间{interval}，n={value['n']}")
+                if changes:
+                    lines.append(f"- {delta['name']} 相对 {delta['baseline']} / {QUESTION_TYPE_LABELS.get(kind, '合并')}：" + "；".join(changes))
+    if result["same_test_data"] is False:
+        lines.extend(["", "测试题或测试内容不同，不能直接进行横向排名。"])
+    if len({entry["generation_input_mode"] for entry in summaries}) > 1:
+        lines.extend(["", "当前千问可接收图片，DeepSeek只接收文本；若需相同文本条件，请将四组textOnly统一设为true。"])
+    lines.extend(["", "复核信息：", ""])
+    for summary in summaries:
+        lines.append(f"- {summary['name']}：待复核{summary['review_count']}题，可能截断{summary['possible_truncations']}题，"
+                     f"缺有效参考解释{summary['missing_reference_explanations']}题，裁判失败{summary['judge_failures']}题。")
+    for run in result["runs"]:
+        if run["status"] == "failed" or run.get("scoring_status") == "failed":
+            lines.extend(["", f"任务 {run['name']} 失败：{run.get('error', '请查看对应eval.log')}。"])
+    lines.extend(["", "评分失败会降低覆盖率；不同有效子集的均值不可直接排名。详细原子事实与核验结果见predictions.jsonl，"
+                  "需人工检查的记录见review_needed.json。", "", result["note"], ""])
+    (root / "suite_comparison.md").write_text("\n".join(lines), encoding="utf-8")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -2175,7 +2459,7 @@ def main(argv: list[str] | None = None) -> int:
             if not job.export_only:
                 validate_model_choice(job)
                 validate_lora_path(job.model_path, job.lora_path)
-                if job.evaluation["judgeScope"] != "none":
+                if _judge_enabled(job):
                     validate_model_choice(judge_arguments(job))
                 if not job.dataset_path:
                     raise ValueError(f"{job.run_name} 缺少 datasetPath / --dataset_path。")
@@ -2198,13 +2482,16 @@ def main(argv: list[str] | None = None) -> int:
                 if args.check_data:
                     key = _selection_key(job, configs)
                     if key != last_key:
-                        prepared = prepare_evaluation_data(job, configs)
+                        prepared = prepare_protocol_data(job, configs)
                         last_key = key
                     test, knowledge, metadata = prepared
                     entry.update({"num_samples": len(test), "knowledge_size": len(knowledge),
                                   "test_ids": [row["id"] for row in test],
                                   "test_fingerprint": dataset_fingerprint(test),
                                   "test_selection": metadata["test_selection"]})
+                    entry["question_type_counts"] = {kind: sum(question_type_for_sample(sample) == kind for sample in test)
+                                                       for kind in QUESTION_TYPE_ORDER}
+                    entry["reference_explanation_count"] = sum(score_answer(sample, "")["explanation_eligible"] for sample in test)
                 checked.append(entry)
             print(json.dumps(checked[0] if len(checked) == 1 else checked, ensure_ascii=False, indent=2))
             return 0
@@ -2229,7 +2516,7 @@ def main(argv: list[str] | None = None) -> int:
             configs = parse_eval_config(job.eval_config, job.top_k)
             key = _selection_key(job, configs)
             if key != last_key:
-                prepared = prepare_evaluation_data(job, configs)
+                prepared = prepare_protocol_data(job, configs)
                 last_key = key
             code = run_evaluation(job, prepared)
             if code:
@@ -2246,7 +2533,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run_semantic_scoring(jobs, runs)
     except Exception as error:
-        LOGGER.exception("统一语义评分未完成；生成回答已保留，修正问题后可 resume 续评。")
+        LOGGER.exception("统一裁判评分未完成；生成回答已保留，修正问题后可 resume 续评。")
         for run in runs:
             if run["status"] == "generated":
                 run["scoring_status"] = "failed"
@@ -2261,7 +2548,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n本轮完成 {sum(run['status'] == 'complete' for run in runs)}/{len(runs)} 组，"
           f"总耗时 {result['elapsed_seconds']:.1f} 秒；汇总：{root / 'suite_comparison.md'}")
     if needs_review:
-        print("存在语义评分失败，已记录为 null 并列入 review_needed.json；请先复核再比较均值。")
+        print("存在裁判评分失败，已记录为 null 并列入 review_needed.json；请先复核再比较均值。")
     return 1 if failed else 2 if needs_review else 0
 
 

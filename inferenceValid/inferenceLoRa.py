@@ -83,7 +83,7 @@ def check_local_dependencies(use_lora: bool) -> None:
             print(f"  - {problem}")
         print()
         print("可以先在可用环境里安装：")
-        print("  pip install -r DeepSeek-Model/requirements-lora.txt")
+        print("  pip install -r DeepSeek-R1-Distill-Qwen-1.5B/requirements-lora.txt")
         raise SystemExit(1)
 
 

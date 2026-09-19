@@ -9,7 +9,7 @@ Download Hugging Face models with automatic resume support.
 
 示例：
   python inferenceValid/download.py
-  python inferenceValid/download.py --repo-id deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --local-dir DeepSeek-Model
+  python inferenceValid/download.py --repo-id deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --local-dir DeepSeek-R1-Distill-Qwen-1.5B
   python inferenceValid/download.py --endpoint https://hf-mirror.com
 """
 

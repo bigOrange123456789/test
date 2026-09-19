@@ -95,18 +95,142 @@ def _text(value: Any) -> str:
 
 def _semantic_text(value: Any, question_type: str) -> str:
     """语义裁判保留答案与解释，不把影像标注或隐藏推理作为回答内容。"""
+    if isinstance(value, str):
+        value, visible_ok = _without_thinking(value)
+        if not visible_ok:
+            return ""
     value, valid = _decode(value)
     if not valid:
         return ""
+    if isinstance(value, list):
+        return ", ".join(text for item in value if (text := _semantic_text(item, question_type)))
     if not isinstance(value, dict):
         return _text(value)
     pieces = []
-    for key in ("correct_option", "correct_options", "answer", "text", "explanation", "rationale"):
+    for key in ("correct_option", "correct_options", "answer", "text", "explanation", "rationale", "reasoning"):
         if key in value:
             text = _semantic_text(value[key], question_type)
             if text and text not in pieces:
                 pieces.append(text)
     return "\n".join(pieces)
+
+
+_EXPLANATION_MARKER = re.compile(
+    r"(?:^|\n|(?<=[.!?。]))\s*(?:#{1,6}\s*)?"
+    r"(?:explanation|rationale|reasoning|解释|理由|推理解释|推理说明)\s*[:：]\s*", re.I,
+)
+_EXPLANATION_END = re.compile(
+    r"(?:^|\n|(?<=[.!?。]))\s*(?:#{1,6}\s*)?"
+    r"(?:visual[ _-]*evidence|image[ _-]*evidence|视觉证据|影像证据|"
+    r"(?:final\s+|correct\s+)?answers?|最终答案|正确答案|答案)\s*[:：]", re.I,
+)
+
+
+def question_type_for_sample(sample: dict) -> str:
+    """优先使用保留的题型元数据；兼容旧结果中只存在 MIRA 编号的记录。"""
+    question_type = sample.get("question_type")
+    if question_type in QUESTION_TYPES:
+        return question_type
+    parts = str(sample.get("id", "")).split(":")
+    return parts[3] if len(parts) == 5 and parts[0] == "mira" and parts[3] in QUESTION_TYPES else "open_ended"
+
+
+def _explanation_text(text: str) -> str:
+    """保留解释正文，截去随后单独给出的答案或影像证据栏目。"""
+    text = _plain_format(text)
+    marker = _EXPLANATION_MARKER.search(text)
+    if marker:
+        text = text[marker.end():].strip()
+    end = _EXPLANATION_END.search(text)
+    if end:
+        text = text[:end.start()].strip()
+    # 单个答案标签或肯否词即使误放在 explanation 字段中，也不算解释。
+    if re.fullmatch(r"(?:yes|no|true|false|是|否|不是|不|[A-Z](?:\s*[,，、;；]\s*[A-Z])*)[.!。]?", text, re.I):
+        return ""
+    return text.strip()
+
+
+def _explanation_field(value: Any) -> tuple[str, bool]:
+    """显式解释字段仅接受文本或文本列表，不把任意嵌套对象转换为解释。"""
+    if value is None:
+        return "", True
+    if isinstance(value, list):
+        if any(not isinstance(item, str) for item in value):
+            return "", False
+        pieces = [_explanation_field(item) for item in value]
+        return "\n".join(text for text, valid in pieces if text), all(valid for text, valid in pieces)
+    if not isinstance(value, str):
+        return "", False
+    if not value.strip():
+        return "", True
+    visible, valid = _without_thinking(value)
+    return (_explanation_text(visible), True) if valid else ("", False)
+
+
+def _extract_explanation(value: Any, question_type: str) -> tuple[str, bool]:
+    """严格提取可公开展示的解释；开放题整段答案不自动充当推理解释。
+
+    第二项表示解析是否有效。无独立解释但格式有效时返回 ("", True)，
+    malformed JSON、未闭合 think、解释字段类型错误时返回 ("", False)。
+    影像标注 visual_evidence 永不作为解释的后备字段。
+    """
+    if isinstance(value, str):
+        if not value.strip():
+            return "", True
+        value, valid = _without_thinking(value)
+        if not valid:
+            return "", False
+    value, valid = _decode(value)
+    if not valid:
+        return "", False
+    if isinstance(value, dict):
+        for key in ("explanation", "rationale", "reasoning"):
+            if key in value:
+                explanation, valid = _explanation_field(value[key])
+                if explanation or not valid:
+                    return explanation, valid
+        # 只沿明确的答案容器向内查找，不遍历视觉证据等其他标注字段。
+        for key in ("answer", "text"):
+            if key in value:
+                explanation, valid = _extract_explanation(value[key], question_type)
+                if explanation or not valid:
+                    return explanation, valid
+        return "", True
+    if not isinstance(value, str):
+        return "", True
+    plain = _plain_format(value)
+    marker = _EXPLANATION_MARKER.search(plain)
+    if marker:
+        return _explanation_text(plain[marker.end():]), True
+    if question_type == "closed_ended":
+        # MIRA 的封闭题常把解释写在 text 中：“Yes/No, 解释”。
+        candidates = _answer_candidates(plain)
+        if len(candidates) == 1:
+            match = re.match(r"^(?:yes|no|true|false|不是|是|否|不)(?=$|[\s,.，。!！:：])", candidates[0], re.I)
+            if match:
+                tail = candidates[0][match.end():].lstrip(" \t\r\n,.，。!！:：;；")
+                if not re.match(r"^(?:or|and|/)\s*(?:yes|no)\b|^(?:或者|或|和)(?:是|否)", tail, re.I):
+                    return _explanation_text(tail), True
+    return "", True
+
+
+def _explanation_details(reference: Any, prediction: Any, question_type: str) -> dict:
+    expected, reference_ok = _extract_explanation(reference, question_type)
+    observed, prediction_ok = _extract_explanation(prediction, question_type)
+    eligible = reference_ok and bool(expected)
+    if not reference_ok:
+        status = "reference_unparseable"
+    elif not expected:
+        status = "reference_missing"
+    elif not prediction_ok:
+        status = "prediction_unparseable"
+    elif not observed:
+        status = "prediction_missing"
+    else:
+        status = "ok"
+    return {"prediction_explanation": observed if prediction_ok else "",
+            "reference_explanation": expected if reference_ok else "",
+            "explanation_eligible": eligible, "explanation_status": status}
 
 
 def _options(sample: dict) -> dict[str, str]:
@@ -413,10 +537,7 @@ def score_answer(sample: dict, prediction: str) -> dict:
     开放题和不明确的参考不计算客观准确率，返回 None；不能把文本匹配当医学正确率。
     normalized_* 用于答案文本指标，prediction_raw 保留原始模型输出供人工审查。
     """
-    question_type = sample.get("question_type")
-    if question_type not in QUESTION_TYPES:
-        parts = str(sample.get("id", "")).split(":")
-        question_type = parts[3] if len(parts) == 5 and parts[0] == "mira" and parts[3] in QUESTION_TYPES else "open_ended"
+    question_type = question_type_for_sample(sample)
     reference_raw = sample.get("answer", sample.get("reference", ""))
     reference_value, reference_ok = _answer_field(reference_raw, question_type)
     visible, visible_ok = _without_thinking(prediction)
@@ -431,6 +552,7 @@ def score_answer(sample: dict, prediction: str) -> dict:
         "semantic_reference": _semantic_text(reference_raw, question_type),
         "answer_accuracy": None, "eligible": False, "parse_status": "not_objective", "choice_f1": None,
     }
+    result.update(_explanation_details(reference_raw, prediction, question_type))
     if question_type == "open_ended":
         if not prediction_ok:
             result["parse_status"] = "prediction_unparseable"

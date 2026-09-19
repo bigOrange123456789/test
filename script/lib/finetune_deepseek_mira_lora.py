@@ -20,7 +20,7 @@
       否则退回 CPU；显式指定 CUDA 但不可用时会报错。
 
 数据与监督规则：
-    - 默认基座模型为项目根目录 ``DeepSeek-Model``，默认 ID 清单为
+    - 默认基座模型为项目根目录 ``DeepSeek-R1-Distill-Qwen-1.5B``，默认 ID 清单为
       ``output/mira_split_ids.json``，只按顺序使用 ``train_ids``；重复 ID、
       与 ``test_ids`` 重叠或无法回源的 ID 都会报错。
     - 数据目录优先级为 ``--data-root``、清单中的 ``data_root``、最后是
@@ -473,7 +473,7 @@ def build_parser():
     mode.add_argument("--check-env", action="store_true", help="Check packages/CUDA only; do not load model weights.")
     mode.add_argument("--dry-run", action="store_true", help="Validate all selected IDs/QA text, without ML dependencies.")
     mode.add_argument("--check-data", action="store_true", help="Validate IDs and actual tokenizer labels/lengths, without model weights.")
-    parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "DeepSeek-Model")
+    parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B")
     parser.add_argument("--split-manifest", type=Path, default=OUTPUT_DIR / "mira_split_ids.json",
                         help="训练 ID 清单；默认读取项目 output/mira_split_ids.json。")
     parser.add_argument("--data-root", type=Path, help="Default: manifest data_root, then G:/Codex_dataset/MIRA-data.")

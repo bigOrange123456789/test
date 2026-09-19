@@ -183,7 +183,7 @@ def _ensure_local_dependencies(model_id: str, use_lora: bool) -> None:
     details = "；".join(problems)
     message = (
         f"本地模型 {model_id} 的推理依赖未就绪：{details}。"
-        "请在当前虚拟环境中执行：pip install -r DeepSeek-Model/requirements-lora.txt"
+        "请在当前虚拟环境中执行：pip install -r DeepSeek-R1-Distill-Qwen-1.5B/requirements-lora.txt"
     )
     print(f"[CardioAI] {message}", flush=True)
     raise RuntimeError(message)

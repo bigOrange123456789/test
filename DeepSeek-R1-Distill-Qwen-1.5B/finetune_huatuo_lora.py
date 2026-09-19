@@ -6,8 +6,8 @@ This script saves only LoRA adapter weights. It does not overwrite the base
 model weights in model.safetensors.
 
 Typical usage from the project root:
-    python DeepSeek-Model/finetune_huatuo_lora.py --check-env
-    python DeepSeek-Model/finetune_huatuo_lora.py
+    python DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora.py --check-env
+    python DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora.py
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def ensure_dependencies() -> None:
             print(f"  - {line}")
         print()
         print("Install/update dependencies, then rerun training. For example:")
-        print("  pip install -r DeepSeek-Model/requirements-lora.txt")
+        print("  pip install -r DeepSeek-R1-Distill-Qwen-1.5B/requirements-lora.txt")
         raise SystemExit(1)
 
 
@@ -452,7 +452,7 @@ def parse_args() -> argparse.Namespace:
     project_root = script_dir.parent
 
     parser = argparse.ArgumentParser(
-        description="LoRA fine-tuning for local DeepSeek-Model with Huatuo QA JSONL data."
+        description="使用华佗问答对对本地 DeepSeek-R1-Distill-Qwen-1.5B 进行 LoRA 微调。"
     )
     parser.add_argument("--check-env", action="store_true", help="Only check dependencies.")
     parser.add_argument("--model-dir", type=Path, default=script_dir)

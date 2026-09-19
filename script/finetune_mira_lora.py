@@ -6,6 +6,9 @@ DeepSeek 文本模型与 Qwen3-VL 视觉语言模型的数据管线差异较大�
 * ``DeepSeek-Model`` 由 ``lib/finetune_deepseek_mira_lora.py`` 后端执行；
 * ``Qwen3-VL-2B-Instruct`` 由 ``lib/finetune_qwen3_vl_lora.py`` 后端执行。
 
+``DeepSeek-Model`` 保留为配置中的模型选择标识，实际默认权重目录为项目根目录的
+``DeepSeek-R1-Distill-Qwen-1.5B``；选择标识与磁盘上的文件夹名称分别维护。
+
 因为最终调用的是原后端的 ``main(argv)``，未重新实现训练过程，所以相同参数下
 的数据选择、提示词、token/图片处理、随机种子、LoRA 层、优化器和输出均与直接
 运行原脚本一致。

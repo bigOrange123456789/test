@@ -2,7 +2,7 @@
 """
 Download and normalize public medical QA/SFT datasets for DeepSeek LoRA.
 
-The output format matches DeepSeek-Model/finetune_huatuo_lora.py:
+The output format matches DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora.py:
 each JSONL row contains question, answer, and messages fields.
 
 Examples:

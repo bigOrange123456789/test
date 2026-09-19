@@ -7,7 +7,7 @@ import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
-from script.lib.answer_metrics import score_answer
+from script.lib.answer_metrics import question_type_for_sample, score_answer
 
 
 def choice_sample(*, multiple=False, reference=None, options=None):
@@ -293,6 +293,37 @@ class AnswerMetricTests(unittest.TestCase):
         self.assertEqual(wrong["answer_accuracy"], 0)
         self.assertEqual(wrong["normalized_prediction"], "B")
 
+    def test_semantic_reasoning_field_preserves_public_facts_and_excludes_hidden_or_visual_text(self):
+        sample = {"question_type": "open_ended", "answer": {
+            "text": "Coronary intervention is required.",
+            "reasoning": "<think>REFERENCE_SECRET</think>The stenosis may cause infarction.",
+            "visual_evidence": "REFERENCE_IMAGE_ONLY",
+        }}
+        prediction = json.dumps({"text": "Intervention is indicated.",
+                                 "reasoning": "<think>PREDICTION_SECRET</think>The artery may become occluded.",
+                                 "visual_evidence": "PREDICTION_IMAGE_ONLY"})
+        result = score_answer(sample, prediction)
+        self.assertIn("The stenosis may cause infarction.", result["semantic_reference"])
+        self.assertIn("The artery may become occluded.", result["semantic_prediction"])
+        for field in ("semantic_reference", "semantic_prediction"):
+            self.assertNotIn("SECRET", result[field])
+            self.assertNotIn("IMAGE_ONLY", result[field])
+            self.assertNotIn("<think>", result[field])
+        self.assertEqual(result["reference_explanation"], "The stenosis may cause infarction.")
+        self.assertEqual(result["prediction_explanation"], "The artery may become occluded.")
+
+    def test_semantic_nested_reasoning_lists_strip_think_and_reject_unclosed_hidden_text(self):
+        sample = {"question_type": "open_ended", "answer": {"answer": {
+            "text": "Intervention.", "reasoning": ["<think>SECRET</think>Flow is impaired.",
+                                                     "<think>UNFINISHED_SECRET"],
+            "visual_evidence": {"reasoning": "IMAGE_ONLY"},
+        }}}
+        result = score_answer(sample, '{"answer":{"text":"Intervention.","reasoning":"Flow is impaired."}}')
+        self.assertIn("Flow is impaired.", result["semantic_reference"])
+        self.assertIn("Flow is impaired.", result["semantic_prediction"])
+        self.assertNotIn("SECRET", result["semantic_reference"])
+        self.assertNotIn("IMAGE_ONLY", result["semantic_reference"])
+
     def test_same_line_explanation_does_not_hide_uncertain_or_conflicting_choice(self):
         predictions = [
             "Answer: C or B because either may fit.",
@@ -352,6 +383,144 @@ class AnswerMetricTests(unittest.TestCase):
                 result = score_answer(choice_sample(multiple=True), prediction)
                 self.assertEqual(result["parse_status"], "prediction_unparseable")
                 self.assertEqual(result["answer_accuracy"], 0)
+
+    def test_question_type_helper_preserves_metadata_and_legacy_id_fallback(self):
+        self.assertEqual(question_type_for_sample({"question_type": "single_choice",
+                                                  "id": "mira:train:1:open_ended:0"}), "single_choice")
+        self.assertEqual(question_type_for_sample({"id": "mira:train:1:multiple_choice:0"}), "multiple_choice")
+        self.assertEqual(question_type_for_sample({"question_type": "unknown"}), "open_ended")
+        self.assertEqual(question_type_for_sample({"id": "arbitrary:train:1:single_choice:0"}), "open_ended")
+
+    def test_real_choice_explanation_is_separate_from_answer_and_image_annotation(self):
+        sample = choice_sample(reference={"correct_option": "C. Echocardiography",
+                                          "explanation": "Doppler assesses blood flow in the heart.",
+                                          "visual_evidence": "REFERENCE_IMAGE_ONLY"})
+        prediction = json.dumps({"correct_option": "C", "explanation": "Doppler measures cardiac blood flow.",
+                                 "visual_evidence": "PREDICTION_IMAGE_ONLY"})
+        result = score_answer(sample, prediction)
+        self.assertTrue(result["explanation_eligible"])
+        self.assertEqual(result["explanation_status"], "ok")
+        self.assertEqual(result["reference_explanation"], "Doppler assesses blood flow in the heart.")
+        self.assertEqual(result["prediction_explanation"], "Doppler measures cardiac blood flow.")
+        self.assertNotIn("IMAGE_ONLY", result["reference_explanation"] + result["prediction_explanation"])
+        self.assertEqual(result["answer_accuracy"], 1)
+
+    def test_closed_reference_text_after_yes_no_is_explanation_but_bare_yes_no_is_not(self):
+        sample = {"question_type": "closed_ended",
+                  "answer": {"text": "No, there is no evidence of myocardial infarction.",
+                             "visual_evidence": "REFERENCE_IMAGE_ONLY"}}
+        result = score_answer(sample, "Answer: No, the tracing does not show infarction.")
+        self.assertEqual(result["reference_explanation"], "there is no evidence of myocardial infarction.")
+        self.assertEqual(result["prediction_explanation"], "the tracing does not show infarction.")
+        self.assertTrue(result["explanation_eligible"])
+        self.assertEqual(result["explanation_status"], "ok")
+        sample["answer"]["text"] = "No"
+        result = score_answer(sample, "No. Explanation: The tracing is normal.")
+        self.assertFalse(result["explanation_eligible"])
+        self.assertEqual(result["reference_explanation"], "")
+        self.assertEqual(result["explanation_status"], "reference_missing")
+
+    def test_missing_prediction_explanation_remains_eligible_for_zero_score(self):
+        sample = choice_sample(reference={"correct_option": "C", "explanation": "Doppler assesses flow."})
+        for prediction in ("C", '{"correct_option":"C"}',
+                           '{"correct_option":"C","visual_evidence":"Doppler assesses flow."}',
+                           '{"correct_option":"C","explanation":"C"}'):
+            with self.subTest(prediction=prediction):
+                result = score_answer(sample, prediction)
+                self.assertTrue(result["explanation_eligible"])
+                self.assertEqual(result["prediction_explanation"], "")
+                self.assertEqual(result["explanation_status"], "prediction_missing")
+                self.assertEqual(result["answer_accuracy"], 1)
+
+    def test_open_answer_text_never_automatically_becomes_explanation(self):
+        sample = {"question_type": "open_ended", "answer": {
+            "text": "Coronary angiography shows two right coronary artery lesions.",
+            "visual_evidence": "REFERENCE_IMAGE_ONLY"}}
+        result = score_answer(sample, '{"text":"There are two lesions.","visual_evidence":"PREDICTION_IMAGE_ONLY"}')
+        self.assertFalse(result["explanation_eligible"])
+        self.assertEqual(result["explanation_status"], "reference_missing")
+        self.assertEqual(result["reference_explanation"], "")
+        self.assertEqual(result["prediction_explanation"], "")
+        self.assertIn("Coronary angiography", result["semantic_reference"])
+
+    def test_explicit_open_explanation_is_scored_when_present(self):
+        sample = {"question_type": "open_ended", "answer": {
+            "text": "Urgent coronary intervention.", "explanation": "The narrowed artery may occlude."}}
+        result = score_answer(sample, "Answer: Intervention.\nExplanation: Occlusion could cause infarction.")
+        self.assertTrue(result["explanation_eligible"])
+        self.assertEqual(result["prediction_explanation"], "Occlusion could cause infarction.")
+        self.assertEqual(result["reference_explanation"], "The narrowed artery may occlude.")
+
+    def test_explanation_headings_accept_markdown_chinese_and_same_line(self):
+        sample = choice_sample(reference={"correct_option": "C", "rationale": "Assesses blood flow."})
+        predictions = [
+            ("Answer: C\nExplanation: Doppler assesses flow.", "Doppler assesses flow."),
+            ("Answer: C\n\n### **Rationale:**\nDoppler assesses flow.", "Doppler assesses flow."),
+            ("Answer: C. Explanation: Doppler assesses flow.", "Doppler assesses flow."),
+            ("答案：C。\n解释：多普勒可评估血流。", "多普勒可评估血流。"),
+        ]
+        for prediction, expected in predictions:
+            with self.subTest(prediction=prediction):
+                result = score_answer(sample, prediction)
+                self.assertEqual(result["prediction_explanation"], expected)
+                self.assertEqual(result["explanation_status"], "ok")
+
+    def test_explanation_stops_at_final_answer_and_visual_evidence_sections(self):
+        sample = choice_sample(reference={"correct_option": "C", "explanation": "Assesses flow."})
+        for prediction in (
+            "Answer: C\nExplanation: Doppler assesses flow.\nVisual evidence: IMAGE_ONLY",
+            "Answer: C\nExplanation: Doppler assesses flow. Visual evidence: IMAGE_ONLY",
+            "Explanation: Doppler assesses flow.\nFinal answer: C",
+            "Answer: C\nExplanation: Doppler assesses flow.\nvisual_evidence: IMAGE_ONLY",
+        ):
+            with self.subTest(prediction=prediction):
+                result = score_answer(sample, prediction)
+                self.assertEqual(result["prediction_explanation"], "Doppler assesses flow.")
+
+    def test_explanation_follows_only_answer_or_text_containers(self):
+        sample = choice_sample(reference={"answer": {"correct_option": "C", "reasoning": "Assesses flow."}})
+        prediction = json.dumps({"answer": {"correct_option": "C", "rationale": ["Shows valves.", "Assesses flow."]},
+                                 "visual_evidence": {"explanation": "IMAGE_ONLY"}})
+        result = score_answer(sample, prediction)
+        self.assertEqual(result["prediction_explanation"], "Shows valves.\nAssesses flow.")
+        self.assertEqual(result["reference_explanation"], "Assesses flow.")
+        self.assertEqual(result["explanation_status"], "ok")
+        result = score_answer(choice_sample(), '{"correct_option":"C","visual_evidence":{"explanation":"IMAGE_ONLY"}}')
+        self.assertEqual(result["prediction_explanation"], "")
+        self.assertEqual(result["explanation_status"], "reference_missing")
+
+    def test_hidden_thinking_is_never_used_as_explanation(self):
+        sample = choice_sample(reference={"correct_option": "C", "explanation": "Assesses flow."})
+        result = score_answer(sample, '<think>Explanation: SECRET_REASONING</think>\nAnswer: C')
+        self.assertEqual(result["prediction_explanation"], "")
+        self.assertEqual(result["explanation_status"], "prediction_missing")
+        result = score_answer(sample, json.dumps({"correct_option": "C",
+                                                  "explanation": "<think>SECRET_REASONING</think>Assesses flow."}))
+        self.assertEqual(result["prediction_explanation"], "Assesses flow.")
+        self.assertEqual(result["explanation_status"], "ok")
+
+    def test_truncated_json_or_thinking_and_wrong_field_types_have_explicit_failure_status(self):
+        sample = choice_sample(reference={"correct_option": "C", "explanation": "Assesses flow."})
+        for prediction in (
+            '{"correct_option":"C","explanation":"Assesses flow.',
+            '```json\n{"correct_option":"C","explanation":"Assesses flow."}',
+            '<think>Explanation: Assesses flow.',
+            'Answer: C\nExplanation: Assesses flow.<think>unfinished',
+            '{"correct_option":"C","explanation":{"visual_evidence":"Assesses flow."}}',
+            '{"correct_option":"C","explanation":["Assesses flow.",17]}',
+        ):
+            with self.subTest(prediction=prediction):
+                result = score_answer(sample, prediction)
+                self.assertEqual(result["explanation_status"], "prediction_unparseable")
+                self.assertTrue(result["explanation_eligible"])
+                self.assertEqual(result["prediction_explanation"], "")
+
+    def test_invalid_reference_explanation_is_not_silently_treated_as_missing(self):
+        sample = choice_sample(reference={"correct_option": "C", "explanation": 5})
+        result = score_answer(sample, "Answer: C\nExplanation: Assesses flow.")
+        self.assertFalse(result["explanation_eligible"])
+        self.assertEqual(result["explanation_status"], "reference_unparseable")
+        self.assertEqual(result["answer_accuracy"], 1, "解释格式与客观答案准确率相互独立。")
 
 
 if __name__ == "__main__":

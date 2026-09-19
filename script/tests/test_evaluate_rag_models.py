@@ -63,7 +63,7 @@ class RunConfigurationTests(TemporaryCase):
         })
         args = self.args("--top_k", "3")
         self.assertEqual(args.model, "DeepSeek-Model")
-        self.assertEqual(Path(args.model_path), PROJECT_ROOT / "DeepSeek-Model")
+        self.assertEqual(Path(args.model_path), PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B")
         self.assertEqual(Path(args.embedding_model_path), PROJECT_ROOT / "Qwen3-VL-Embedding-2B")
         self.assertEqual(Path(args.dataset_path), self.root / "mira.jsonl")
         self.assertEqual(Path(args.chroma_db_dir), self.root / "MIRA-chroma")
@@ -87,7 +87,7 @@ class RunConfigurationTests(TemporaryCase):
         with changed_directory(another_directory):
             args = self.args()
         self.assertEqual(args.model, "DeepSeek-Model")
-        self.assertEqual(Path(args.model_path), PROJECT_ROOT / "DeepSeek-Model")
+        self.assertEqual(Path(args.model_path), PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B")
 
     def test_explicit_config_replaces_default_file(self):
         self.write_config({"model": "DeepSeek-Model", "useRAG": True})
@@ -102,7 +102,7 @@ class RunConfigurationTests(TemporaryCase):
         self.write_config({"model": "Qwen3-VL-2B-Instruct", "useRAG": False})
         args = self.args("--model", "DeepSeek-Model")
         self.assertEqual(args.model, "DeepSeek-Model")
-        self.assertEqual(Path(args.model_path), PROJECT_ROOT / "DeepSeek-Model")
+        self.assertEqual(Path(args.model_path), PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B")
 
     def test_cli_paths_and_eval_tasks_override_config(self):
         self.write_config({

@@ -42,13 +42,14 @@ dataset/**/*.tsv
 # DeepSeek MIRA text-only LoRA adapters and Trainer checkpoints
 /script/deepseek_mira_lora_adapter/
 
-# Large local model assets, caches, and fine-tuning outputs.
-# Keep only the local training scripts and their dependency file.
-DeepSeek-Model/*
-!DeepSeek-Model/
-!DeepSeek-Model/finetune_huatuo_lora.py
-!DeepSeek-Model/finetune_huatuo_lora2.py
-!DeepSeek-Model/requirements-lora.txt
+# Local DeepSeek model: ignore downloaded weights, tokenizer/config files,
+# Hugging Face caches, upstream documentation, LoRA outputs, and checkpoints.
+# Keep only project-maintained training scripts and their dependency list.
+/DeepSeek-R1-Distill-Qwen-1.5B/**
+!/DeepSeek-R1-Distill-Qwen-1.5B/
+!/DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora.py
+!/DeepSeek-R1-Distill-Qwen-1.5B/finetune_huatuo_lora2.py
+!/DeepSeek-R1-Distill-Qwen-1.5B/requirements-lora.txt
 
 # Downloaded Qwen3-VL model files.
 Qwen3-VL-2B-Instruct/

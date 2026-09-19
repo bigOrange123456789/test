@@ -38,7 +38,7 @@ def main():
         base, data, output = root / "base", root / "data", root / "adapter"
         data.mkdir()
         tokenizer = AutoTokenizer.from_pretrained(
-            PROJECT_ROOT / "DeepSeek-Model", local_files_only=True
+            PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B", local_files_only=True
         )
         config = Qwen2Config(
             vocab_size=151936, hidden_size=32, intermediate_size=64,
