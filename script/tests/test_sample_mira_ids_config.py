@@ -164,7 +164,7 @@ class SampleMiraIdsConfigurationTests(unittest.TestCase):
         self.assertEqual(args.collection, sampling.DEFAULT_COLLECTION)
         self.assertIs(args.exclude_shared_images, False)
         self.assertIs(args.check_config, False)
-        self.assertEqual(Path(args.output).name, "mira_split_ids.json")
+        self.assertEqual(Path(args.output), sampling.PROJECT_ROOT / "output" / "mira_split_ids.json")
 
     def test_null_db_uses_sibling_default_and_null_keywords_enable_match_all(self):
         self.write_config(dict(self.payload, db_dir=None, keywords_file=None))

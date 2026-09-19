@@ -33,6 +33,11 @@ JSON 结构：
 参数名使用后端命令行参数的下划线形式，例如 ``gradient_accumulation_steps``。
 未写入 JSON 的参数继续使用原后端默认值。布尔值会正确转换为 ``--check-env``、
 ``--dry-run``、``--no-gradient-checkpointing`` 等开关。
+
+默认从项目 ``output/mira_split_ids.json`` 读取训练 ID，并分别将参数保存到
+``output/deepseek_mira_lora_adapter`` 或 ``output/qwen3_vl_2b_lora_adapter``。
+JSON 中的相对路径以配置文件所在目录为基准；临时命令行路径仍以当前工作目录
+为基准。可在 JSON 中修改 ``split_manifest`` 和 ``output_dir`` 指定其他位置。
 """
 
 from __future__ import annotations
@@ -130,13 +135,26 @@ def arguments_to_argv(parser: argparse.ArgumentParser, values: dict[str, Any]) -
     return argv
 
 
-def resolve_backend_argv(payload: dict[str, Any], extra_args: list[str]) -> tuple[Any, list[str]]:
+def resolve_backend_argv(
+    payload: dict[str, Any], extra_args: list[str], config_dir: Path | None = None,
+) -> tuple[Any, list[str]]:
     """选择后端并组合 JSON 参数与临时命令行参数。"""
     model = payload["model"]
     backend = import_backend(model)
     profiles = payload.get("model_arguments", {})
-    configured = profiles.get(model, {})
-    argv = arguments_to_argv(backend.build_parser(), configured)
+    configured = dict(profiles.get(model, {}))
+    parser = backend.build_parser()
+    actions = parser_actions(parser)
+    config_dir = (config_dir or SCRIPT_DIR).expanduser().resolve()
+    # 配置文件不依赖启动位置；命令行覆盖在路径转换后追加，保留其原有语义。
+    for name, value in configured.items():
+        action = actions.get(name)
+        if isinstance(value, str) and action is not None and (
+            action.type is Path or name == "resume_from_checkpoint"
+        ):
+            path = Path(value).expanduser()
+            configured[name] = str((path if path.is_absolute() else config_dir / path).resolve())
+    argv = arguments_to_argv(parser, configured)
     if extra_args[:1] == ["--"]:
         extra_args = extra_args[1:]
     argv.extend(extra_args)
@@ -158,7 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     args, extra_args = parser.parse_known_args(argv)
     try:
         payload = load_config(args.config)
-        backend, backend_argv = resolve_backend_argv(payload, extra_args)
+        backend, backend_argv = resolve_backend_argv(
+            payload, extra_args, args.config.expanduser().resolve().parent,
+        )
         # 先解析一次以验证 JSON 与临时参数组合；真正执行时后端会再次解析同一 argv。
         backend.build_parser().parse_args(backend_argv)
         print(f"微调模型：{payload['model']}", flush=True)

@@ -11,6 +11,7 @@ Python >= 3.10。安装依赖后运行：
 
 每个配置对象是一组评估：name 是名称，pathLora=null 使用原始参数；
 否则只读加载该目录的 LoRA，不合并、不覆盖任何模型文件。
+项目生成的 LoRA 与编号清单统一位于 output；JSON 可使用 ../output/... 相对路径。
 datasetFilter 指向包含 test_ids 的 JSON，仅评估这些问答，不使用 train_ids；
 为 null 时，MIRA 目录使用整个原始 test.csv（JSONL 则使用该文件全部记录）。
 默认不限制题数；显式 --N 仅取固定测试集前 N 题，便于小规模试运行。

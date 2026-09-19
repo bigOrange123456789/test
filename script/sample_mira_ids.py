@@ -14,7 +14,7 @@ JSON 参数说明（路径可为绝对路径，相对路径以 JSON 所在目录
     splits：抽样来源列表，支持 train、validation、test；默认只从 train.csv 抽样。
     seed：随机种子，相同数据和参数下可复现抽样。
     exclude_shared_images：true 时额外排除与测试题共用图片的训练题。
-    output：生成的 ID 清单，默认 mira_split_ids.json，不能覆盖输入配置。
+    output：生成的 ID 清单，默认项目 output/mira_split_ids.json，不能覆盖输入配置。
     check_config：true 时只显示解析后的参数，不扫描数据，也不写入抽样结果。
     _说明：可选的中文说明文本，不参与抽样。
 
@@ -358,7 +358,8 @@ def _validated_config(payload: dict, config_path: Path) -> argparse.Namespace:
     defaults = {
         "data_root": str(DEFAULT_DATA_ROOT), "keywords_file": None, "db_dir": None,
         "collection": DEFAULT_COLLECTION, "splits": ["train"], "seed": 42,
-        "exclude_shared_images": False, "output": "mira_split_ids.json", "check_config": False,
+        "exclude_shared_images": False,
+        "output": str(PROJECT_ROOT / "output" / "mira_split_ids.json"), "check_config": False,
     }
     if not isinstance(payload, dict):
         raise ValueError("抽样配置必须是 JSON 对象。")

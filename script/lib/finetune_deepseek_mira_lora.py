@@ -21,7 +21,7 @@
 
 数据与监督规则：
     - 默认基座模型为项目根目录 ``DeepSeek-Model``，默认 ID 清单为
-      ``script/mira_split_ids.json``，只按顺序使用 ``train_ids``；重复 ID、
+      ``output/mira_split_ids.json``，只按顺序使用 ``train_ids``；重复 ID、
       与 ``test_ids`` 重叠或无法回源的 ID 都会报错。
     - 数据目录优先级为 ``--data-root``、清单中的 ``data_root``、最后是
       ``G:\\Codex_dataset\\MIRA-data``。一条训练样本对应一个 MIRA 问答。
@@ -36,9 +36,9 @@
       基座权重始终冻结；这不是 4-bit QLoRA。CUDA 优先 BF16，其次 FP16，
       CPU 使用 FP32。脚本按优化器步输出 loss、速度、耗时和预计剩余时间。
     - 快速试跑示例：``--limit 16 --max-steps 2 --output-dir
-      script/deepseek_mira_smoke_adapter``。显存不足时保持 batch size 1，并可降低
+      output/deepseek_mira_smoke_adapter``。显存不足时保持 batch size 1，并可降低
      最大长度，但应先用 ``--check-data`` 确认完整答案仍能容纳。
-    - 默认输出 ``script/deepseek_mira_lora_adapter``，包含 adapter、tokenizer、
+    - 默认输出 ``output/deepseek_mira_lora_adapter``，包含 adapter、tokenizer、
       training_metadata.json、trainer_state.json 和定期 checkpoint。输出目录必须
       不存在或为空，且不得是基座模型目录、其父目录或子目录；不会覆盖原模型。
     - adapter 不是完整模型。推理时先加载同一 DeepSeek 基座，再通过
@@ -71,6 +71,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SCRIPT_DIR.parent
+OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_DATA_ROOT = Path(r"G:\Codex_dataset\MIRA-data")
 DEFAULT_SYSTEM_PROMPT = (
     "You are a medical question-answering assistant. Answer the question using "
@@ -473,9 +474,11 @@ def build_parser():
     mode.add_argument("--dry-run", action="store_true", help="Validate all selected IDs/QA text, without ML dependencies.")
     mode.add_argument("--check-data", action="store_true", help="Validate IDs and actual tokenizer labels/lengths, without model weights.")
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "DeepSeek-Model")
-    parser.add_argument("--split-manifest", type=Path, default=SCRIPT_DIR / "mira_split_ids.json")
+    parser.add_argument("--split-manifest", type=Path, default=OUTPUT_DIR / "mira_split_ids.json",
+                        help="训练 ID 清单；默认读取项目 output/mira_split_ids.json。")
     parser.add_argument("--data-root", type=Path, help="Default: manifest data_root, then G:/Codex_dataset/MIRA-data.")
-    parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR / "deepseek_mira_lora_adapter")
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "deepseek_mira_lora_adapter",
+                        help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
     parser.add_argument("--limit", type=int, default=0, help="First N train_ids for a short experiment; 0 uses all.")
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=-1, help="Positive value overrides epochs.")

@@ -29,6 +29,9 @@ dataset/**/*.tsv
 # Local sampling, fine-tuning, and evaluation JSON configuration
 /script/*.json
 
+# Generated split manifests, LoRA adapters, and training checkpoints
+/output/
+
 # Generated model evaluation results, logs, reports, and caches
 /eval_results/
 /eval_results_v2/

@@ -35,6 +35,40 @@ class UnifiedFinetuneTests(unittest.TestCase):
         direct_args = backend.build_parser().parse_args([])
         self.assertEqual(vars(unified_args), vars(direct_args))
 
+    def test_both_default_profiles_and_backends_use_project_output(self):
+        payload = unified.load_config(unified.DEFAULT_CONFIG_PATH)
+        for model, adapter_name in (
+            ("DeepSeek-Model", "deepseek_mira_lora_adapter"),
+            ("Qwen3-VL-2B-Instruct", "qwen3_vl_2b_lora_adapter"),
+        ):
+            with self.subTest(model=model):
+                backend, argv = unified.resolve_backend_argv(dict(payload, model=model), [])
+                for args in (backend.build_parser().parse_args(argv), backend.build_parser().parse_args([])):
+                    self.assertEqual(args.split_manifest, unified.SCRIPT_DIR.parent / "output" / "mira_split_ids.json")
+                    self.assertEqual(args.output_dir, unified.SCRIPT_DIR.parent / "output" / adapter_name)
+
+    def test_json_paths_use_config_directory_and_cli_paths_remain_explicit(self):
+        payload = {
+            "model": "Qwen3-VL-2B-Instruct",
+            "model_arguments": {"Qwen3-VL-2B-Instruct": {
+                "split_manifest": "../output/custom_ids.json",
+                "output_dir": "../output/custom_adapter",
+                "resume_from_checkpoint": "../output/custom_adapter/checkpoint-4",
+            }},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            backend, argv = unified.resolve_backend_argv(payload, [], root / "config")
+            args = backend.build_parser().parse_args(argv)
+            self.assertEqual(args.split_manifest, root / "output" / "custom_ids.json")
+            self.assertEqual(args.output_dir, root / "output" / "custom_adapter")
+            self.assertEqual(args.resume_from_checkpoint, str(root / "output" / "custom_adapter" / "checkpoint-4"))
+            _, argv = unified.resolve_backend_argv(
+                payload, ["--output-dir", "explicit_cli_adapter"], root / "config",
+            )
+            self.assertEqual(backend.build_parser().parse_args(argv).output_dir, Path("explicit_cli_adapter"))
+        self.assertEqual(payload["model_arguments"][payload["model"]]["output_dir"], "../output/custom_adapter")
+
     def test_json_values_and_cli_overrides_follow_backend_argparse(self):
         payload = {
             "model": "DeepSeek-Model",

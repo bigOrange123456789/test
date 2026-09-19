@@ -19,7 +19,7 @@ CUDA 版 ``MLMtest`` 环境中使用统一入口：
 
 数据与监督规则：
     - 默认基座是项目根目录 ``Qwen3-VL-2B-Instruct``。从
-      ``script/mira_split_ids.json`` 读取 ``train_ids`` 并回源到 MIRA CSV；
+      ``output/mira_split_ids.json`` 读取 ``train_ids`` 并回源到 MIRA CSV；
       保持清单顺序，拒绝重复 ID 或与 ``test_ids`` 重叠，不在训练中使用测试集。
     - 一条样本包含一个问答及其全部图片。用户输入仅含问题、选项和图片；
       caption 与其他源字段不会作为提示。结构化答案和嵌套解释会完整保留。
@@ -33,9 +33,9 @@ CUDA 版 ``MLMtest`` 环境中使用统一入口：
       alpha 32、dropout 0.05，启用 SDPA 和梯度检查点。只训练语言解码器投影层
       adapter，基座和视觉权重保持冻结。CUDA 优先 BF16，否则 FP16；CPU FP32。
     - 快速试跑：``--limit 16 --max-steps 2 --output-dir
-      script/qwen3_vl_lora_smoke``。显存不足时保持 batch size 1，可将
+      output/qwen3_vl_lora_smoke``。显存不足时保持 batch size 1，可将
       ``--max-pixels`` 降至 131072；默认每图像素预算为 4096～262144。
-    - 默认输出 ``script/qwen3_vl_2b_lora_adapter``，包含 adapter、processor、
+    - 默认输出 ``output/qwen3_vl_2b_lora_adapter``，包含 adapter、processor、
       tokenizer、training_metadata.json、trainer_state.json 和 checkpoint。脚本
       不会向原模型目录写入或合并权重，非空输出目录默认被拒绝。
     - 可用 ``--resume-from-checkpoint`` 恢复训练，但应保持相同清单、模型、数据
@@ -65,6 +65,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SCRIPT_DIR.parent
+OUTPUT_DIR = PROJECT_ROOT / "output"
 INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
 if str(INFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(INFERENCE_DIR))
@@ -636,14 +637,15 @@ def train(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Define safe defaults for the local model, manifest, and adapter output."""
-    script_dir = SCRIPT_DIR
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check-env", action="store_true", help="Only report dependencies and CUDA; do not load weights.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve IDs and print counts without loading the model.")
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "Qwen3-VL-2B-Instruct")
     parser.add_argument("--data-root", type=Path, help="MIRA CSV directory; defaults to data_root in the manifest.")
-    parser.add_argument("--split-manifest", type=Path, default=script_dir / "mira_split_ids.json")
-    parser.add_argument("--output-dir", type=Path, default=script_dir / "qwen3_vl_2b_lora_adapter")
+    parser.add_argument("--split-manifest", type=Path, default=OUTPUT_DIR / "mira_split_ids.json",
+                        help="训练 ID 清单；默认读取项目 output/mira_split_ids.json。")
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "qwen3_vl_2b_lora_adapter",
+                        help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
     parser.add_argument("--allow-existing-output", action="store_true", help="Allow saving into a nonempty adapter directory.")
     parser.add_argument("--resume-from-checkpoint", default=None, help="Trainer checkpoint directory to resume.")
     parser.add_argument("--limit", type=int, default=0, help="Use only the first N manifest IDs for a debug run; 0 means all.")

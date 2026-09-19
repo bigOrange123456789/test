@@ -65,8 +65,8 @@ def main(argv=None):
     if args.device == "cuda" and not torch.cuda.is_available():
         parser.error("当前环境无法使用 CUDA，请切换至 MLMtest 环境后再运行。")
 
-    qwen_adapter = PROJECT_ROOT / "script" / "qwen3_vl_2b_lora_adapter"
-    deepseek_adapter = PROJECT_ROOT / "script" / "deepseek_mira_lora_adapter"
+    qwen_adapter = PROJECT_ROOT / "output" / "qwen3_vl_2b_lora_adapter"
+    deepseek_adapter = PROJECT_ROOT / "output" / "deepseek_mira_lora_adapter"
     cases = [
         ("Qwen", "Qwen3-VL-2B-Instruct", None, "text_and_images"),
         ("Qwen_lora", "Qwen3-VL-2B-Instruct", qwen_adapter, "text_and_images"),
