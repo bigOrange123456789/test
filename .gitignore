@@ -26,9 +26,11 @@ dataset/**/*.parquet
 dataset/**/*.csv
 dataset/**/*.tsv
 
-# Local MIRA sampling results and evaluation configuration
-/script/mira_split_ids.json
-/script/evaluate_rag.json
+# Local sampling, fine-tuning, and evaluation JSON configuration
+/script/*.json
+
+# Generated model evaluation results, logs, reports, and caches
+/eval_results/
 
 # Qwen3-VL LoRA adapters and Trainer checkpoints
 /script/qwen3_vl_2b_lora_adapter/

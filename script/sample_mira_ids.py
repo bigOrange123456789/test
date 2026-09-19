@@ -1,18 +1,33 @@
-"""Audit MIRA keyword/embedding coverage and sample training/test QA IDs.
+"""检查 MIRA 关键词/向量覆盖情况，并生成训练集和测试集问答编号。
 
-Example:
-    python script/sample_mira_ids.py --train-count 5000 --test-count 500
+先修改本脚本同目录的 sample_mira_ids.json，再直接运行，无须输入抽样参数：
+    python script/sample_mira_ids.py
+或在 script 目录中运行：
+    python sample_mira_ids.py
 
-All existing train/validation/test CSVs are checked against the Chroma IDs.
-The default sampling pool is train.csv; use --splits to select other sources.
-Test QAs are selected first, then training QAs. Priority: keyword + embedding,
-embedding only, keyword only, neither. Counts refer to individual QA pairs.
-Keywords match question/options/answer/extra QA text, not shared captions.
-Matching ignores case, uses word boundaries and flexible phrase whitespace,
-and treats a term's parenthesized abbreviation as an alternative. Each QA
-counts once, even if several keywords match. No stemming or synonym expansion.
-Uses only the Python standard library and reads Chroma SQLite metadata in
-read-only mode. Coverage means a matching stored ID, not vector quality.
+JSON 参数说明（路径可为绝对路径，相对路径以 JSON 所在目录为基准）：
+    train_count / test_count：训练集 / 测试集的问答数量，均为正整数。
+    data_root：MIRA 数据目录。
+    keywords_file：关键词文件；null 使用数据目录旁的 MIRA_myConfig 中的默认文件。
+    db_dir：已有 Chroma 目录；null 使用数据目录旁的 MIRA-chroma。
+    collection：Chroma 集合名。
+    splits：抽样来源列表，支持 train、validation、test；默认只从 train.csv 抽样。
+    seed：随机种子，相同数据和参数下可复现抽样。
+    exclude_shared_images：true 时额外排除与测试题共用图片的训练题。
+    output：生成的 ID 清单，默认 mira_split_ids.json，不能覆盖输入配置。
+    check_config：true 时只显示解析后的参数，不扫描数据，也不写入抽样结果。
+    _说明：可选的中文说明文本，不参与抽样。
+
+默认配置以脚本位置定位，与运行时工作目录无关。为兼容旧调用仍保留命令行选项，
+显式命令行参数优先于 JSON；正常使用只需编辑 JSON。重复运行会更新 output 指定的清单，
+如需保留已有训练/测试划分，请在 JSON 中为 output 设置不同文件名。
+
+数量以一个问答对为单位。先选测试题，再选训练题，优先级依次为：
+关键词与向量均匹配、仅有向量、仅匹配关键词、两者均不满足。
+会核查所有已有 train/validation/test CSV，但只从 splits 指定的来源抽样。
+关键词匹配问题、选项、答案和额外问答文本，不匹配共用图片标题；忽略大小写，
+使用词边界并允许短语内不同空白，括号中的缩写也可匹配。每道题只统计一次。
+只使用标准库，并只读访问 Chroma 元数据；向量覆盖表示存在对应编号，不代表向量质量。
 """
 
 from __future__ import annotations
@@ -39,6 +54,7 @@ from embed_mira_chroma import DEFAULT_DATA_ROOT, Sample, image_path, iter_sample
 LOGGER = logging.getLogger("sample_mira_ids")
 SPLITS = ("train", "validation", "test")
 DEFAULT_COLLECTION = "mira_qwen3_vl_embedding"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_suffix(".json")
 KEYWORDS_FILENAME = "cardiovascular_ai_keywords2.txt"
 PRIORITY_ORDER = ("keyword_and_embedded", "embedded_only", "keyword_only", "neither")
 T = TypeVar("T")
@@ -326,26 +342,107 @@ def sample_dataset(data_root: Path, train_count: int, test_count: int, *,
     }
 
 
+def _validated_config(payload: dict, config_path: Path) -> argparse.Namespace:
+    """严格检查 JSON 类型，避免字符串 false 或布尔数量被误当作有效参数。"""
+    defaults = {
+        "data_root": str(DEFAULT_DATA_ROOT), "keywords_file": None, "db_dir": None,
+        "collection": DEFAULT_COLLECTION, "splits": ["train"], "seed": 42,
+        "exclude_shared_images": False, "output": "mira_split_ids.json", "check_config": False,
+    }
+    if not isinstance(payload, dict):
+        raise ValueError("抽样配置必须是 JSON 对象。")
+    unknown = set(payload) - set(defaults) - {"train_count", "test_count", "_说明"}
+    if unknown:
+        raise ValueError(f"抽样配置包含未知字段：{sorted(unknown)}")
+    if "_说明" in payload and not isinstance(payload["_说明"], str):
+        raise ValueError("_说明 必须是中文说明字符串。")
+    settings = defaults | {key: value for key, value in payload.items() if key != "_说明"}
+    for key in ("train_count", "test_count"):
+        value = settings.get(key)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{key} 必须设置为正整数。")
+    if type(settings["seed"]) is not int:
+        raise ValueError("seed 必须为整数。")
+    for key in ("exclude_shared_images", "check_config"):
+        if type(settings[key]) is not bool:
+            raise ValueError(f"{key} 必须为 JSON true 或 false，不能带引号。")
+    splits = settings["splits"]
+    if (not isinstance(splits, list) or not splits
+            or any(not isinstance(split, str) or split not in SPLITS for split in splits)
+            or len(splits) != len(set(splits))):
+        raise ValueError("splits 必须是非空且不重复的列表，可选 train、validation、test。")
+    if not isinstance(settings["collection"], str) or not settings["collection"].strip():
+        raise ValueError("collection 必须为非空字符串。")
+    for key in ("data_root", "keywords_file", "db_dir", "output"):
+        value = settings[key]
+        if value is None and key in {"keywords_file", "db_dir"}:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{key} 必须为非空路径字符串。")
+        path = Path(value).expanduser()
+        settings[key] = (path if path.is_absolute() else config_path.parent / path).resolve()
+    data_root = settings["data_root"]
+    if settings["db_dir"] is None:
+        settings["db_dir"] = data_root.parent / "MIRA-chroma"
+    if settings["keywords_file"] is None:
+        settings["keywords_file"] = data_root.parent / "MIRA_myConfig" / KEYWORDS_FILENAME
+    output = settings["output"]
+    if output.suffix.lower() != ".json":
+        raise ValueError("output 必须使用 .json 扩展名。")
+    protected = {config_path, DEFAULT_CONFIG_PATH.resolve(), settings["keywords_file"]}
+    if output in protected:
+        raise ValueError("output 不能覆盖抽样配置文件或关键词文件，请指定独立的 ID 清单路径。")
+    return argparse.Namespace(config=config_path, **settings)
+
+
+def load_config(path: Path) -> argparse.Namespace:
+    """读取同名 JSON；相对路径统一以该 JSON 的目录为基准。"""
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"抽样配置文件不存在：{path}")
+    return _validated_config(json.loads(path.read_text(encoding="utf-8-sig")), path)
+
+
+def resolve_run_config(args: argparse.Namespace) -> argparse.Namespace:
+    """常规使用全部来自 JSON；仅显式指定的旧命令行参数可以覆盖配置。"""
+    path = args.config.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"抽样配置文件不存在：{path}")
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("抽样配置必须是 JSON 对象。")
+    # 先验证原始配置，避免命令行覆盖掩盖 JSON 中的类型错误或危险输出路径。
+    _validated_config(payload, path)
+    for key, value in vars(args).items():
+        if key == "config" or value is None:
+            continue
+        # 兼容旧命令行的路径语义：显式 CLI 相对路径以当前工作目录为基准。
+        payload[key] = str(value.expanduser().resolve()) if isinstance(value, Path) else value
+    return _validated_config(payload, path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--train-count", type=int, required=True, help="Number of training QAs.")
-    parser.add_argument("--test-count", type=int, required=True, help="Number of test QAs.")
-    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT,
-                        help=f"MIRA CSV directory (default: {DEFAULT_DATA_ROOT}).")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
+                        help="配置文件；默认读取脚本同目录的 sample_mira_ids.json。")
+    parser.add_argument("--check-config", action="store_true", default=None,
+                        help="仅检查配置，不进行抽样；也可在 JSON 设置 check_config=true。")
+    parser.add_argument("--train-count", type=int, help="兼容旧调用：覆盖 JSON 的 train_count。")
+    parser.add_argument("--test-count", type=int, help="兼容旧调用：覆盖 JSON 的 test_count。")
+    parser.add_argument("--data-root", type=Path,
+                        help="兼容旧调用：覆盖 JSON 的 data_root。")
     parser.add_argument("--keywords-file", type=Path,
-                        help=f"UTF-8 keyword file (default: MIRA_myConfig/{KEYWORDS_FILENAME} beside data-root).")
+                        help="兼容旧调用：覆盖 JSON 的 keywords_file。")
     parser.add_argument("--db-dir", type=Path,
-                        help="Existing Chroma directory (default: MIRA-chroma beside data-root).")
-    parser.add_argument("--collection", default=DEFAULT_COLLECTION,
-                        help=f"Existing Chroma collection (default: {DEFAULT_COLLECTION}).")
-    parser.add_argument("--splits", nargs="+", choices=SPLITS, default=["train"],
-                        help="Source CSV splits to sample from (default: train).")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
-    parser.add_argument("--exclude-shared-images", action="store_true",
-                        help="Exclude training QAs sharing any image path with the test set.")
-    parser.add_argument("--output", type=Path, default=Path(__file__).with_name("mira_split_ids.json"),
-                        help="Output JSON path (default: script/mira_split_ids.json).")
+                        help="兼容旧调用：覆盖 JSON 的 db_dir。")
+    parser.add_argument("--collection", help="兼容旧调用：覆盖 JSON 的 collection。")
+    parser.add_argument("--splits", nargs="+", choices=SPLITS,
+                        help="兼容旧调用：覆盖 JSON 的 splits。")
+    parser.add_argument("--seed", type=int, help="兼容旧调用：覆盖 JSON 的 seed。")
+    parser.add_argument("--exclude-shared-images", action=argparse.BooleanOptionalAction, default=None,
+                        help="兼容旧调用：覆盖 JSON 的 exclude_shared_images。")
+    parser.add_argument("--output", type=Path, help="兼容旧调用：覆盖 JSON 的 output。")
     return parser
 
 
@@ -353,9 +450,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
-        output = args.output.expanduser().resolve()
-        if output.suffix.lower() != ".json":
-            raise ValueError("--output must have a .json extension.")
+        args = resolve_run_config(args)
+        output = args.output
+        print(f"读取抽样配置：{args.config}", flush=True)
+        if args.check_config:
+            print(json.dumps(vars(args), ensure_ascii=False, indent=2, default=str))
+            print("配置检查通过；未扫描数据、未写入抽样结果。", flush=True)
+            return 0
         result = sample_dataset(args.data_root, args.train_count, args.test_count,
                                 splits=args.splits, seed=args.seed,
                                 exclude_shared_images=args.exclude_shared_images,
@@ -364,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         with output.open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(result, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
-        print(f"Saved {result['train_count']} train IDs and {result['test_count']} test IDs: {output}")
+        print(f"已保存 {result['train_count']} 个训练编号和 {result['test_count']} 个测试编号：{output}")
         return 0
     except (OSError, ValueError) as error:
         LOGGER.error("%s", error)
