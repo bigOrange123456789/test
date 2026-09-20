@@ -42,6 +42,11 @@ JSON 结构：
 JSON 中的相对路径以配置文件所在目录为基准；临时命令行路径仍以当前工作目录
 为基准。可在 JSON 中修改 ``split_manifest`` 和 ``output_dir`` 指定其他位置。
 
+Qwen 配置可设置 ``on_existing_output: "new"``（默认）：若输出目录已有结果，
+自动另存到相邻的 ``原目录名_run_年月日_时分秒``，保留之前的微调参数；
+``"error"`` 则停止并提示修改目录。断点续训继续使用原输出目录。训练开始和结束
+都会打印实际保存位置；评估新结果时，将评估 JSON 的 ``pathLora`` 指向该位置。
+
 DeepSeek 配置可设置 ``incomplete_samples: "skip"``（默认），跳过原始问题或答案
 缺失的问答并输出数量；``"error"`` 则遇缺失即停止。不会从测试集补齐，也不会用
 visual_evidence 代替答案。训练开始前保存 ``data_selection.json`` 审计清单，完成后

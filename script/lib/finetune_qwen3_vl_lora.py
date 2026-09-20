@@ -37,7 +37,9 @@ CUDA 版 ``MLMtest`` 环境中使用统一入口：
       ``--max-pixels`` 降至 131072；默认每图像素预算为 4096～262144。
     - 默认输出 ``output/qwen3_vl_2b_lora_adapter``，包含 adapter、processor、
       tokenizer、training_metadata.json、trainer_state.json 和 checkpoint。脚本
-      不会向原模型目录写入或合并权重，非空输出目录默认被拒绝。
+      不会向原模型目录写入或合并权重。若目录已有结果，默认改用相邻的
+      ``原目录名_run_年月日_时分秒``，保留旧结果；``--on-existing-output error``
+      可恢复遇到非空目录即停止的行为。实际保存路径会打印到控制台。
     - 可用 ``--resume-from-checkpoint`` 恢复训练，但应保持相同清单、模型、数据
       和训练设置。最终 adapter 不是独立完整模型；推理时需加载同一 Qwen3-VL
       基座，再用 ``PeftModel.from_pretrained`` 加载 adapter。
@@ -511,8 +513,33 @@ def output_is_safe(model_dir: Path, output_dir: Path, allow_existing: bool = Fal
     model_dir, output_dir = model_dir.resolve(), output_dir.resolve()
     if output_dir == model_dir or model_dir in output_dir.parents or output_dir in model_dir.parents:
         raise ValueError("--output-dir must be outside the base model directory; the original weights are protected.")
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError(f"LoRA 输出路径必须是目录，当前路径是文件：{output_dir}")
     if output_dir.exists() and any(output_dir.iterdir()) and not allow_existing:
-        raise ValueError(f"Output directory is not empty: {output_dir}. Choose another path or pass --allow-existing-output.")
+        raise ValueError(f"Output directory is not empty: {output_dir}. "
+                         "请修改 output_dir，或将 on_existing_output 设为 new，另存本次结果。")
+
+
+def select_output_directory(args: argparse.Namespace) -> Path:
+    """遇到旧结果时另选新目录；只计算路径，不在参数检查或 dry-run 中创建文件。"""
+    requested = args.output_dir
+    # 先拒绝与基座重叠及非目录路径，不能靠自动改名绕过保护。
+    output_is_safe(args.model_dir, requested, allow_existing=True)
+    if args.resume_from_checkpoint or args.allow_existing_output:
+        return requested
+    if not requested.exists() or not any(requested.iterdir()):
+        return requested
+    if args.on_existing_output == "error":
+        output_is_safe(args.model_dir, requested)
+    stem = f"{requested.name}_run_{time.strftime('%Y%m%d_%H%M%S')}"
+    candidate = requested.with_name(stem)
+    suffix = 2
+    while candidate.exists():
+        candidate = requested.with_name(f"{stem}_{suffix}")
+        suffix += 1
+    output_is_safe(args.model_dir, candidate)
+    print(f"输出目录已有训练结果，已为本次训练选择新目录：{candidate}", flush=True)
+    return candidate
 
 
 def select_lora_targets(model: Any, suffixes: list[str]) -> list[str]:
@@ -553,6 +580,9 @@ def train(args: argparse.Namespace) -> None:
     started = time.perf_counter()
     ensure_dependencies()
     output_is_safe(args.model_dir, args.output_dir, args.allow_existing_output)
+    if getattr(args, "_auto_output_dir", False):
+        # 自动选出的目录必须由本次训练独占创建；若被另一进程抢先占用，停止而不覆盖。
+        args.output_dir.mkdir(parents=True, exist_ok=False)
     dataset, manifest, train_ids = prepare_dataset(args)
     from transformers import Trainer, TrainerCallback, set_seed
     from peft import LoraConfig, TaskType, get_peft_model
@@ -609,6 +639,7 @@ def train(args: argparse.Namespace) -> None:
     total_elapsed = time.perf_counter() - started
     metadata_payload = {
         "base_model_dir": str(args.model_dir.resolve()),
+        "output_dir": str(args.output_dir.resolve()),
         "split_manifest": str(args.split_manifest.resolve()),
         "manifest_train_count": len(train_ids),
         "actual_train_count": len(dataset),
@@ -646,6 +677,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="训练 ID 清单；默认读取项目 output/mira_split_ids.json。")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "qwen3_vl_2b_lora_adapter",
                         help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
+    parser.add_argument("--on-existing-output", choices=("new", "error"), default="new",
+                        help="输出目录非空时：new 自动另选带时间戳的新目录（默认）；error 停止。续训不改目录。")
     parser.add_argument("--allow-existing-output", action="store_true", help="Allow saving into a nonempty adapter directory.")
     parser.add_argument("--resume-from-checkpoint", default=None, help="Trainer checkpoint directory to resume.")
     parser.add_argument("--limit", type=int, default=0, help="Use only the first N manifest IDs for a debug run; 0 means all.")
@@ -695,7 +728,7 @@ def validate_args(args: argparse.Namespace) -> None:
     args.model_dir = args.model_dir.expanduser().resolve()
     args.split_manifest = args.split_manifest.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
-    output_is_safe(args.model_dir, args.output_dir, args.allow_existing_output or bool(args.resume_from_checkpoint))
+    output_is_safe(args.model_dir, args.output_dir, allow_existing=True)
     config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
     if config.get("model_type") != "qwen3_vl" or "Qwen3VLForConditionalGeneration" not in config.get("architectures", []):
         raise ValueError("--model-dir must contain Qwen3-VL-Instruct, not an embedding or text-only model.")
@@ -707,6 +740,9 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Resume using the original --output-dir that contains the checkpoint.")
         args.resume_from_checkpoint = str(checkpoint)
         args.allow_existing_output = True
+    requested_output = args.output_dir
+    args.output_dir = select_output_directory(args)
+    args._auto_output_dir = args.output_dir != requested_output
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -723,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(lines))
             return 1 if problems else 0
         validate_args(args)
+        print(f"本次 LoRA 输出目录：{args.output_dir}", flush=True)
         if args.dry_run:
             prepare_dataset(args)
             print("Dry run complete; no model was loaded and no files were written.", flush=True)
