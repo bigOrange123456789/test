@@ -24,7 +24,11 @@ def main():
     started = time.perf_counter()
     try:
         with tempfile.TemporaryDirectory(prefix="atomic-factscore-smoke-") as directory:
-            scorer = AtomicFactScorer(llm, directory, {"path": args.model_path}, max_new_tokens=1024)
+            prima = evaluation.prima_settings(args)
+            scorer = AtomicFactScorer(
+                llm, directory, {"path": args.model_path},
+                max_new_tokens=prima["factScoreMaxNewTokens"], batch_size=prima["factScoreBatchSize"],
+                retries=args.evaluation["judgeRetries"], length_budget=prima["factScoreLengthBudget"])
             for prediction, expected in cases:
                 details = scorer.score(sample, prediction)
                 observed.append({"expected": expected, **details})

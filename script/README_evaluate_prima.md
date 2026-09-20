@@ -38,14 +38,57 @@
 | `questionTypes` | 选择要评估的题型，必须为非空、不重复列表。例如只测试选择题时填 `["single_choice", "multiple_choice"]`。 |
 | `factScore` | 开放题原子事实评估开关。关闭后 FActScore 为不适用，不调用整体语义分替代它。 |
 | `explanationRougeL` | 要求模型给出 `Answer` 与 `Explanation`，并比较最终解释。关闭后不计该指标。 |
-| `factScoreMaxNewTokens` | 事实拆分/每批核验的最大输出 token 数，默认 1024；截断 JSON 会记失败并按设置重试，不能使用残缺数组评分。 |
+| `factScoreMaxNewTokens` | 关闭动态裁判预算时，事实拆分/每批核验的固定输出 token 上限，默认 1024。 |
 | `factScoreBatchSize` | 每批核验的事实数，默认 8；剩余事实继续下一批，没有只评分前几条的上限。 |
+| `factScoreLengthBudget` | 动态裁判预算，当前 JSON 已启用，见下方说明。 |
 
 `evaluation.judgeModel` / `judgeModelPath` 决定所有被测模型共同使用的原版裁判，默认本地原版千问，不装载被测 LoRA。`judgeRetries` 控制各阶段格式失败的重试次数（0 或 1）。`judgeScope`、`judgeMaxNewTokens` 仅控制关闭 PRIMA 后的旧语义评分。
 
 只想关闭新增功能：把四组 `evaluation.prima.enabled` 都改为 `false`。为保留不同设置的实验，建议同时更改 `outputDir`。单独调整某个开关也必须对四组保持一致。
 
 题型过滤在调试参数 `--N` 之前进行。筛掉的测试题仍然从 RAG 知识库中排除，不会变成检索材料。
+
+## 按文本长度设置输出 token 预算
+
+回答生成和裁判评分使用独立预算。原来的 `generation.maxNewTokens=2048` 控制模型回答；`evaluation.prima.factScoreMaxNewTokens=1024` 控制事实拆分/核验，1024 并不是所有生成步骤共用的上限。
+
+当前四组 JSON 的 `generation` 都增加了：
+
+```json
+"referenceLengthBudget": {
+  "enabled": true,
+  "multiplier": 4.0,
+  "extraTokens": 256,
+  "minNewTokens": 512,
+  "maxNewTokens": 4096,
+  "retryOnTruncation": true
+}
+```
+
+程序用各基础模型自己的 tokenizer 计算参考答案及公开解释的 token 数，不用字数近似，不计聊天模板标记，也不计结构化 `visual_evidence` 字段。每题预算为 `ceil(参考 token 数 × multiplier) + extraTokens`，再限制在 `minNewTokens` 与 `maxNewTokens` 之间。例如参考答案为 100 tokens 时分配 656；为 500 tokens 时分配 2256。缺少可解析参考文本时使用原 `maxNewTokens`，同样受动态上下限约束。
+
+这只是最大允许生成量，模型遇到结束标记会提前停止。若第一次确实触顶且尚未达到动态上限，`retryOnTruncation=true` 会用 4096 的上限重新生成一次，保留第二次完整回答；不会把第一次的残句当续写上下文。仍然触顶时保存截断标记并列入复核。扩容重试发生错误时保留第一次回答及错误信息，不能冒充完整答案。两次调用的耗时会合计，并在 `generation_info.attempts` 中分别记录。
+
+设 `enabled=false` 可恢复固定 `generation.maxNewTokens`；显式命令行 `--max_new_tokens` 也会关闭回答的动态预算并优先采用该值。回答预算与 PRIMA 总开关独立，关闭 PRIMA 并不会自动关闭回答的动态预算。
+
+裁判的动态配置位于 `evaluation.prima.factScoreLengthBudget`，字段相同，目前为：
+
+```json
+{
+  "enabled": true,
+  "multiplier": 2.0,
+  "extraTokens": 256,
+  "minNewTokens": 1024,
+  "maxNewTokens": 8192,
+  "retryOnTruncation": true
+}
+```
+
+裁判输出长度主要由待处理内容决定：拆分阶段按模型实际回答计数，核验阶段按本批事实 JSON 计数，而不是只看参考答案长度。长回答即使对应很短的参考，也不会因此获得不足的拆分预算。触顶时可在既有 `judgeRetries` 次数内扩容重试，格式错误仍须通过严格 JSON 校验；失败仍记 `null`。关闭后恢复固定 `factScoreMaxNewTokens`。预算与计数依据保存在 `factscore_details.budget_audit` 和各次 `attempts` 中。
+
+参考答案的内容不会进入被测模型提示词，但按测试参考长度分配预算确实使用了测试标注的长度信息。四组应保持同样的预算规则，原版与其 LoRA 使用同一个基础 tokenizer；不同模型 tokenizer 的 token 数可能不同。正式报告应注明这一设置，不应把动态预算结果与固定预算结果当作完全相同的实验条件。FActScore 的评分公式不随预算变化，预算只影响生成和格式完整性。
+
+改变回答预算会使生成缓存失效；仅调整裁判预算可复用已生成的回答，但会重新执行受影响的裁判阶段。当前 JSON 将新结果写到 `output/evaluation_prima_adaptive`，保留先前的 `output/evaluation_prima`。参考预算只是估算，无法保证更快或杜绝截断；模型实际上下文窗口仍是硬限制。
 
 ## FActScore 的具体口径
 
@@ -67,7 +110,7 @@ ROUGE-L 采用项目原有的 jieba 分词 + 最长公共子序列 F1，表示�
 
 ## 输出与复核
 
-当前配置的结果根目录为 `output/evaluation_prima`，保留四组名称 `Qwen`、`Qwen_lora`、`Deepseek`、`Deepseek_lora`。
+当前配置的结果根目录为 `output/evaluation_prima_adaptive`，保留四组名称 `Qwen`、`Qwen_lora`、`Deepseek`、`Deepseek_lora`。
 
 - `suite_comparison.md`：四类题型主表与微调前后变化。
 - `suite_comparison.json`：完整统计、置信区间和配对差值。

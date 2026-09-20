@@ -16,12 +16,14 @@ datasetFilter 指向包含 test_ids 的 JSON，仅评估这些问答，不使用
 为 null 时，MIRA 目录使用整个原始 test.csv（JSONL 则使用该文件全部记录）。
 默认不限制题数；显式 --N 仅取固定测试集前 N 题，便于小规模试运行。
 相同数据共用读取结果；每组完成后释放模型，再加载下一组。
-结果由 JSON 的 outputDir 指定；当前配置写入 output/evaluation_prima/<name>。
+结果由 JSON 的 outputDir 指定；当前配置写入 output/evaluation_prima_adaptive/<name>。
 suite_comparison.md/json 为总览；未配置 outputDir 时仍使用项目 eval_results_v2。
 重复运行会更新同名结果，需要保留多轮实验时请指定不同 --output_dir。
 命令行显式参数统一覆盖配置中的所有组；--resume 不会改变当前筛选清单。
 
-测试 reference 只用于评分，不进入查询或答案生成。
+测试 reference 用于评分；启用动态预算后还用于本地 token 计数，不放进查询或答案生成提示。
+generation.referenceLengthBudget 控制回答长度预算；显式 --max_new_tokens 切回固定预算。
+evaluation.prima.factScoreLengthBudget 控制事实拆分/核验预算，两者独立。
 所有被测模型先依次生成回答并卸载，再统一加载一次固定的原版裁判。
 evaluation.prima.enabled=true：按PRIMA论文的四类题型分别测试、保存明细和汇总。
 单选、多选和是非题核对最终答案，Accuracy以百分比展示；多选必须完整匹配选项集合。
@@ -149,6 +151,8 @@ try:
     from .lib.evaluation_data import prepare_evaluation_data
     from .lib.answer_metrics import score_answer, question_type_for_sample
     from .lib.atomic_factscore import AtomicFactScorer
+    from .lib.token_budget import (LENGTH_BUDGET_DEFAULTS, FACT_LENGTH_BUDGET_DEFAULTS,
+                                   normalize_length_budget, calculate_token_budget)
     from .lib.reference_judge import ReferenceJudge
     from .lib.evaluation_statistics import summarize_values, paired_summary
 except ImportError:
@@ -156,6 +160,8 @@ except ImportError:
     from lib.evaluation_data import prepare_evaluation_data
     from lib.answer_metrics import score_answer, question_type_for_sample
     from lib.atomic_factscore import AtomicFactScorer
+    from lib.token_budget import (LENGTH_BUDGET_DEFAULTS, FACT_LENGTH_BUDGET_DEFAULTS,
+                                 normalize_length_budget, calculate_token_budget)
     from lib.reference_judge import ReferenceJudge
     from lib.evaluation_statistics import summarize_values, paired_summary
 
@@ -179,6 +185,7 @@ PRIMA_DEFAULTS = {
     "enabled": False, "separateQuestionTypes": True, "announceQuestionType": True,
     "questionTypes": list(QUESTION_TYPE_ORDER), "factScore": True, "explanationRougeL": True,
     "factScoreMaxNewTokens": 1024, "factScoreBatchSize": 8,
+    "factScoreLengthBudget": FACT_LENGTH_BUDGET_DEFAULTS,
 }
 EVALUATION_DEFAULTS = {
     "judgeModel": "Qwen3-VL-2B-Instruct", "judgeModelPath": None,
@@ -252,6 +259,18 @@ def prima_settings(args) -> dict:
     return getattr(args, "evaluation", {}).get("prima", PRIMA_DEFAULTS)
 
 
+def reference_length_budget(args) -> dict:
+    return getattr(args, "reference_length_budget", LENGTH_BUDGET_DEFAULTS)
+
+
+def generation_settings(args) -> dict:
+    settings = {"max_new_tokens": args.max_new_tokens, "max_input_tokens": args.max_input_tokens}
+    budget = reference_length_budget(args)
+    if budget["enabled"]:
+        settings["reference_length_budget"] = {"version": "reference-length-v1", **budget}
+    return settings
+
+
 def _prima_enabled(evaluation: dict) -> bool:
     return evaluation.get("prima", {}).get("enabled", False)
 
@@ -308,6 +327,11 @@ def resolve_run_configs(args):
             raise ValueError(f"evaluation.prima 必须是配置对象，可选字段：{list(PRIMA_DEFAULTS)}")
         job.evaluation["prima"] = copy.deepcopy(PRIMA_DEFAULTS | prima)
         prima = job.evaluation["prima"]
+        if not isinstance(prima["factScoreLengthBudget"], dict):
+            raise ValueError("evaluation.prima.factScoreLengthBudget 必须是 JSON 配置对象。")
+        prima["factScoreLengthBudget"] = normalize_length_budget(
+            prima.get("factScoreLengthBudget", {}), "evaluation.prima.factScoreLengthBudget",
+            defaults=FACT_LENGTH_BUDGET_DEFAULTS)
         for field in ("enabled", "separateQuestionTypes", "announceQuestionType", "factScore", "explanationRougeL"):
             if type(prima[field]) is not bool:
                 raise ValueError(f"evaluation.prima.{field} 必须为 JSON true/false。")
@@ -337,8 +361,15 @@ def resolve_run_configs(args):
         else:
             job.evaluation["judgeModelPath"] = str(MODEL_DIRECTORIES[job.evaluation["judgeModel"]])
         generation = settings.get("generation", {})
-        if not isinstance(generation, dict) or set(generation) - {"maxNewTokens", "maxInputTokens"}:
-            raise ValueError("generation 仅支持 maxNewTokens、maxInputTokens。")
+        if not isinstance(generation, dict) or set(generation) - {"maxNewTokens", "maxInputTokens", "referenceLengthBudget"}:
+            raise ValueError("generation 仅支持 maxNewTokens、maxInputTokens、referenceLengthBudget。")
+        if not isinstance(generation.get("referenceLengthBudget", {}), dict):
+            raise ValueError("generation.referenceLengthBudget 必须是 JSON 配置对象。")
+        job.reference_length_budget = normalize_length_budget(
+            generation.get("referenceLengthBudget", {}), "generation.referenceLengthBudget")
+        if args.max_new_tokens is not None:
+            # 显式命令行参数优先；只改变回答生成，不干预裁判预算。
+            job.reference_length_budget["enabled"] = False
         for field, key, fallback in (("max_new_tokens", "maxNewTokens", 2048), ("max_input_tokens", "maxInputTokens", 16384)):
             value = generation.get(key, fallback)
             if type(value) is not int or value <= 0:
@@ -813,6 +844,15 @@ def _check_context(model, inputs, output_tokens: int) -> None:
         raise ValueError(f"输入加输出长度 {total} 超过模型上下文窗口 {limit}。")
 
 
+def _hit_generation_limit(answer_ids, limit: int, generation_config) -> bool:
+    """最后一个位置恰为 EOS 时仍是完整结束，不能误报为截断并重复生成。"""
+    if len(answer_ids) < limit or not len(answer_ids):
+        return False
+    eos = getattr(generation_config, "eos_token_id", None)
+    eos_ids = eos if isinstance(eos, (list, tuple, set)) else [eos] if eos is not None else []
+    return int(answer_ids[-1]) not in eos_ids
+
+
 class QwenGenerator:
     """单条、多图答案生成及文本事实核验；模型延迟加载，便于复用缓存。"""
     supports_images = True
@@ -821,6 +861,7 @@ class QwenGenerator:
         self.model = self.processor = self.torch = None
         self.device = None
         self.last_generation_info = {}
+        self._budget_tokenizer = None
         if getattr(args, "text_only", False):
             self.supports_images = False
 
@@ -879,11 +920,12 @@ class QwenGenerator:
             answer_ids = generated[:, prefix_length:]
             text = self.processor.batch_decode(answer_ids, skip_special_tokens=True,
                                               clean_up_tokenization_spaces=False)[0].strip()
-            if answer_ids.shape[1] >= max_new_tokens:
+            hit_limit = _hit_generation_limit(answer_ids[0], max_new_tokens, self.generation_config)
+            if hit_limit:
                 LOGGER.warning("生成达到 max_new_tokens=%d；输出可能被截断。", max_new_tokens)
             self.last_generation_info = {
                 "input_tokens": int(prefix_length), "output_tokens": int(answer_ids.shape[1]),
-                "hit_token_limit": bool(answer_ids.shape[1] >= max_new_tokens),
+                "hit_token_limit": hit_limit, "max_new_tokens": max_new_tokens,
                 "elapsed_seconds": time.perf_counter() - started,
             }
             return text
@@ -896,9 +938,24 @@ class QwenGenerator:
                           {"role": "user", "content": [{"type": "text", "text": prompt}]}],
                          max_new_tokens)
 
+    def count_tokens(self, text: str) -> int:
+        """只加载基础 tokenizer，按真实 token 计数；无需模型权重，也不加入聊天标记。"""
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None and self.processor is not None:
+            tokenizer = self.processor.tokenizer
+        if tokenizer is None:
+            if self._budget_tokenizer is None:
+                from transformers import AutoTokenizer
+                self._budget_tokenizer = AutoTokenizer.from_pretrained(
+                    self.args.model_path, trust_remote_code=True,
+                    revision=self.args.model_revision, local_files_only=True)
+            tokenizer = self._budget_tokenizer
+        return len(tokenizer.encode(text, add_special_tokens=False))
+
     def close(self):
         """释放模型引用和 GPU 缓存。"""
         self.model = self.processor = None
+        self._budget_tokenizer = None
         gc.collect()
         if self.torch is not None and self.torch.cuda.is_available():
             self.torch.cuda.empty_cache()
@@ -969,11 +1026,12 @@ class DeepSeekGenerator(QwenGenerator):
                 max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=True,
             )
         answer_ids = generated[0, inputs["input_ids"].shape[1]:]
-        if len(answer_ids) >= max_new_tokens:
+        hit_limit = _hit_generation_limit(answer_ids, max_new_tokens, self.generation_config)
+        if hit_limit:
             LOGGER.warning("DeepSeek 生成达到 max_new_tokens=%d；输出可能被截断。", max_new_tokens)
         self.last_generation_info = {
             "input_tokens": int(inputs["input_ids"].shape[1]), "output_tokens": int(len(answer_ids)),
-            "hit_token_limit": bool(len(answer_ids) >= max_new_tokens),
+            "hit_token_limit": hit_limit, "max_new_tokens": max_new_tokens,
             "elapsed_seconds": time.perf_counter() - started,
         }
         return self.tokenizer.decode(answer_ids, skip_special_tokens=True,
@@ -1015,8 +1073,54 @@ def generate_answer(sample: dict, evidence: list[dict], llm: QwenGenerator) -> s
     if prima["enabled"] and prima["explanationRougeL"]:
         content.append({"type": "text", "text": PRIMA_EXPLANATION_PROMPT})
     system = ANSWER_SYSTEM if llm.supports_images else TEXT_ANSWER_SYSTEM
-    return llm.chat([{"role": "system", "content": [{"type": "text", "text": system}]},
-                     {"role": "user", "content": content}], llm.args.max_new_tokens)
+    messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
+                {"role": "user", "content": content}]
+    budget = reference_length_budget(llm.args)
+    if not budget["enabled"]:
+        return llm.chat(messages, llm.args.max_new_tokens)
+    # 参考答案只在本地用于计数，不写进 messages；排除影像标注和隐藏思考。
+    reference = score_answer(sample, "")["semantic_reference"]
+    count = llm.count_tokens(reference) if reference else None
+    limit = (calculate_token_budget(count, budget) if count is not None else
+             min(budget["maxNewTokens"], max(budget["minNewTokens"], llm.args.max_new_tokens)))
+    audit = {"mode": "reference_length", "reference_tokens": count,
+             "count_method": "native_tokenizer_without_special_tokens",
+             "source": "answer_and_explanation" if reference else "fixed_missing_reference",
+             "initial_max_new_tokens": limit, "policy": dict(budget)}
+    LOGGER.info("%s：参考答案 %s tokens，本题输出预算 %d（上限 %d）。",
+                sample["id"], count if count is not None else "缺失", limit, budget["maxNewTokens"])
+    attempts = []
+    for attempt in range(2):
+        started = time.perf_counter()
+        try:
+            candidate = llm.chat(messages, limit)
+        except Exception as exc:
+            if not attempts:
+                raise
+            # 扩容重试失败时保留首次回答与截断标记，避免已生成数据丢失；仍需人工复核。
+            attempts.append({"attempt": attempt + 1, "max_new_tokens": limit,
+                             "elapsed_seconds": time.perf_counter() - started,
+                             "error": f"{type(exc).__name__}: {exc}"})
+            LOGGER.warning("%s：扩容重试失败，保留首次截断回答供复核：%s", sample["id"], exc)
+            audit["retry_error"] = attempts[-1]["error"]
+            limit = attempts[0]["max_new_tokens"]
+            break
+        prediction = candidate
+        info = dict(getattr(llm, "last_generation_info", {}))
+        attempts.append({**info, "attempt": attempt + 1, "max_new_tokens": limit})
+        if (attempt == 0 and info.get("hit_token_limit", False) and budget["retryOnTruncation"]
+                and limit < budget["maxNewTokens"]):
+            LOGGER.warning("%s：达到本题预算 %d，使用 %d tokens 重新生成一次完整回答。",
+                           sample["id"], limit, budget["maxNewTokens"])
+            limit = budget["maxNewTokens"]
+            continue
+        break
+    llm.last_generation_info = {
+        **info, "max_new_tokens": limit, "token_budget": audit, "attempts": attempts,
+        "elapsed_seconds": sum(item.get("elapsed_seconds", 0.0) for item in attempts),
+        "total_output_tokens": sum(item.get("output_tokens", 0) for item in attempts),
+    }
+    return prediction
 
 
 class QwenEmbedding:
@@ -1167,6 +1271,8 @@ def generation_fingerprint(args, config: dict, data_hash: str,
         "runtime_versions": {k: versions[k] for k in
                              ("torch", "torchvision", "transformers", "qwen-vl-utils", "Pillow")}
     }
+    if reference_length_budget(args)["enabled"]:
+        payload["reference_length_budget"] = generation_settings(args)["reference_length_budget"]
     if config["use_rag"] and knowledge_ids is not None:
         payload["knowledge_subset_ids"] = sorted(canonical_id(key) for key in knowledge_ids)
     if config["use_rag"] and getattr(args, "chroma_db_dir", None):
@@ -1765,7 +1871,7 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
         "bleu_smoothing": args.bleu_smoothing, "rouge_tokenizer": "jieba + whitespace",
         "evaluation": args.evaluation, "scoring_version": SCHEMA_VERSION,
         "protocol": "prima" if prima["enabled"] else "reference_semantic",
-        "generation_settings": {"max_new_tokens": args.max_new_tokens, "max_input_tokens": args.max_input_tokens},
+        "generation_settings": generation_settings(args),
         "cached_generations": sum(r["generation_from_cache"] for r in results),
         "dataset_fingerprint": data_hash, "generation_fingerprint": fingerprint,
         "note": ("PRIMA题型协议：开放题按支持的原子事实数/全部事实数计算参考答案版FActScore；"
@@ -2054,6 +2160,9 @@ def run_evaluation(args, prepared=None) -> int:
         LOGGER.info("评分方案：%s；生成阶段不进行自评。",
                     "PRIMA：开放题FActScore，其余Accuracy，解释ROUGE-L" if prima_settings(args)["enabled"]
                     else f"按题型核对答案；固定裁判范围={args.evaluation['judgeScope']}")
+        if reference_length_budget(args)["enabled"]:
+            LOGGER.info("已启用参考答案长度预算：%s；参考内容不会进入待测模型提示。",
+                        json.dumps(reference_length_budget(args), ensure_ascii=False))
         split_metadata = {
             **selection,
             "training_overlap_audit": training_audit,
@@ -2240,7 +2349,8 @@ def run_semantic_scoring(jobs, runs) -> None:
                     if use_atomic:
                         scorer = AtomicFactScorer(judge_model, Path(args.suite_output_dir) / "judge_cache",
                                                  identity, max_new_tokens=prima["factScoreMaxNewTokens"],
-                                                 batch_size=prima["factScoreBatchSize"], retries=args.evaluation["judgeRetries"])
+                                                 batch_size=prima["factScoreBatchSize"], retries=args.evaluation["judgeRetries"],
+                                                 length_budget=prima["factScoreLengthBudget"])
                     else:
                         scorer = ReferenceJudge(judge_model, Path(args.suite_output_dir) / "judge_cache",
                                                 identity, max_new_tokens=args.evaluation["judgeMaxNewTokens"],
@@ -2474,7 +2584,8 @@ def main(argv: list[str] | None = None) -> int:
                     "model_path": job.model_path, "pathLora": job.lora_path,
                     "generation_input_mode": "text_only" if job.model == "DeepSeek-Model" or job.text_only else "text_and_images",
                     "evaluation": job.evaluation, "generation": {"maxNewTokens": job.max_new_tokens,
-                                                                  "maxInputTokens": job.max_input_tokens},
+                                                                  "maxInputTokens": job.max_input_tokens,
+                                                                  "referenceLengthBudget": reference_length_budget(job)},
                     "dataset_path": job.dataset_path, "datasetFilter": job.dataset_filter,
                     "source_splits": job.source_splits, "embedding_model_path": job.embedding_model_path,
                     "chroma_db_dir": job.chroma_db_dir, "eval_config": configs, "output_dir": job.output_dir,

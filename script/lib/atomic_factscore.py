@@ -16,6 +16,8 @@ import re
 import tempfile
 from typing import Any, Callable
 
+from .token_budget import FACT_LENGTH_BUDGET_DEFAULTS, calculate_token_budget, normalize_length_budget
+
 
 LOGGER = logging.getLogger("rag_eval")
 FACTSCORE_VERSION = "reference-atomic-factscore-v1"
@@ -134,7 +136,8 @@ class AtomicFactScorer:
     """固定裁判的原子事实精度评分；仅缓存成功阶段，失败整题为缺失值。"""
 
     def __init__(self, llm: Any, cache_dir: str | Path | None, identity: Any,
-                 max_new_tokens: int = 1024, batch_size: int = 8, retries: int = 1):
+                 max_new_tokens: int = 1024, batch_size: int = 8, retries: int = 1,
+                 length_budget: dict[str, Any] | None = None):
         if not callable(getattr(llm, "text", None)):
             raise ValueError("裁判必须提供 text(prompt, max_new_tokens=...) 接口。")
         for name, value in (("max_new_tokens", max_new_tokens), ("batch_size", batch_size)):
@@ -144,19 +147,26 @@ class AtomicFactScorer:
             raise ValueError("每阶段的格式重试次数只能为 0 或 1。")
         if identity is None:
             raise ValueError("必须提供固定裁判的身份，避免跨裁判复用缓存。")
+        self.length_budget = normalize_length_budget(length_budget, "factScore.lengthBudget", defaults=FACT_LENGTH_BUDGET_DEFAULTS)
+        if self.length_budget["enabled"] and not callable(getattr(llm, "count_tokens", None)):
+            raise ValueError("启用动态预算的裁判必须提供 count_tokens(text) 接口。")
         self.llm = llm
         self.identity = json.loads(_canonical(identity))
         self.cache_dir = Path(cache_dir).expanduser().resolve() / "atomic_factscore_v1" if cache_dir is not None else None
         self.max_new_tokens, self.batch_size, self.retries = max_new_tokens, batch_size, retries
         self._memory: dict[str, dict[str, Any]] = {}
 
-    def _fingerprint(self, stage: str, data: dict[str, Any]) -> str:
+    def _fingerprint(self, stage: str, data: dict[str, Any], budget: dict[str, Any] | None = None) -> str:
         content = {
             "version": FACTSCORE_VERSION, "stage": stage, "data": data, "identity": self.identity,
             "max_new_tokens": self.max_new_tokens, "batch_size": self.batch_size, "retries": self.retries,
             "extract_prompt": EXTRACT_PROMPT, "verify_prompt": VERIFY_PROMPT, "retry_prompt": RETRY_PREFIX,
             "verify_output_suffix": VERIFY_OUTPUT_SUFFIX,
         }
+        # 关闭时不增加字段，保留此前固定预算缓存的指纹。
+        if self.length_budget["enabled"]:
+            content["length_budget"] = self.length_budget
+            content["effective_budget"] = budget
         return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
 
     def _read_cache(self, fingerprint: str, stage: str, parser: Callable) -> dict[str, Any] | None:
@@ -171,18 +181,31 @@ class AtomicFactScorer:
                 raise ValueError("缓存版本不一致")
             if stored.get("fingerprint") != fingerprint or stored.get("stage") != stage:
                 raise ValueError("缓存内容身份不匹配")
+            info = stored.get("generation_info")
+            if stored.get("hit_token_limit") is True or (isinstance(info, dict) and info.get("hit_token_limit") is True):
+                raise ValueError("缓存输出触及 token 上限，不能视为完整成功结果")
             parsed = parser(stored.get("raw"))
             # 对磁盘内容重新做严格解析，防止损坏或旧格式改变事实数与支持数。
             if _canonical(parsed) != _canonical(stored.get("parsed")):
                 raise ValueError("缓存中的原始输出与解析结果不一致")
             self._memory[fingerprint] = stored
-            return {"raw": stored["raw"], "parsed": parsed}
+            result = {"raw": stored["raw"], "parsed": parsed}
+            if self.length_budget["enabled"]:
+                if not isinstance(stored.get("budget"), dict):
+                    raise ValueError("动态预算缓存缺少预算审计记录")
+                result["budget"] = stored["budget"]
+            return result
         except (OSError, TypeError, ValueError) as exc:
             LOGGER.warning("原子事实缓存无法使用，将重新执行该阶段：%s；%s", path, exc)
             return None
 
-    def _write_cache(self, fingerprint: str, stage: str, raw: str, parsed: Any) -> None:
+    def _write_cache(self, fingerprint: str, stage: str, raw: str, parsed: Any,
+                     budget: dict[str, Any] | None = None, hit_token_limit: bool | None = None) -> None:
         stored = {"version": FACTSCORE_VERSION, "stage": stage, "fingerprint": fingerprint, "raw": raw, "parsed": parsed}
+        if budget is not None:
+            stored["budget"] = budget
+        if hit_token_limit is not None:
+            stored["hit_token_limit"] = hit_token_limit
         self._memory[fingerprint] = stored
         if self.cache_dir is None:
             return
@@ -205,35 +228,65 @@ class AtomicFactScorer:
 
     def _stage(self, stage: str, payload: dict[str, Any], prefix: str, parser: Callable,
                attempts: list[dict[str, Any]], batch: int | None = None) -> dict[str, Any]:
-        fingerprint = self._fingerprint(stage, payload)
+        budget = None
+        effective_limit = self.max_new_tokens
+        if self.length_budget["enabled"]:
+            # 仅根据本阶段需要输出的内容计数：参考资料不能扩大拆分或核验预算。
+            source = "prediction" if stage == "extract" else "claims_json"
+            count_text = payload["prediction"] if stage == "extract" else _canonical(payload["claims"])
+            budget = {"stage": stage, "batch": batch, "source": source, "count_method": "llm.count_tokens"}
+            try:
+                token_count = self.llm.count_tokens(count_text)
+                effective_limit = calculate_token_budget(token_count, self.length_budget)
+            except Exception as exc:
+                error = f"裁判 token 计数失败：{type(exc).__name__}: {exc}"
+                return {"raw": "", "parsed": None, "error": error, "budget": {**budget, "error": error}}
+            budget.update({"token_count": token_count, "calculated_max_new_tokens": effective_limit,
+                           "retry_max_new_tokens": self.length_budget["maxNewTokens"] if self.length_budget["retryOnTruncation"] else effective_limit})
+        fingerprint = self._fingerprint(stage, payload, budget)
         cached = self._read_cache(fingerprint, stage, parser)
         if cached is not None:
+            if budget is not None:
+                cached["budget"] = {**cached["budget"], "from_cache": True}
             return {**cached, "error": None}
         raw = ""
         for attempt in range(self.retries + 1):
-            record = {"stage": stage, "batch": batch, "attempt": attempt + 1, "max_new_tokens": self.max_new_tokens}
+            record = {"stage": stage, "batch": batch, "attempt": attempt + 1, "max_new_tokens": effective_limit}
+            audit = {"budget": {**budget, "effective_max_new_tokens": effective_limit, "from_cache": False}} if budget is not None else {}
+            if audit:
+                record["length_budget"] = audit["budget"]
             prompt = (RETRY_PREFIX if attempt else "") + prefix + _canonical(payload)
             if stage == "verify":
                 # 为小型本地裁判明确本批数组长度和全部 id；只改提示，不放宽严格解析。
                 ids = [item["id"] for item in payload["claims"]]
                 prompt += VERIFY_OUTPUT_SUFFIX.format(count=len(ids), ids=_canonical(ids))
             try:
-                raw = self.llm.text(prompt, max_new_tokens=self.max_new_tokens)
+                raw = self.llm.text(prompt, max_new_tokens=effective_limit)
                 record["raw"] = raw if isinstance(raw, str) else repr(raw)
             except Exception as exc:
                 record["error"] = f"裁判推理失败：{type(exc).__name__}: {exc}"
                 attempts.append(record)
-                return {"raw": raw, "parsed": None, "error": record["error"]}
+                return {"raw": raw, "parsed": None, "error": record["error"], **audit}
+            info = getattr(self.llm, "last_generation_info", None)
+            hit_token_limit = info.get("hit_token_limit") if isinstance(info, dict) else None
+            if type(hit_token_limit) is not bool:
+                hit_token_limit = None
+            if hit_token_limit is not None:
+                record["hit_token_limit"] = hit_token_limit
             try:
+                if hit_token_limit:
+                    raise ValueError("裁判输出触及 token 上限；即使 JSON 可解析也不能视为完整结果。")
                 parsed = parser(raw)
             except ValueError as exc:
                 record["error"] = str(exc)
                 attempts.append(record)
+                if hit_token_limit and budget is not None and self.length_budget["retryOnTruncation"]:
+                    effective_limit = budget["retry_max_new_tokens"]
                 continue
             attempts.append(record)
-            self._write_cache(fingerprint, stage, raw, parsed)
-            return {"raw": raw, "parsed": parsed, "error": None}
-        return {"raw": raw if isinstance(raw, str) else repr(raw), "parsed": None, "error": attempts[-1]["error"]}
+            self._write_cache(fingerprint, stage, raw, parsed, audit.get("budget"), hit_token_limit)
+            return {"raw": raw, "parsed": parsed, "error": None, **audit}
+        return {"raw": raw if isinstance(raw, str) else repr(raw), "parsed": None, "error": attempts[-1]["error"], **audit}
 
     def score(self, sample: dict[str, Any], prediction: str) -> dict[str, Any]:
         """返回逐事实记录；raw 保存各阶段输出，attempts 只记录本次实际模型调用。"""
@@ -242,6 +295,9 @@ class AtomicFactScorer:
             "reason": "", "from_cache": False, "fingerprint": None, "attempts": [],
             "claims": [], "claim_count": 0, "supported_count": None,
         }
+        if self.length_budget["enabled"]:
+            result["length_budget"] = dict(self.length_budget)
+            result["budget_audit"] = []
         try:
             if not isinstance(sample, dict):
                 raise ValueError("待评分样本必须是对象。")
@@ -262,6 +318,7 @@ class AtomicFactScorer:
             return {**result, "score": 0.0, "status": "ok", "reason": "empty_answer：没有可核验的最终回答。", "supported_count": 0}
         extraction = self._stage("extract", {"question": payload["question"], "prediction": payload["prediction"]},
                                  EXTRACT_PROMPT, parse_facts, result["attempts"])
+        self._record_budget(result, payload, extraction)
         result["raw"]["extract"] = extraction["raw"]
         if extraction["error"]:
             result["reason"] = "事实拆分失败：" + extraction["error"]
@@ -279,6 +336,7 @@ class AtomicFactScorer:
                 "verify", {"question": payload["question"], "reference": payload["reference"], "claims": batch_claims},
                 VERIFY_PROMPT, lambda raw: parse_verdicts(raw, expected_ids), result["attempts"], start // self.batch_size,
             )
+            self._record_budget(result, payload, verification)
             result["raw"]["verify"].append(verification["raw"])
             if verification["error"]:
                 # 保留已处理事实供排查，但整题为缺失，绝不缩小分母或对成功批次求均值。
@@ -289,3 +347,11 @@ class AtomicFactScorer:
         supported = sum(item["supported"] is True for item in result["claims"])
         return {**result, "score": supported / len(facts), "status": "ok", "supported_count": supported,
                 "reason": f"参考答案支持 {supported}/{len(facts)} 条原子事实。", "from_cache": not result["attempts"]}
+
+    def _record_budget(self, result: dict[str, Any], payload: dict[str, Any], stage: dict[str, Any]) -> None:
+        if not self.length_budget["enabled"]:
+            return
+        result["budget_audit"].append(stage["budget"])
+        # 缓存命中与原始运行的得分指纹一致；分词结果或实际使用预算改变则失效。
+        audit = [{key: value for key, value in item.items() if key != "from_cache"} for item in result["budget_audit"]]
+        result["fingerprint"] = self._fingerprint("score", payload, {"stages": audit})

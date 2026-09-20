@@ -9,7 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -144,8 +144,13 @@ class ManifestAndDataTests(unittest.TestCase):
         self.write_split("train", [{"open_ended": [{"question": "Question", "answer": "Answer"}]}])
         for sample_id in ("mira:train:10:open_ended:0", "mira:train:0:multiple_choice:0",
                           "mira:train:0:open_ended:3"):
-            with self.subTest(sample_id=sample_id), self.assertRaises(ValueError):
-                finetune.load_training_samples(self.root, [sample_id])
+            for policy in ("error", "skip"):
+                skipped = []
+                with self.subTest(sample_id=sample_id, policy=policy), self.assertRaises(ValueError):
+                    finetune.load_training_samples(
+                        self.root, [sample_id], incomplete_policy=policy, skipped_incomplete=skipped,
+                    )
+                self.assertEqual(skipped, [])
 
     def test_missing_csv_is_reported(self):
         with self.assertRaises(FileNotFoundError):
@@ -157,6 +162,223 @@ class ManifestAndDataTests(unittest.TestCase):
                 self.write_split("train", [{"open_ended": [{"question": question, "answer": "Answer"}]}])
                 with self.assertRaises(ValueError):
                     finetune.load_training_samples(self.root, [make_sample().sample_id])
+
+    def test_skip_records_missing_fields_and_default_api_remains_strict(self):
+        cases = [
+            ({"answer": "Answer"}, ["question"]),
+            ({"question": None, "answer": "Answer"}, ["question"]),
+            ({"question": " \n\t", "answer": "Answer"}, ["question"]),
+            ({"question": "Question"}, ["answer"]),
+            ({"question": "Question", "answer": None}, ["answer"]),
+            ({"question": "Question", "answer": ""}, ["answer"]),
+            ({"question": "Question", "answer": " \n\t"}, ["answer"]),
+            ({"question": "Question", "answer": {}}, ["answer"]),
+            ({"question": "Question", "answer": []}, ["answer"]),
+            ({}, ["question", "answer"]),
+        ]
+        for qa, missing_fields in cases:
+            with self.subTest(qa=qa):
+                self.write_split("train", [
+                    {"open_ended": [qa]},
+                    {"open_ended": [{"question": "Valid", "answer": "Original answer"}]},
+                ])
+                ids = [make_sample().sample_id, make_sample(1).sample_id]
+                for kwargs in ({}, {"incomplete_policy": "error"}):
+                    with self.assertRaisesRegex(ValueError, ids[0]):
+                        finetune.load_training_samples(self.root, ids, **kwargs)
+                sentinel = {"id": "previous", "missing_fields": ["answer"]}
+                skipped = [sentinel]
+                samples = finetune.load_training_samples(
+                    self.root, ids, incomplete_policy="skip", skipped_incomplete=skipped,
+                )
+                self.assertEqual([sample.sample_id for sample in samples], ids[1:])
+                self.assertEqual(samples[0].answer, "Original answer")
+                self.assertEqual(skipped, [sentinel, {"id": ids[0], "missing_fields": missing_fields}])
+
+    def test_skip_retains_false_zero_and_structured_answers_in_manifest_order(self):
+        answers = [False, 0, ["A", "B"], {"answer": "A", "explanation": "Evidence"}]
+        self.write_split("train", [
+            {"open_ended": [{"question": f"Question {index}", "answer": answer}]}
+            for index, answer in enumerate(answers)
+        ])
+        ids = [make_sample(index).sample_id for index in (3, 1, 2, 0)]
+        skipped = []
+        samples = finetune.load_training_samples(
+            self.root, ids, incomplete_policy="skip", skipped_incomplete=skipped,
+        )
+        self.assertEqual([sample.sample_id for sample in samples], ids)
+        for sample, index in zip(samples, (3, 1, 2, 0)):
+            self.assertEqual(sample.answer, answers[index])
+            self.assertIs(type(sample.answer), type(answers[index]))
+        self.assertEqual(skipped, [])
+
+    def test_missing_answer_with_malformed_question_is_audited_without_inventing_qa(self):
+        self.write_split("train", [
+            {"open_ended": [{"question": {"text": "Explanation", "visual_evidence": "Figure"}}]},
+            {"open_ended": [{"question": "Valid", "answer": "Answer"}]},
+        ])
+        ids = [make_sample().sample_id, make_sample(1).sample_id]
+        skipped = []
+        samples = finetune.load_training_samples(
+            self.root, ids, incomplete_policy="skip", skipped_incomplete=skipped,
+        )
+        self.assertEqual([sample.sample_id for sample in samples], ids[1:])
+        self.assertEqual(skipped, [{
+            "id": ids[0], "missing_fields": ["question", "answer"], "invalid_fields": ["question"],
+        }])
+
+    def test_skip_does_not_hide_corrupt_json_qa_objects_or_nonstring_complete_questions(self):
+        corrupt_payloads = [
+            [], {"open_ended": {}}, {"open_ended": [None]}, {"open_ended": ["not a QA"]},
+            *({"open_ended": [{"question": value, "answer": "Answer"}]}
+              for value in ([], {}, ["Question"], {"question": "Question"}, 123, False)),
+        ]
+        for payload in corrupt_payloads:
+            with self.subTest(payload=payload):
+                self.write_split("train", [payload])
+                with self.assertRaises(ValueError):
+                    finetune.load_training_samples(
+                        self.root, [make_sample().sample_id], incomplete_policy="skip",
+                    )
+        (self.root / "train.csv").write_text('vqa_json\nnot-json\n', encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            finetune.load_training_samples(self.root, [make_sample().sample_id], incomplete_policy="skip")
+        for malformed_csv in ('vqa_json\n"unterminated\n', 'vqa_json\n{},extra\n', 'wrong_column\n{}\n'):
+            with self.subTest(csv=malformed_csv):
+                (self.root / "train.csv").write_text(malformed_csv, encoding="utf-8")
+                with self.assertRaises((ValueError, csv.Error)):
+                    finetune.load_training_samples(
+                        self.root, [make_sample().sample_id], incomplete_policy="skip",
+                    )
+
+    def test_all_incomplete_fails_after_recording_every_skipped_id(self):
+        self.write_split("train", [{"open_ended": [{}]}, {"open_ended": [{"question": "Question"}]}])
+        ids = [make_sample(1).sample_id, make_sample().sample_id]
+        skipped = []
+        with self.assertRaisesRegex(ValueError, "没有可训练"):
+            finetune.load_training_samples(
+                self.root, ids, incomplete_policy="skip", skipped_incomplete=skipped,
+            )
+        self.assertEqual([item["id"] for item in skipped], ids)
+
+    def test_skip_console_examples_are_bounded_but_audit_is_complete(self):
+        self.write_split("train", [
+            *({"open_ended": [{"question": "Missing answer"}]} for _ in range(12)),
+            {"open_ended": [{"question": "Valid", "answer": "Answer"}]},
+        ])
+        ids = [make_sample(index).sample_id for index in range(13)]
+        skipped, output = [], io.StringIO()
+        with redirect_stdout(output):
+            finetune.load_training_samples(
+                self.root, ids, incomplete_policy="skip", skipped_incomplete=skipped,
+            )
+        self.assertEqual(len(skipped), 12)
+        self.assertEqual(sum(sample_id in output.getvalue() for sample_id in ids), 10)
+        self.assertIn("12", output.getvalue())
+
+    def selection_args(self, *extra):
+        self.write_split("train", [
+            {"open_ended": [{"question": "First valid", "answer": "First answer"}]},
+            {"open_ended": [{"question": "Missing answer"}]},
+            {"open_ended": [{"question": "Last valid", "answer": "Last answer"}]},
+            {"open_ended": [{"question": "Outside limit", "answer": "Do not backfill"}]},
+            {"open_ended": [{"question": "Held out", "answer": "Do not use for training"}]},
+        ])
+        manifest = self.manifest({
+            "train_ids": [make_sample(index).sample_id for index in (2, 1, 0, 3)],
+            "test_ids": [make_sample(4).sample_id], "data_root": str(self.root),
+        })
+        return finetune.build_parser().parse_args([
+            "--split-manifest", str(manifest), "--model-dir", str(self.root / "base"),
+            "--output-dir", str(self.root / "adapter"), *extra,
+        ])
+
+    def test_prepare_filters_only_selected_prefix_and_preserves_audit_and_manifest(self):
+        args = self.selection_args("--limit", "3")
+        original_manifest = args.split_manifest.read_bytes()
+        samples, manifest = finetune.prepare_samples(args)
+        self.assertEqual([sample.sample_id for sample in samples], [make_sample(2).sample_id, make_sample().sample_id])
+        self.assertEqual(args.data_selection_audit, {
+            "incomplete_samples_policy": "skip", "manifest_train_count": 4,
+            "selected_train_count": 3, "actual_train_count": 2, "skipped_incomplete_count": 1,
+            "skipped_incomplete_ids": [make_sample(1).sample_id],
+            "skipped_incomplete_details": [{"id": make_sample(1).sample_id, "missing_fields": ["answer"]}],
+        })
+        self.assertEqual(manifest, json.loads(original_manifest.decode("utf-8-sig")))
+        self.assertEqual(args.split_manifest.read_bytes(), original_manifest)
+        self.assertFalse(args.output_dir.exists())
+
+    def test_prepare_strict_mode_and_all_incomplete_limit_do_not_backfill(self):
+        args = self.selection_args("--incomplete-samples", "error")
+        with self.assertRaisesRegex(ValueError, make_sample(1).sample_id):
+            finetune.prepare_samples(args)
+        args.incomplete_samples, args.limit = "skip", 1
+        args.split_manifest = self.manifest({
+            "train_ids": [make_sample(1).sample_id, make_sample().sample_id], "data_root": str(self.root),
+        })
+        with self.assertRaisesRegex(ValueError, "没有可训练"):
+            finetune.prepare_samples(args)
+
+    def test_validation_modes_filter_data_without_writing_training_audit(self):
+        args = self.selection_args()
+        args.model_dir.mkdir()
+        (args.model_dir / "config.json").write_text(json.dumps({
+            "model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"], "max_position_embeddings": 4096,
+        }), encoding="utf-8")
+        original_files = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        for mode in ("--dry-run", "--check-data"):
+            with self.subTest(mode=mode), patch.object(finetune, "prepare_tokens") as tokenize:
+                status = finetune.main([
+                    mode, "--split-manifest", str(args.split_manifest), "--model-dir", str(args.model_dir),
+                    "--output-dir", str(args.output_dir),
+                ])
+                self.assertEqual(status, 0)
+                self.assertEqual(tokenize.call_count, int(mode == "--check-data"))
+                if tokenize.called:
+                    self.assertEqual(len(tokenize.call_args.args[1]), 3)
+                self.assertFalse(args.output_dir.exists())
+                self.assertEqual(
+                    {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, original_files,
+                )
+
+    def test_training_persists_audit_before_train_and_retains_actual_ids_in_metadata(self):
+        args = self.selection_args("--limit", "3")
+        model, tokenizer = Mock(), Mock(pad_token_id=99)
+        linear = type("FakeLinear", (), {})
+        model.named_modules.return_value = [(target, linear()) for target in finetune.TARGET_MODULES.split(",")]
+        model.named_parameters.return_value = [("lora_weight", SimpleNamespace(requires_grad=True))]
+        trainer = Mock(state=SimpleNamespace(global_step=1))
+        audit_at_train = []
+
+        def train_without_model():
+            audit_at_train.append(json.loads((args.output_dir / "data_selection.json").read_text(encoding="utf-8")))
+
+        trainer.train.side_effect = train_without_model
+        modules = {
+            "torch": SimpleNamespace(nn=SimpleNamespace(Linear=linear)),
+            "peft": SimpleNamespace(LoraConfig=Mock(), TaskType=SimpleNamespace(CAUSAL_LM="causal"),
+                                    get_peft_model=Mock(return_value=model)),
+            "transformers": SimpleNamespace(
+                AutoModelForCausalLM=SimpleNamespace(from_pretrained=Mock(return_value=model)),
+                Trainer=Mock(return_value=trainer), TrainerCallback=type("FakeCallback", (), {}),
+                TrainingArguments=Mock(), set_seed=Mock(),
+            ),
+        }
+        with patch.dict(sys.modules, modules), \
+                patch.object(finetune, "dependency_report", return_value=([], [])), \
+                patch.object(finetune, "prepare_tokens", return_value=(tokenizer, [], {})), \
+                patch.object(finetune, "device_and_dtype", return_value=("cpu", "float32", "fake_dtype")), \
+                patch.object(finetune.metadata, "version", return_value="4.57.0"):
+            finetune.train(args)
+        trainer.train.assert_called_once_with()
+        self.assertEqual(len(audit_at_train), 1)
+        saved = json.loads((args.output_dir / "training_metadata.json").read_text(encoding="utf-8"))
+        for key, value in args.data_selection_audit.items():
+            self.assertEqual(saved[key], value)
+            self.assertEqual(audit_at_train[0][key], value)
+        self.assertEqual(saved["train_ids"], [make_sample(2).sample_id, make_sample().sample_id])
+        self.assertEqual(audit_at_train[0]["split_manifest"], str(args.split_manifest))
+        self.assertEqual(audit_at_train[0]["data_root"], str(self.root.resolve()))
 
     def test_question_contains_options_but_never_the_answer(self):
         sample = make_sample(question="Choose a side", options={"A": "Left", "B": "Right"},

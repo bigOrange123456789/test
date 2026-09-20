@@ -18,8 +18,12 @@ class UnifiedFinetuneTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def test_default_file_selects_deepseek_backend(self):
-        payload = unified.load_config(unified.DEFAULT_CONFIG_PATH)
+    def test_config_file_selects_deepseek_backend(self):
+        path = self.write_config({
+            "model": "DeepSeek-Model",
+            "model_arguments": {"DeepSeek-Model": {"epochs": 1, "device": "auto"}},
+        })
+        payload = unified.load_config(path)
         self.assertEqual(payload["model"], "DeepSeek-Model")
         backend, argv = unified.resolve_backend_argv(payload, [])
         self.assertEqual(backend.__name__.rsplit(".", 1)[-1], "finetune_deepseek_mira_lora")
@@ -36,7 +40,10 @@ class UnifiedFinetuneTests(unittest.TestCase):
         self.assertEqual(vars(unified_args), vars(direct_args))
 
     def test_both_default_profiles_and_backends_use_project_output(self):
-        payload = unified.load_config(unified.DEFAULT_CONFIG_PATH)
+        payload = {
+            "model": "DeepSeek-Model",
+            "model_arguments": {"DeepSeek-Model": {}, "Qwen3-VL-2B-Instruct": {}},
+        }
         for model, adapter_name in (
             ("DeepSeek-Model", "deepseek_mira_lora_adapter"),
             ("Qwen3-VL-2B-Instruct", "qwen3_vl_2b_lora_adapter"),
@@ -46,6 +53,24 @@ class UnifiedFinetuneTests(unittest.TestCase):
                 for args in (backend.build_parser().parse_args(argv), backend.build_parser().parse_args([])):
                     self.assertEqual(args.split_manifest, unified.SCRIPT_DIR.parent / "output" / "mira_split_ids.json")
                     self.assertEqual(args.output_dir, unified.SCRIPT_DIR.parent / "output" / adapter_name)
+
+    def test_both_backends_preserve_custom_manifest_and_adapter_paths(self):
+        for model, adapter_name in (
+            ("DeepSeek-Model", "deepseek_mira_lora_adapter2"),
+            ("Qwen3-VL-2B-Instruct", "qwen3_vl_2b_lora_adapter2"),
+        ):
+            with self.subTest(model=model):
+                configured = {
+                    "split_manifest": "../output/mira_split_ids2.json",
+                    "output_dir": f"../output/{adapter_name}",
+                }
+                path = self.write_config({"model": model, "model_arguments": {model: configured}})
+                payload = unified.load_config(path)
+                backend, argv = unified.resolve_backend_argv(payload, [], path.parent)
+                args = backend.build_parser().parse_args(argv)
+                self.assertEqual(args.split_manifest, (path.parent / configured["split_manifest"]).resolve())
+                self.assertEqual(args.output_dir, (path.parent / configured["output_dir"]).resolve())
+                self.assertEqual(payload["model_arguments"][model], configured)
 
     def test_json_paths_use_config_directory_and_cli_paths_remain_explicit(self):
         payload = {
@@ -81,6 +106,48 @@ class UnifiedFinetuneTests(unittest.TestCase):
         self.assertEqual(args.epochs, 2)
         self.assertEqual(args.limit, 3)
         self.assertFalse(args.gradient_checkpointing)
+
+    def test_deepseek_default_incomplete_samples_policy_is_skip(self):
+        backend, argv = unified.resolve_backend_argv({"model": "DeepSeek-Model"}, [])
+        self.assertEqual(backend.build_parser().parse_args(argv).incomplete_samples, "skip")
+        self.assertEqual(backend.build_parser().parse_args([]).incomplete_samples, "skip")
+
+    def test_json_incomplete_samples_policies_reach_deepseek_backend(self):
+        for policy in ("skip", "error"):
+            with self.subTest(policy=policy):
+                path = self.write_config({
+                    "model": "DeepSeek-Model",
+                    "model_arguments": {"DeepSeek-Model": {"incomplete_samples": policy}},
+                })
+                backend, argv = unified.resolve_backend_argv(unified.load_config(path), [])
+                self.assertEqual(argv, ["--incomplete-samples", policy])
+                self.assertEqual(backend.build_parser().parse_args(argv).incomplete_samples, policy)
+
+    def test_cli_incomplete_samples_policy_overrides_json(self):
+        for configured, override in (("skip", "error"), ("error", "skip")):
+            with self.subTest(configured=configured, override=override):
+                payload = {
+                    "model": "DeepSeek-Model",
+                    "model_arguments": {"DeepSeek-Model": {"incomplete_samples": configured}},
+                }
+                backend, argv = unified.resolve_backend_argv(
+                    payload, ["--", "--incomplete-samples", override],
+                )
+                self.assertEqual(backend.build_parser().parse_args(argv).incomplete_samples, override)
+                self.assertEqual(payload["model_arguments"]["DeepSeek-Model"]["incomplete_samples"], configured)
+
+    def test_invalid_incomplete_samples_policies_are_rejected(self):
+        for source in ("json", "cli"):
+            with self.subTest(source=source):
+                configured = {"incomplete_samples": "ignore"} if source == "json" else {}
+                path = self.write_config({
+                    "model": "DeepSeek-Model",
+                    "model_arguments": {"DeepSeek-Model": configured},
+                })
+                extra_args = ["--", "--incomplete-samples", "ignore"] if source == "cli" else []
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as raised:
+                    unified.main(["--config", str(path), "--check-config", *extra_args])
+                self.assertEqual(raised.exception.code, 2)
 
     def test_main_delegates_exact_resolved_argv_to_original_main(self):
         path = self.write_config({

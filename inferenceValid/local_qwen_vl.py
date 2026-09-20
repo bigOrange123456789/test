@@ -11,6 +11,8 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+from .qwen_vl_compat import load_qwen_vl_processor
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,7 +61,7 @@ class LocalQwenVL:
     def load(self, cfg: dict, emit=None):
         """只读取本地 Instruct 权重，使用视觉生成模型类而非纯文本模型类。"""
         import torch
-        from transformers import AutoProcessor, Qwen2VLImageProcessorPil, Qwen3VLForConditionalGeneration
+        from transformers import Qwen3VLForConditionalGeneration
 
         model_path = (PROJECT_ROOT / cfg.get("model_path", "Qwen3-VL-2B-Instruct")).resolve()
         requested_device = str(cfg.get("device", "auto"))
@@ -96,18 +98,16 @@ class LocalQwenVL:
                 emit("正在加载本地 Qwen3-VL-2B-Instruct。", {"device": device, "dtype": str(dtype)})
             print(f"[CardioAI][本地Qwen] 加载开始 路径={model_path} 设备={device} 精度={dtype}", flush=True)
             started = time.perf_counter()
+            # 与 RAG 编码器共用版本兼容逻辑；生成保留左侧填充，编码保留右侧填充。
+            processor = load_qwen_vl_processor(
+                model_path, min_pixels=min_pixels, max_pixels=max_pixels, padding_side="left",
+            )
             model, loading = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path, local_files_only=True, dtype=dtype, attn_implementation="sdpa", output_loading_info=True,
             )
             if loading.get("missing_keys") or loading.get("mismatched_keys") or loading.get("error_msgs"):
                 raise RuntimeError(f"本地 Qwen 权重加载不完整：{loading}")
             model.to(device).eval()
-            processor = AutoProcessor.from_pretrained(model_path, local_files_only=True, padding_side="left")
-            processor.image_processor = Qwen2VLImageProcessorPil.from_pretrained(
-                model_path, local_files_only=True,
-                size={"shortest_edge": min_pixels, "longest_edge": max_pixels},
-                min_pixels=min_pixels, max_pixels=max_pixels,
-            )
             self.model, self.processor, self.signature = model, processor, signature
             print(f"[CardioAI][本地Qwen] 加载完成 耗时={time.perf_counter() - started:.2f}秒", flush=True)
             return model, processor

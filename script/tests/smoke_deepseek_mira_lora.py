@@ -65,7 +65,13 @@ def main():
                         "options": {"A": "First", "B": "Second"}, "answer": answer,
                     }]}),
                 })
-        train_ids = [f"mira:train:{index}:open_ended:0" for index in (2, 0, 1)]
+            # 复现原始 MIRA 缺答案，以及 question 错填为解释对象且同时缺答案的记录。
+            for incomplete in ({"question": "Question without answer", "visual_evidence": "Not a target"},
+                               {"question": {"text": "Misplaced explanation"}}):
+                writer.writerow({"vqa_json": json.dumps({"open_ended": [incomplete]})})
+        train_ids = [f"mira:train:{index}:open_ended:0" for index in (2, 4, 0, 5, 1)]
+        actual_ids = [f"mira:train:{index}:open_ended:0" for index in (2, 0, 1)]
+        skipped_ids = [f"mira:train:{index}:open_ended:0" for index in (4, 5)]
         test_ids = ["mira:train:3:open_ended:0"]
         manifest = root / "split.json"
         manifest.write_text(json.dumps({
@@ -93,8 +99,14 @@ def main():
         assert any(torch.count_nonzero(value).item() for name, value in adapter_weights.items() if "lora_B" in name)
 
         result = json.loads((output / "training_metadata.json").read_text(encoding="utf-8"))
-        assert result["actual_train_count"] == result["manifest_train_count"] == 3
-        assert result["train_ids"] == train_ids
+        assert result["actual_train_count"] == 3
+        assert result["manifest_train_count"] == result["selected_train_count"] == 5
+        assert result["train_ids"] == actual_ids
+        assert result["skipped_incomplete_count"] == 2
+        assert result["skipped_incomplete_ids"] == skipped_ids
+        audit = json.loads((output / "data_selection.json").read_text(encoding="utf-8"))
+        assert audit["skipped_incomplete_ids"] == skipped_ids
+        assert audit["actual_train_count"] == 3
         assert not set(result["train_ids"]) & set(test_ids)
         assert result["images_used"] is False and result["captions_used"] is False
         assert result["training"]["completed_optimizer_steps"] == 2

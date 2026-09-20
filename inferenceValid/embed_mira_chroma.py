@@ -303,31 +303,42 @@ class Checkpoint:
         os.replace(temporary, self.path)
 
 
+def load_embedding_processor(args: argparse.Namespace):
+    """兼容不同 Transformers 版本的 PIL 处理器，保持入库和查询的预处理一致。"""
+    if __package__:
+        from .qwen_vl_compat import load_qwen_vl_processor
+    else:
+        # 兼容直接运行本文件，以及旧脚本通过 sys.path 导入的方式。
+        from qwen_vl_compat import load_qwen_vl_processor
+    return load_qwen_vl_processor(args.model_dir, min_pixels=args.min_pixels,
+                                  max_pixels=args.max_pixels, padding_side="right")
+
+
 class QwenEmbeddingEncoder:
     """使用完整图文模型的最终隐藏状态生成归一化检索向量。"""
 
     def __init__(self, args: argparse.Namespace):
         """只加载本地权重和处理器，不调用远程 API，也不加载聊天模型的输出头。"""
         import torch
-        from transformers import AutoProcessor, Qwen2VLImageProcessorPil, Qwen3VLModel
+        from transformers import Qwen3VLModel
 
         self.args = args
         device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("指定了 CUDA，但当前 PyTorch 没有可用 GPU。")
+        # 先验证处理器，配置/依赖不兼容时不占用模型显存。
+        self.processor = load_embedding_processor(args)
         dtype = "auto" if args.dtype == "auto" else getattr(torch, args.dtype)
+        # 4.57.x 的裸特征模型前缀为空，不会自动剥离权重中的 model.。
+        # 仅映射加载时的名称；有原生前缀处理的版本交给库自身，避免重复剥离。
+        load_options = {"key_mapping": {r"^model\.": ""}} if not Qwen3VLModel.base_model_prefix else {}
         self.model, loading = Qwen3VLModel.from_pretrained(
             args.model_dir, local_files_only=True, dtype=dtype, output_loading_info=True,
+            **load_options,
         )
         if loading.get("missing_keys") or loading.get("mismatched_keys") or loading.get("error_msgs"):
             raise RuntimeError(f"模型权重加载不完整：{loading}")
         self.model.to(device).eval()
-        self.processor = AutoProcessor.from_pretrained(args.model_dir, local_files_only=True, padding_side="right")
-        self.processor.image_processor = Qwen2VLImageProcessorPil.from_pretrained(
-            args.model_dir, local_files_only=True,
-            size={"shortest_edge": args.min_pixels, "longest_edge": args.max_pixels},
-            min_pixels=args.min_pixels, max_pixels=args.max_pixels,
-        )
         LOGGER.info("已加载 Embedding 模型：%s，设备=%s，精度=%s", args.model_dir, device, self.model.dtype)
         if device == "cpu":
             LOGGER.warning("当前使用 CPU；百万条图文编码耗时很长，建议先用 --limit 10 测量速度。")

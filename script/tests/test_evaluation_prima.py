@@ -147,11 +147,19 @@ class PrimaEvaluationTests(unittest.TestCase):
                 self.assertIsNotNone(question, contents)
                 answer_prompts.append((name, question, contents))
                 events.append(("answer", name))
+                events.append(("answer_budget", name, max_new_tokens))
+                generator.last_generation_info = {
+                    "hit_token_limit": False, "output_tokens": 12, "elapsed_seconds": 0.25,
+                }
                 return self.responses[question]
 
             def text(prompt, max_new_tokens=256):
                 self.assertTrue(is_judge, "被测模型不得评分自身的输出。")
                 judge_prompts.append(prompt)
+                events.append(("judge_budget", name, max_new_tokens))
+                generator.last_generation_info = {
+                    "hit_token_limit": False, "output_tokens": 20, "elapsed_seconds": 0.1,
+                }
                 if "原子事实拆分器" in prompt:
                     events.append(("extract", name))
                     return json.dumps({"facts": ["Atrial fibrillation.", "The rhythm is irregular."]})
@@ -170,11 +178,17 @@ class PrimaEvaluationTests(unittest.TestCase):
                     active.remove(name)
                     events.append(("close_judge" if is_judge else "close_generator", name))
 
-            return SimpleNamespace(
+            def count_tokens(text):
+                count = len(text.split())
+                events.append(("count_tokens", name, text, count))
+                return count
+
+            generator = SimpleNamespace(
                 args=args, supports_images=False if is_judge else args.model != "DeepSeek-Model",
-                chat=chat, text=text, close=close,
-                last_generation_info={"hit_token_limit": False, "generated_tokens": 12},
+                chat=chat, text=text, close=close, count_tokens=count_tokens,
+                last_generation_info={"hit_token_limit": False, "output_tokens": 12},
             )
+            return generator
 
         def close_handlers(**kwargs):
             for handler in kwargs.get("handlers", []):
@@ -455,6 +469,53 @@ class PrimaEvaluationTests(unittest.TestCase):
         self.assertIn("BLEU-4", markdown)
         self.assertNotIn("# PRIMA题型评估", markdown)
         self.assertNotIn("Accuracy (%)", markdown)
+
+    def test_dynamic_answer_and_fact_budgets_flow_through_pipeline_and_saved_audits(self):
+        self.entries = self.entries[:1]
+        answer_policy = {
+            "enabled": True, "multiplier": 10, "extraTokens": 64,
+            "minNewTokens": 128, "maxNewTokens": 1024, "retryOnTruncation": True,
+        }
+        fact_policy = {
+            "enabled": True, "multiplier": 2, "extraTokens": 128,
+            "minNewTokens": 256, "maxNewTokens": 2048, "retryOnTruncation": True,
+        }
+        self.entries[0]["generation"] = {"referenceLengthBudget": answer_policy}
+        self.entries[0]["evaluation"]["prima"]["factScoreLengthBudget"] = fact_policy
+        self.write_config()
+        code, events, prompts, _, _, errors = self.run_main()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(sum(event[0] == "count_tokens" and event[1] == "Qwen" for event in events), 4)
+        self.assertEqual(sum(event[0] == "count_tokens" and event[1] == "固定语义裁判" for event in events), 2)
+        self.assertEqual([event[2] for event in events if event[0] == "judge_budget"], [256, 256])
+        summary = self.summary()
+        self.assertEqual(summary["generation_settings"]["reference_length_budget"], {
+            "version": "reference-length-v1", **answer_policy,
+        })
+        self.assertEqual(summary["evaluation"]["prima"]["factScoreLengthBudget"], fact_policy)
+        manifest = read_json(self.output / "Qwen" / "run_config.json")
+        self.assertEqual(manifest["arguments"]["reference_length_budget"], answer_policy)
+        for row in self.rows():
+            info = row["generation_info"]
+            audit = info["token_budget"]
+            count = len(row["answer_details"]["semantic_reference"].split())
+            expected = min(1024, max(128, count * 10 + 64))
+            self.assertEqual(audit["reference_tokens"], count)
+            self.assertEqual(audit["policy"], answer_policy)
+            self.assertEqual(audit["initial_max_new_tokens"], expected)
+            self.assertEqual(info["max_new_tokens"], expected)
+            self.assertEqual(info["total_output_tokens"], 12)
+            self.assertEqual(len(info["attempts"]), 1)
+        open_row = next(row for row in self.rows() if row["id"] == self.samples[0]["id"])
+        details = open_row["factscore_details"]
+        self.assertEqual(details["score"], 0.5)
+        self.assertEqual(details["length_budget"], fact_policy)
+        self.assertEqual([audit["stage"] for audit in details["budget_audit"]], ["extract", "verify"])
+        self.assertTrue(all(audit["calculated_max_new_tokens"] == 256 for audit in details["budget_audit"]))
+        self.assertTrue(all("PRIVATE_VISUAL_ANNOTATION" not in event[2]
+                            for event in events if event[0] == "count_tokens"))
+        self.assertTrue(all(self.samples[0]["answer"]["explanation"] not in prompt
+                            for _, _, prompt in prompts))
 
 
 if __name__ == "__main__":

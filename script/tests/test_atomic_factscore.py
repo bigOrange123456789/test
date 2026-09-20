@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from script.lib.atomic_factscore import AtomicFactScorer, parse_facts, parse_verdicts
+from script.lib.atomic_factscore import (
+    AtomicFactScorer, EXTRACT_PROMPT, FACTSCORE_VERSION, RETRY_PREFIX,
+    VERIFY_OUTPUT_SUFFIX, VERIFY_PROMPT, parse_facts, parse_verdicts,
+)
 
 
 SAMPLE = {"id": "open:1", "question": "What are the findings?", "reference": "A and B are present."}
@@ -35,6 +39,26 @@ class FakeLLM:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class CountingLLM(FakeLLM):
+    def __init__(self, *responses, counts=None, truncated=None):
+        super().__init__(*responses)
+        self.counts = list(counts) if counts is not None else None
+        self.count_calls = []
+        self.truncated = list(truncated or [])
+        self.last_generation_info = {}
+
+    def count_tokens(self, text):
+        self.count_calls.append(text)
+        count = self.counts.pop(0) if self.counts is not None else len(text)
+        if isinstance(count, Exception):
+            raise count
+        return count
+
+    def text(self, prompt, max_new_tokens):
+        self.last_generation_info = {"hit_token_limit": self.truncated.pop(0) if self.truncated else False}
+        return super().text(prompt, max_new_tokens)
 
 
 class StrictParsingTests(unittest.TestCase):
@@ -268,6 +292,143 @@ class AtomicFactScorerTests(unittest.TestCase):
         for kwargs in ({"batch_size": True}, {"batch_size": 0}, {"max_new_tokens": 0}, {"retries": 2}, {"retries": False}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.scorer(FakeLLM(), **kwargs)
+
+
+class DynamicFactBudgetTests(unittest.TestCase):
+    POLICY = {"enabled": True, "multiplier": 2, "extraTokens": 10, "minNewTokens": 20, "maxNewTokens": 100}
+
+    def scorer(self, llm, cache=None, policy=None, **kwargs):
+        return AtomicFactScorer(llm, cache, "fixed-judge", length_budget=self.POLICY if policy is None else policy, **kwargs)
+
+    def test_disabled_policy_preserves_original_fingerprint_and_fixed_limits(self):
+        identity, payload = "fixed-judge", {"x": 1}
+        original_content = {
+            "version": FACTSCORE_VERSION, "stage": "score", "data": payload, "identity": identity,
+            "max_new_tokens": 777, "batch_size": 8, "retries": 1,
+            "extract_prompt": EXTRACT_PROMPT, "verify_prompt": VERIFY_PROMPT,
+            "retry_prompt": RETRY_PREFIX, "verify_output_suffix": VERIFY_OUTPUT_SUFFIX,
+        }
+        expected = hashlib.sha256(json.dumps(original_content, ensure_ascii=False, sort_keys=True,
+                                            separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        llm = FakeLLM('{"facts":[', facts("A"), verdicts((0, True)))
+        scorer = self.scorer(llm, policy={"enabled": False, "maxNewTokens": 9000}, max_new_tokens=777)
+        self.assertEqual(scorer._fingerprint("score", payload), expected)
+        result = scorer.score(SAMPLE, "A.")
+        self.assertEqual(result["score"], 1.0)
+        self.assertNotIn("budget_audit", result)
+        self.assertNotIn("length_budget", result["attempts"][0])
+        self.assertEqual([call["max_new_tokens"] for call in llm.calls], [777, 777, 777])
+
+    def test_stage_counts_candidate_and_claim_json_without_reference_or_question(self):
+        llm = CountingLLM(facts("A", "B", "C"), verdicts((0, True), (1, False)), verdicts((2, True)), counts=[5, 30, 100])
+        result = self.scorer(llm, batch_size=2).score(SAMPLE, "<think>secret</think>A. B. C.")
+        self.assertAlmostEqual(result["score"], 2 / 3)
+        self.assertEqual(llm.count_calls[0], "A. B. C.")
+        self.assertEqual(json.loads(llm.count_calls[1]), [{"id": 0, "text": "A"}, {"id": 1, "text": "B"}])
+        self.assertEqual(json.loads(llm.count_calls[2]), [{"id": 2, "text": "C"}])
+        self.assertNotIn(SAMPLE["reference"], llm.calls[0]["prompt"])
+        self.assertEqual([call["max_new_tokens"] for call in llm.calls], [20, 70, 100])
+        self.assertEqual([item["source"] for item in result["budget_audit"]], ["prediction", "claims_json", "claims_json"])
+        self.assertEqual([item["token_count"] for item in result["budget_audit"]], [5, 30, 100])
+        self.assertTrue(all(item["count_method"] == "llm.count_tokens" for item in result["budget_audit"]))
+
+    def test_truncated_parseable_extraction_retries_at_maximum_without_accepting_subset(self):
+        llm = CountingLLM(facts("A"), facts("A", "B"), verdicts((0, True), (1, False)),
+                          counts=[10, 25], truncated=[True, False, False])
+        result = self.scorer(llm).score(SAMPLE, "A. B.")
+        self.assertEqual(result["score"], 0.5)
+        self.assertEqual(result["claim_count"], 2)
+        self.assertEqual([call["max_new_tokens"] for call in llm.calls], [30, 100, 60])
+        self.assertTrue(result["attempts"][0]["hit_token_limit"])
+        self.assertIn("error", result["attempts"][0])
+        self.assertEqual(result["budget_audit"][0]["calculated_max_new_tokens"], 30)
+        self.assertEqual(result["budget_audit"][0]["effective_max_new_tokens"], 100)
+        self.assertEqual(len(llm.count_calls), 2)
+
+    def test_truncated_verification_retries_but_failed_stage_remains_null(self):
+        llm = CountingLLM(facts("A"), verdicts((0, True)), verdicts((0, True)),
+                          counts=[10, 10], truncated=[False, True, True])
+        result = self.scorer(llm).score(SAMPLE, "A.")
+        self.assertIsNone(result["score"])
+        self.assertIsNone(result["supported_count"])
+        self.assertEqual(result["status"], "judge_failed")
+        self.assertEqual([call["max_new_tokens"] for call in llm.calls], [30, 30, 100])
+        self.assertIsNone(result["claims"][0]["supported"])
+
+    def test_no_increase_for_format_only_retry_or_disabled_truncation_retry(self):
+        for truncated, retry in ((False, True), (True, False)):
+            llm = CountingLLM("broken", facts(), counts=[10], truncated=[truncated, False])
+            result = self.scorer(llm, policy={**self.POLICY, "retryOnTruncation": retry}).score(SAMPLE, "No answer.")
+            with self.subTest(truncated=truncated, retry=retry):
+                self.assertEqual(result["score"], 0.0)
+                self.assertEqual([call["max_new_tokens"] for call in llm.calls], [30, 30])
+
+    def test_retry_count_limit_is_preserved_and_failures_are_not_cached(self):
+        llm = CountingLLM(facts(), facts(), counts=[10, 10], truncated=[True, False])
+        scorer = self.scorer(llm, retries=0)
+        failed = scorer.score(SAMPLE, "No answer.")
+        recovered = scorer.score(SAMPLE, "No answer.")
+        self.assertIsNone(failed["score"])
+        self.assertEqual(len(failed["attempts"]), 1)
+        self.assertEqual(recovered["score"], 0.0)
+        self.assertFalse(recovered["from_cache"])
+
+    def test_enabled_requires_counter_and_count_errors_remain_null(self):
+        with self.assertRaisesRegex(ValueError, "count_tokens"):
+            self.scorer(FakeLLM())
+        for count in (RuntimeError("tokenizer missing"), True, -1, 2.5):
+            llm = CountingLLM(counts=[count])
+            result = self.scorer(llm).score(SAMPLE, "A.")
+            with self.subTest(count=count):
+                self.assertIsNone(result["score"])
+                self.assertEqual(result["status"], "judge_failed")
+                self.assertIn("token", result["reason"])
+                self.assertEqual(result["attempts"], [])
+                self.assertEqual(llm.calls, [])
+
+    def test_cached_retry_success_preserves_audit_and_avoids_generation(self):
+        with tempfile.TemporaryDirectory() as cache:
+            first = self.scorer(CountingLLM(facts("A"), facts("A"), verdicts((0, True)),
+                                           counts=[10, 20], truncated=[True, False, False]), cache).score(SAMPLE, "A.")
+            llm = CountingLLM(counts=[10, 20])
+            cached = self.scorer(llm, cache).score(SAMPLE, "A.")
+            self.assertTrue(cached["from_cache"])
+            self.assertEqual(cached["score"], first["score"])
+            self.assertEqual(cached["fingerprint"], first["fingerprint"])
+            self.assertEqual(cached["attempts"], [])
+            self.assertEqual(llm.calls, [])
+            self.assertEqual(cached["budget_audit"][0]["effective_max_new_tokens"], 100)
+            self.assertTrue(all(item["from_cache"] for item in cached["budget_audit"]))
+
+    def test_policy_or_tokenizer_counts_invalidate_cache(self):
+        for policy, count in (({**self.POLICY, "multiplier": 3}, 10), (self.POLICY, 20)):
+            with self.subTest(policy=policy, count=count), tempfile.TemporaryDirectory() as cache:
+                baseline = self.scorer(CountingLLM(facts(), counts=[10]), cache).score(SAMPLE, "No answer.")
+                llm = CountingLLM(facts(), counts=[count])
+                changed = self.scorer(llm, cache, policy=policy).score(SAMPLE, "No answer.")
+                self.assertFalse(changed["from_cache"])
+                self.assertNotEqual(changed["fingerprint"], baseline["fingerprint"])
+                self.assertEqual(len(llm.calls), 1)
+
+    def test_cache_with_explicit_truncation_flag_is_rejected_including_disabled_mode(self):
+        for flag in ({"hit_token_limit": True}, {"generation_info": {"hit_token_limit": True}}):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as cache:
+                self.scorer(FakeLLM(facts()), cache, policy={"enabled": False}).score(SAMPLE, "No answer.")
+                path = next((Path(cache) / "atomic_factscore_v1").glob("*.json"))
+                stored = json.loads(path.read_text(encoding="utf-8"))
+                stored.update(flag)
+                path.write_text(json.dumps(stored), encoding="utf-8")
+                llm = FakeLLM(facts())
+                result = self.scorer(llm, cache, policy={"enabled": False}).score(SAMPLE, "No answer.")
+                self.assertFalse(result["from_cache"])
+                self.assertEqual(len(llm.calls), 1)
+
+    def test_dynamic_budget_does_not_relax_strict_verdict_validation(self):
+        llm = CountingLLM(facts("A", "B"), verdicts((0, True)), verdicts((0, True)), counts=[10, 20])
+        result = self.scorer(llm).score(SAMPLE, "A. B.")
+        self.assertIsNone(result["score"])
+        self.assertEqual(result["claim_count"], 2)
+        self.assertEqual([call["max_new_tokens"] for call in llm.calls], [30, 50, 50])
 
 
 if __name__ == "__main__":

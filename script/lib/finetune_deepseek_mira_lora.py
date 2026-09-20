@@ -25,6 +25,9 @@
       与 ``test_ids`` 重叠或无法回源的 ID 都会报错。
     - 数据目录优先级为 ``--data-root``、清单中的 ``data_root``、最后是
       ``G:\\Codex_dataset\\MIRA-data``。一条训练样本对应一个 MIRA 问答。
+    - 缺少问题或答案的原始问答默认跳过并明确报告数量与编号；不会编造答案或
+      从测试集补齐。JSON 中 ``incomplete_samples: "error"`` 可恢复遇缺失即停止。
+      ID 不存在、CSV/JSON 损坏和非法对象仍报错，不归入可跳过的缺失字段。
     - 模型输入只有问题和选项，不读取图片、caption 或额外提示。结构化答案会
       完整序列化为 JSON，仅作为 assistant 标签，避免答案信息泄漏到输入。
     - 只对 assistant 答案及末尾 EOS 计算损失；system、问题、选项和 padding
@@ -121,13 +124,15 @@ def load_split_manifest(path):
     return train_ids, payload
 
 
-def load_training_samples(data_root, train_ids):
-    """Resolve selected QA IDs without reading, decoding or checking images."""
+def load_training_samples(data_root, train_ids, *, incomplete_policy="error", skipped_incomplete=None):
+    """回源问答；可显式跳过缺失字段，始终核对全部编号且不读取图片。"""
+    if incomplete_policy not in {"skip", "error"}:
+        raise ValueError("incomplete_policy 必须是 skip 或 error。")
     requested = {}
     for sample_id in train_ids:
         split, row, category, qa = parse_sample_id(sample_id)
         requested.setdefault(split, {}).setdefault(row, []).append((category, qa, sample_id))
-    found = {}
+    found, skipped = {}, {}
     csv.field_size_limit(64 * 1024 * 1024)
     for split, rows in requested.items():
         source = Path(data_root) / f"{split}.csv"
@@ -152,18 +157,44 @@ def load_training_samples(data_root, train_ids):
                         if not isinstance(qa, dict):
                             raise ValueError(f"Invalid QA object: {sample_id}")
                         question, answer = qa.get("question"), qa.get("answer")
-                        if not isinstance(question, str) or not question.strip() or answer is None or answer in ("", {}, []):
-                            raise ValueError(f"Missing question or answer: {sample_id}; no samples are silently skipped.")
-                        if isinstance(answer, str) and not answer.strip():
-                            raise ValueError(f"Empty answer: {sample_id}")
+                        invalid_question = question is not None and not isinstance(question, str)
+                        missing_fields = []
+                        if question is None or invalid_question or not question.strip():
+                            missing_fields.append("question")
+                        if (answer is None or answer in ("", {}, [])
+                                or isinstance(answer, str) and not answer.strip()):
+                            missing_fields.append("answer")
+                        # 个别原始记录同时没有答案且 question 错填为解释对象；按缺失问答跳过，
+                        # 不尝试把解释重构成问题。答案完整但问题类型错误时仍报错，避免掩盖结构问题。
+                        if invalid_question and "answer" not in missing_fields:
+                            raise ValueError(f"{sample_id}: question 必须是字符串，不能把非法类型当作缺失问答跳过。")
+                        if missing_fields:
+                            if incomplete_policy == "error":
+                                raise ValueError(f"Missing question or answer: {sample_id}; "
+                                                 f"缺少字段 {missing_fields}。可设置 incomplete_samples=skip 跳过并记录。")
+                            skipped[sample_id] = {"id": sample_id, "missing_fields": missing_fields}
+                            if invalid_question:
+                                skipped[sample_id]["invalid_fields"] = ["question"]
+                            if len(skipped) <= 10:
+                                print(f"跳过缺失问答：{sample_id}；缺少字段={missing_fields}", flush=True)
+                            continue
                         found[sample_id] = TextSample(sample_id, question.strip(), answer, qa.get("options"))
                 if row_index >= last_row:
                     break
-        print(f"Resolved {len(found):,}/{len(train_ids):,} selected QAs", flush=True)
-    missing = [sample_id for sample_id in train_ids if sample_id not in found]
+        print(f"已回源 {len(found) + len(skipped):,}/{len(train_ids):,} 个问答；"
+              f"有效 {len(found):,}，字段缺失 {len(skipped):,}。", flush=True)
+    missing = [sample_id for sample_id in train_ids if sample_id not in found and sample_id not in skipped]
     if missing:
         raise ValueError(f"{len(missing)} training IDs not found: {', '.join(missing[:5])}")
-    return [found[sample_id] for sample_id in train_ids]
+    skipped_records = [skipped[sample_id] for sample_id in train_ids if sample_id in skipped]
+    if skipped_incomplete is not None:
+        skipped_incomplete.extend(skipped_records)
+    if skipped:
+        print(f"共跳过 {len(skipped):,} 个问题或答案缺失的问答；"
+              "训练时会保存完整跳过清单，不会用占位符训练。", flush=True)
+    if not found:
+        raise ValueError("没有可训练的问答：选中的数据均缺少有效问题或答案。")
+    return [found[sample_id] for sample_id in train_ids if sample_id in found]
 
 
 def json_text(value):
@@ -328,10 +359,31 @@ def prepare_samples(args):
     train_ids, manifest = load_split_manifest(args.split_manifest)
     selected = train_ids[:args.limit] if args.limit else train_ids
     args.data_root = Path(args.data_root or manifest.get("data_root") or DEFAULT_DATA_ROOT).expanduser().resolve()
-    samples = load_training_samples(args.data_root, selected)
+    skipped = []
+    policy = getattr(args, "incomplete_samples", "skip")
+    samples = load_training_samples(args.data_root, selected,
+                                    incomplete_policy=policy, skipped_incomplete=skipped)
+    args.data_selection_audit = {
+        "incomplete_samples_policy": policy,
+        "manifest_train_count": len(train_ids), "selected_train_count": len(selected),
+        "actual_train_count": len(samples), "skipped_incomplete_count": len(skipped),
+        "skipped_incomplete_ids": [item["id"] for item in skipped],
+        "skipped_incomplete_details": skipped,
+    }
     print(f"Manifest: {len(train_ids):,} train / {len(manifest.get('test_ids', [])):,} held-out test IDs; "
-          f"selected for training: {len(samples):,}. Images/captions are excluded.", flush=True)
+          f"selected: {len(selected):,}; trainable: {len(samples):,}; skipped: {len(skipped):,}. "
+          "Images/captions are excluded.", flush=True)
     return samples, manifest
+
+
+def write_data_selection_audit(args):
+    """开始训练前保存完整缺失清单，长时间训练中断后仍能追溯实际筛选规则。"""
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    path = args.output_dir / "data_selection.json"
+    path.write_text(json.dumps({"split_manifest": str(args.split_manifest),
+                                "data_root": str(args.data_root), **args.data_selection_audit},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"数据筛选审计已保存：{path}", flush=True)
 
 
 def prepare_tokens(args, samples):
@@ -435,11 +487,13 @@ def train(args):
     trainer = Trainer(model=model, args=training_args, train_dataset=dataset,
                       data_collator=TextCollator(tokenizer.pad_token_id), callbacks=[progress],
                       **{tokenizer_key: tokenizer})
+    write_data_selection_audit(args)
     trainer.train()
     trainer.save_model(str(args.output_dir))
     trainer.save_state()
     tokenizer.save_pretrained(args.output_dir)
     metadata_payload = {
+        **args.data_selection_audit,
         "base_model_dir": str(args.model_dir), "split_manifest": str(args.split_manifest),
         "data_root": str(args.data_root), "manifest_train_count": len(manifest["train_ids"]),
         "actual_train_count": len(samples), "train_ids": [sample.sample_id for sample in samples],
@@ -480,6 +534,8 @@ def build_parser():
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "deepseek_mira_lora_adapter",
                         help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
     parser.add_argument("--limit", type=int, default=0, help="First N train_ids for a short experiment; 0 uses all.")
+    parser.add_argument("--incomplete-samples", choices=("skip", "error"), default="skip",
+                        help="原始问答缺少问题或答案时：skip 跳过并记录（默认），error 立即停止。")
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=-1, help="Positive value overrides epochs.")
     parser.add_argument("--batch-size", type=int, default=1)

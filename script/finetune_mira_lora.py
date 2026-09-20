@@ -41,6 +41,12 @@ JSON 结构：
 ``output/deepseek_mira_lora_adapter`` 或 ``output/qwen3_vl_2b_lora_adapter``。
 JSON 中的相对路径以配置文件所在目录为基准；临时命令行路径仍以当前工作目录
 为基准。可在 JSON 中修改 ``split_manifest`` 和 ``output_dir`` 指定其他位置。
+
+DeepSeek 配置可设置 ``incomplete_samples: "skip"``（默认），跳过原始问题或答案
+缺失的问答并输出数量；``"error"`` 则遇缺失即停止。不会从测试集补齐，也不会用
+visual_evidence 代替答案。训练开始前保存 ``data_selection.json`` 审计清单，完成后
+``training_metadata.json`` 记录实际训练编号及所有跳过编号。清单中的无效 ID、损坏
+CSV/JSON 仍报错；该选项不改变 Qwen 后端的现有处理。
 """
 
 from __future__ import annotations
