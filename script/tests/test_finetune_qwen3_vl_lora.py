@@ -115,6 +115,35 @@ class ManifestAndDataTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             finetune.load_training_samples(self.root, [make_sample().id])
 
+    def test_null_manifest_uses_all_qas_from_train_csv_only(self):
+        image_dir = self.root / "images"
+        image_dir.mkdir()
+        (image_dir / "0.png").write_bytes(b"fixture")
+        with (self.root / "train.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["image_path", "caption", "vqa_json"])
+            writer.writeheader()
+            writer.writerow({
+                "image_path": "images/0.png", "caption": "",
+                "vqa_json": json.dumps({
+                    "open_ended": [{"question": "open", "answer": "a"}],
+                    "closed_ended": [{"question": "closed", "answer": "b"}],
+                    "single_choice": [{"question": "single", "answer": "c"}],
+                    "multiple_choice": [{"question": "multiple", "answer": "d"}],
+                }),
+            })
+        self.write_split("validation", [[{"question": "held out", "answer": "not train"}]])
+        args = finetune.build_parser().parse_args([
+            "--all-train-data", "--data-root", str(self.root),
+            "--model-dir", str(self.root / "base"), "--output-dir", str(self.root / "adapter"),
+        ])
+        dataset, manifest, train_ids = finetune.prepare_dataset(args)
+        self.assertEqual(len(dataset), 4)
+        self.assertEqual([sample_id.split(":")[3] for sample_id in train_ids],
+                         ["open_ended", "closed_ended", "single_choice", "multiple_choice"])
+        self.assertEqual(manifest["selection_mode"], "full_train_split")
+        self.assertEqual(manifest["source_splits"], ["train"])
+        self.assertEqual(manifest["test_ids"], [])
+
     def test_user_prompt_does_not_leak_answer_rationale_or_caption(self):
         sample = make_sample(
             options={"A": "Left", "B": "Right"}, answer="SECRET_ANSWER",

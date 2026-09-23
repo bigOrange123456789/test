@@ -65,6 +65,29 @@ class ManifestAndDataTests(unittest.TestCase):
         self.assertEqual(ids, payload["train_ids"])
         self.assertEqual(loaded, payload)
 
+    def test_null_manifest_uses_every_train_csv_qa_and_excludes_other_splits(self):
+        self.write_split("train", [{
+            "open_ended": [{"question": "Open", "answer": "A"}],
+            "closed_ended": [{"question": "Closed", "answer": "B"}],
+            "single_choice": [{"question": "Single", "answer": "C"}],
+            "multiple_choice": [{"question": "Multiple", "answer": "D"}],
+        }], include_image_columns=True)
+        self.write_split("validation", [{
+            "open_ended": [{"question": "Held out", "answer": "Do not train"}],
+        }], include_image_columns=True)
+        args = finetune.build_parser().parse_args([
+            "--all-train-data", "--data-root", str(self.root),
+            "--model-dir", str(self.root / "base"), "--output-dir", str(self.root / "adapter"),
+        ])
+        samples, manifest = finetune.prepare_samples(args)
+        self.assertEqual(len(samples), 4)
+        self.assertEqual([sample.sample_id.split(":")[3] for sample in samples],
+                         ["open_ended", "closed_ended", "single_choice", "multiple_choice"])
+        self.assertEqual(manifest["selection_mode"], "full_train_split")
+        self.assertEqual(manifest["source_splits"], ["train"])
+        self.assertEqual(args.data_selection_audit["manifest_train_count"], 4)
+        self.assertEqual(args.data_selection_audit["selection_mode"], "full_train_split")
+
     def test_manifest_rejects_invalid_ids_duplicates_and_train_test_overlap(self):
         sample_id = make_sample().sample_id
         invalid_payloads = [
@@ -299,6 +322,7 @@ class ManifestAndDataTests(unittest.TestCase):
         samples, manifest = finetune.prepare_samples(args)
         self.assertEqual([sample.sample_id for sample in samples], [make_sample(2).sample_id, make_sample().sample_id])
         self.assertEqual(args.data_selection_audit, {
+            "selection_mode": "split_manifest", "source_splits": ["manifest_train_ids"],
             "incomplete_samples_policy": "skip", "manifest_train_count": 4,
             "selected_train_count": 3, "actual_train_count": 2, "skipped_incomplete_count": 1,
             "skipped_incomplete_ids": [make_sample(1).sample_id],

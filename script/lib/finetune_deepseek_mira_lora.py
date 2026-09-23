@@ -23,6 +23,7 @@
     - 默认基座模型为项目根目录 ``DeepSeek-R1-Distill-Qwen-1.5B``，默认 ID 清单为
       ``output/mira_split_ids.json``，只按顺序使用 ``train_ids``；重复 ID、
       与 ``test_ids`` 重叠或无法回源的 ID 都会报错。
+      统一 JSON 中 ``split_manifest: null`` 时改为使用数据目录 ``train.csv`` 的全部问答。
     - 数据目录优先级为 ``--data-root``、清单中的 ``data_root``、最后是
       ``G:\\Codex_dataset\\MIRA-data``。一条训练样本对应一个 MIRA 问答。
     - 缺少问题或答案的原始问答默认跳过并明确报告数量与编号；不会编造答案或
@@ -76,6 +77,10 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SCRIPT_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_DATA_ROOT = Path(r"G:\Codex_dataset\MIRA-data")
+INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
+if str(INFERENCE_DIR) not in sys.path:
+    sys.path.insert(0, str(INFERENCE_DIR))
+from embed_mira_chroma import iter_samples  # noqa: E402
 DEFAULT_SYSTEM_PROMPT = (
     "You are a medical question-answering assistant. Answer the question using "
     "the provided text and options. Give the answer directly without a thinking block."
@@ -356,7 +361,19 @@ def dependency_report():
 
 
 def prepare_samples(args):
-    train_ids, manifest = load_split_manifest(args.split_manifest)
+    if args.split_manifest is None:
+        args.data_root = Path(args.data_root or DEFAULT_DATA_ROOT).expanduser().resolve()
+        train_ids = [sample.id for sample in iter_samples(args.data_root, "train")]
+        manifest = {
+            "train_ids": train_ids,
+            "test_ids": [],
+            "data_root": str(args.data_root),
+            "source_splits": ["train"],
+            "selection_mode": "full_train_split",
+        }
+        print(f"未指定 split manifest；使用 train.csv 中全部训练问答：{len(train_ids):,} 组。", flush=True)
+    else:
+        train_ids, manifest = load_split_manifest(args.split_manifest)
     selected = train_ids[:args.limit] if args.limit else train_ids
     args.data_root = Path(args.data_root or manifest.get("data_root") or DEFAULT_DATA_ROOT).expanduser().resolve()
     skipped = []
@@ -364,6 +381,8 @@ def prepare_samples(args):
     samples = load_training_samples(args.data_root, selected,
                                     incomplete_policy=policy, skipped_incomplete=skipped)
     args.data_selection_audit = {
+        "selection_mode": manifest.get("selection_mode", "split_manifest"),
+        "source_splits": manifest.get("source_splits", ["manifest_train_ids"]),
         "incomplete_samples_policy": policy,
         "manifest_train_count": len(train_ids), "selected_train_count": len(selected),
         "actual_train_count": len(samples), "skipped_incomplete_count": len(skipped),
@@ -380,7 +399,8 @@ def write_data_selection_audit(args):
     """开始训练前保存完整缺失清单，长时间训练中断后仍能追溯实际筛选规则。"""
     args.output_dir.mkdir(parents=True, exist_ok=True)
     path = args.output_dir / "data_selection.json"
-    path.write_text(json.dumps({"split_manifest": str(args.split_manifest),
+    path.write_text(json.dumps({"split_manifest": (str(args.split_manifest)
+                                                     if args.split_manifest is not None else None),
                                 "data_root": str(args.data_root), **args.data_selection_audit},
                                ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"数据筛选审计已保存：{path}", flush=True)
@@ -494,7 +514,10 @@ def train(args):
     tokenizer.save_pretrained(args.output_dir)
     metadata_payload = {
         **args.data_selection_audit,
-        "base_model_dir": str(args.model_dir), "split_manifest": str(args.split_manifest),
+        "base_model_dir": str(args.model_dir),
+        "split_manifest": (str(args.split_manifest) if args.split_manifest is not None else None),
+        "selection_mode": manifest.get("selection_mode", "split_manifest"),
+        "source_splits": manifest.get("source_splits", ["manifest_train_ids"]),
         "data_root": str(args.data_root), "manifest_train_count": len(manifest["train_ids"]),
         "actual_train_count": len(samples), "train_ids": [sample.sample_id for sample in samples],
         "input_mode": "text_only_question_and_options", "images_used": False, "captions_used": False,
@@ -530,6 +553,9 @@ def build_parser():
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B")
     parser.add_argument("--split-manifest", type=Path, default=OUTPUT_DIR / "mira_split_ids.json",
                         help="训练 ID 清单；默认读取项目 output/mira_split_ids.json。")
+    parser.add_argument("--all-train-data", dest="split_manifest", action="store_const",
+                        const=None, default=argparse.SUPPRESS,
+                        help="不使用 ID 清单，使用 MIRA 数据目录 train.csv 中的全部问答。")
     parser.add_argument("--data-root", type=Path, help="Default: manifest data_root, then G:/Codex_dataset/MIRA-data.")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "deepseek_mira_lora_adapter",
                         help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
@@ -576,7 +602,8 @@ def validate_args(args):
         raise ValueError(f"--target-modules must use Qwen2 projection names from: {TARGET_MODULES}")
     args.target_modules = ",".join(dict.fromkeys(targets))
     for name in ("model_dir", "split_manifest", "output_dir"):
-        setattr(args, name, getattr(args, name).expanduser().resolve())
+        value = getattr(args, name)
+        setattr(args, name, value.expanduser().resolve() if value is not None else None)
     output_is_safe(args.model_dir, args.output_dir)
     config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
     if config.get("model_type") != "qwen2" or "Qwen2ForCausalLM" not in config.get("architectures", []):

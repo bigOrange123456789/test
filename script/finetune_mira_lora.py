@@ -41,6 +41,8 @@ JSON 结构：
 ``output/deepseek_mira_lora_adapter`` 或 ``output/qwen3_vl_2b_lora_adapter``。
 JSON 中的相对路径以配置文件所在目录为基准；临时命令行路径仍以当前工作目录
 为基准。可在 JSON 中修改 ``split_manifest`` 和 ``output_dir`` 指定其他位置。
+若所选模型档案中的 ``split_manifest`` 为 ``null``，则不读取 ID 清单，直接使用
+MIRA 数据目录 ``train.csv`` 中全部训练问答；validation/test 数据仍不会用于训练。
 
 Qwen 配置可设置 ``on_existing_output: "new"``（默认）：若输出目录已有结果，
 自动另存到相邻的 ``原目录名_run_年月日_时分秒``，保留之前的微调参数；
@@ -122,8 +124,11 @@ def import_backend(model: str):
 
 def parser_actions(parser: argparse.ArgumentParser) -> dict[str, argparse.Action]:
     """建立参数名到 argparse 动作的映射，防止 JSON 悄悄传入无效参数。"""
-    return {action.dest: action for action in parser._actions
-            if action.dest not in {"help", argparse.SUPPRESS}}
+    actions = {}
+    for action in parser._actions:
+        if action.dest not in {"help", argparse.SUPPRESS}:
+            actions.setdefault(action.dest, action)
+    return actions
 
 
 def option_for(action: argparse.Action) -> str:
@@ -144,7 +149,11 @@ def arguments_to_argv(parser: argparse.ArgumentParser, values: dict[str, Any]) -
     for name, value in values.items():
         action = actions[name]
         option = option_for(action)
-        if isinstance(action, argparse._StoreTrueAction):
+        if name == "split_manifest" and value is None:
+            if "--all-train-data" not in parser._option_string_actions:
+                raise ValueError("所选模型不支持 split_manifest=null。")
+            argv.append("--all-train-data")
+        elif isinstance(action, argparse._StoreTrueAction):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} 必须是 JSON 布尔值。")
             if value:

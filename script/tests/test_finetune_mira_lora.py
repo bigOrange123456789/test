@@ -72,6 +72,20 @@ class UnifiedFinetuneTests(unittest.TestCase):
                 self.assertEqual(args.output_dir, (path.parent / configured["output_dir"]).resolve())
                 self.assertEqual(payload["model_arguments"][model], configured)
 
+    def test_null_manifest_selects_the_full_training_split_for_both_backends(self):
+        for model in ("DeepSeek-Model", "Qwen3-VL-2B-Instruct"):
+            with self.subTest(model=model):
+                payload = {"model": model, "model_arguments": {model: {"split_manifest": None}}}
+                backend, argv = unified.resolve_backend_argv(payload, [])
+                args = backend.build_parser().parse_args(argv)
+                self.assertIsNone(args.split_manifest)
+                # 显式临时命令行路径覆盖 JSON 中的 null。
+                _, overridden = unified.resolve_backend_argv(
+                    payload, ["--split-manifest", "custom_ids.json"],
+                )
+                final_args = backend.build_parser().parse_args(overridden)
+                self.assertEqual(final_args.split_manifest, Path("custom_ids.json"))
+
     def test_json_paths_use_config_directory_and_cli_paths_remain_explicit(self):
         payload = {
             "model": "Qwen3-VL-2B-Instruct",

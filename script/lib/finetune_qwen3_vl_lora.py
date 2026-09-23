@@ -21,6 +21,7 @@ CUDA 版 ``MLMtest`` 环境中使用统一入口：
     - 默认基座是项目根目录 ``Qwen3-VL-2B-Instruct``。从
       ``output/mira_split_ids.json`` 读取 ``train_ids`` 并回源到 MIRA CSV；
       保持清单顺序，拒绝重复 ID 或与 ``test_ids`` 重叠，不在训练中使用测试集。
+      统一 JSON 中 ``split_manifest: null`` 时使用数据目录 ``train.csv`` 的全部问答。
     - 一条样本包含一个问答及其全部图片。用户输入仅含问题、选项和图片；
       caption 与其他源字段不会作为提示。结构化答案和嵌套解释会完整保留。
     - 缺少问题或答案的问答会显式跳过并记录；缺失 ID/图片会报错。图片在
@@ -72,7 +73,7 @@ INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
 if str(INFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(INFERENCE_DIR))
 
-from embed_mira_chroma import Sample, image_path, iter_samples  # noqa: E402
+from embed_mira_chroma import DEFAULT_DATA_ROOT, Sample, image_path, iter_samples  # noqa: E402
 
 
 LOGGER = logging.getLogger("finetune_qwen3_vl_lora")
@@ -553,7 +554,19 @@ def select_lora_targets(model: Any, suffixes: list[str]) -> list[str]:
 
 
 def prepare_dataset(args: argparse.Namespace) -> tuple[MIRATrainingDataset, dict[str, Any], list[str]]:
-    train_ids, manifest = load_split_manifest(args.split_manifest)
+    if args.split_manifest is None:
+        args.data_root = Path(args.data_root or DEFAULT_DATA_ROOT).expanduser().resolve()
+        train_ids = [sample.id for sample in iter_samples(args.data_root, "train")]
+        manifest = {
+            "train_ids": train_ids,
+            "test_ids": [],
+            "data_root": str(args.data_root),
+            "source_splits": ["train"],
+            "selection_mode": "full_train_split",
+        }
+        print(f"未指定 split manifest；使用 train.csv 中全部训练问答：{len(train_ids):,} 组。", flush=True)
+    else:
+        train_ids, manifest = load_split_manifest(args.split_manifest)
     selected_ids = train_ids[:args.limit] if args.limit > 0 else train_ids
     source_root = args.data_root or manifest.get("data_root")
     if not source_root:
@@ -640,7 +653,10 @@ def train(args: argparse.Namespace) -> None:
     metadata_payload = {
         "base_model_dir": str(args.model_dir.resolve()),
         "output_dir": str(args.output_dir.resolve()),
-        "split_manifest": str(args.split_manifest.resolve()),
+        "split_manifest": (str(args.split_manifest.resolve())
+                           if args.split_manifest is not None else None),
+        "selection_mode": manifest.get("selection_mode", "split_manifest"),
+        "source_splits": manifest.get("source_splits", ["manifest_train_ids"]),
         "manifest_train_count": len(train_ids),
         "actual_train_count": len(dataset),
         "train_ids": [record.sample.id for record in dataset.records],
@@ -675,6 +691,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, help="MIRA CSV directory; defaults to data_root in the manifest.")
     parser.add_argument("--split-manifest", type=Path, default=OUTPUT_DIR / "mira_split_ids.json",
                         help="训练 ID 清单；默认读取项目 output/mira_split_ids.json。")
+    parser.add_argument("--all-train-data", dest="split_manifest", action="store_const",
+                        const=None, default=argparse.SUPPRESS,
+                        help="不使用 ID 清单，使用 MIRA 数据目录 train.csv 中的全部问答。")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "qwen3_vl_2b_lora_adapter",
                         help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
     parser.add_argument("--on-existing-output", choices=("new", "error"), default="new",
@@ -726,7 +745,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("Run this script in one process with python; distributed launch is not supported.")
     args.model_dir = args.model_dir.expanduser().resolve()
-    args.split_manifest = args.split_manifest.expanduser().resolve()
+    args.split_manifest = (args.split_manifest.expanduser().resolve()
+                           if args.split_manifest is not None else None)
     args.output_dir = args.output_dir.expanduser().resolve()
     output_is_safe(args.model_dir, args.output_dir, allow_existing=True)
     config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
