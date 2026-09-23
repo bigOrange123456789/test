@@ -299,32 +299,56 @@ class TrainingProgressCallback:
         self.intervals = deque(maxlen=20)
         self.started = None
         self.elapsed_seconds = 0.0
+        self.steps_per_second = 0.0
+        self.current_loss = None
+        self.last_render_length = 0
+
+    def _render(self, state):
+        total = max(int(state.max_steps or 0), 0)
+        step = max(int(state.global_step or 0), 0)
+        fraction = min(step / total, 1.0) if total else 0.0
+        width = 24
+        filled = min(width, int(width * fraction))
+        bar = "=" * filled + (">" if filled < width else "") + " " * max(0, width - filled - 1)
+        eta = (max(total - step, 0) / self.steps_per_second
+               if self.steps_per_second > 0 else float("inf"))
+        loss = f"{self.current_loss:.6f}" if self.current_loss is not None else "--"
+        message = (
+            f"\r[train] [{bar}] {fraction * 100:5.1f}% {step:,}/{total:,} | "
+            f"{self.steps_per_second:.3f} step/s | approx "
+            f"{self.steps_per_second * self.effective_batch_size:.2f} QA/s | "
+            f"loss {loss} | elapsed {format_duration(self.elapsed_seconds)} | ETA {format_duration(eta)}"
+        )
+        # 进度文字变短时补空格，清除上一行残留内容。
+        self.last_render_length = max(self.last_render_length, len(message))
+        print(message.ljust(self.last_render_length), end="\r", flush=True)
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.started = self.last_time = time.perf_counter()
         self.last_step = int(state.global_step)
         self.intervals.clear()
         print(f"LoRA training: {state.max_steps:,} optimizer steps; effective batch={self.effective_batch_size}", flush=True)
+        self._render(state)
 
     def on_step_end(self, args, state, control, **kwargs):
         if self.started is None or state.global_step <= self.last_step:
             return
         now = time.perf_counter()
         self.intervals.append((state.global_step - self.last_step, max(now - self.last_time, 1e-9)))
-        speed = sum(steps for steps, _ in self.intervals) / sum(seconds for _, seconds in self.intervals)
+        self.steps_per_second = sum(steps for steps, _ in self.intervals) / sum(seconds for _, seconds in self.intervals)
         self.elapsed_seconds = now - self.started
-        eta = max(state.max_steps - state.global_step, 0) / speed
-        print(f"[train] step {state.global_step:,}/{state.max_steps:,} | {speed:.3f} step/s | "
-              f"approx {speed * self.effective_batch_size:.2f} QA/s | "
-              f"elapsed {format_duration(self.elapsed_seconds)} | ETA {format_duration(eta)}", flush=True)
+        self._render(state)
         self.last_time, self.last_step = now, int(state.global_step)
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if isinstance((logs or {}).get("loss"), (int, float)):
-            print(f"[loss] step {state.global_step}: {logs['loss']:.6f}", flush=True)
+        loss = (logs or {}).get("loss")
+        if isinstance(loss, (int, float)):
+            self.current_loss = float(loss)
+            self._render(state)
 
     def on_train_end(self, args, state, control, **kwargs):
         self.elapsed_seconds = 0.0 if self.started is None else time.perf_counter() - self.started
+        print(flush=True)
         print(f"LoRA training time: {format_duration(self.elapsed_seconds)} ({self.elapsed_seconds:.2f} s)", flush=True)
 
 
@@ -458,6 +482,7 @@ def train(args):
     import torch
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM, Trainer, TrainerCallback, TrainingArguments, set_seed
+    from transformers.trainer_callback import PrinterCallback
 
     output_is_safe(args.model_dir, args.output_dir)
     set_seed(args.seed)
@@ -511,6 +536,9 @@ def train(args):
     trainer = Trainer(model=model, args=training_args, train_dataset=dataset,
                       data_collator=TextCollator(tokenizer.pad_token_id), callbacks=[progress],
                       **{tokenizer_key: tokenizer})
+    # disable_tqdm=True 会让 Trainer 添加 PrinterCallback 并逐步打印原始日志字典；
+    # 移除它，只保留上面的单行训练进度显示。
+    trainer.remove_callback(PrinterCallback)
     write_data_selection_audit(args)
     trainer.train()
     trainer.save_model(str(args.output_dir))

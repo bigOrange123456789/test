@@ -387,6 +387,9 @@ class ManifestAndDataTests(unittest.TestCase):
                 Trainer=Mock(return_value=trainer), TrainerCallback=type("FakeCallback", (), {}),
                 TrainingArguments=Mock(), set_seed=Mock(),
             ),
+            "transformers.trainer_callback": SimpleNamespace(
+                PrinterCallback=type("FakePrinterCallback", (), {}),
+            ),
         }
         with patch.dict(sys.modules, modules), \
                 patch.object(finetune, "dependency_report", return_value=([], [])), \
@@ -557,11 +560,13 @@ class ProgressTests(unittest.TestCase):
             callback.on_log(None, state, None, logs={"loss": 1.25})
             callback.on_train_end(None, state, None)
         result = output.getvalue()
-        self.assertEqual(result.count("[train]"), 1)
+        self.assertGreaterEqual(result.count("[train]"), 2)
+        self.assertGreaterEqual(result.count("\r"), 3)
         self.assertIn("0.500 step/s", result)
         self.assertIn("4.00 QA/s", result)
         self.assertIn("ETA 00:00:06", result)
         self.assertIn("1.250000", result)
+        self.assertNotIn("[loss]", result)
         self.assertIn("00:00:05", result)
 
 

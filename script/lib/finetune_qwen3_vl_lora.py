@@ -473,13 +473,38 @@ def format_duration(seconds: float) -> str:
 
 
 class TrainingProgressCallback:
-    """Print optimizer speed, effective QA speed, ETA and final training time."""
+    """单行刷新训练进度，并显示速度、loss、ETA 和总训练时间。"""
 
     def __init__(self, effective_batch_size: int):
         self.effective_batch_size = effective_batch_size
         self.started = None
         self.last_time = None
         self.last_step = 0
+        self.steps_per_second = 0.0
+        self.current_loss = None
+        self.elapsed_seconds = 0.0
+        self.last_render_length = 0
+
+    def _render(self, state) -> None:
+        total = max(int(state.max_steps or 0), 0)
+        step = max(int(state.global_step or 0), 0)
+        fraction = min(step / total, 1.0) if total else 0.0
+        width = 24
+        filled = min(width, int(width * fraction))
+        bar = "=" * filled + (">" if filled < width else "") + " " * max(0, width - filled - 1)
+        elapsed = self.elapsed_seconds
+        qa_per_second = self.steps_per_second * self.effective_batch_size
+        remaining = (max(total - step, 0) / self.steps_per_second
+                     if self.steps_per_second > 0 else float("inf"))
+        loss = f"{self.current_loss:.6f}" if self.current_loss is not None else "--"
+        message = (
+            f"\r[train] [{bar}] {fraction * 100:5.1f}% {step:,}/{total:,} | "
+            f"{self.steps_per_second:.3f} step/s | approx {qa_per_second:.2f} QA/s | "
+            f"loss {loss} | elapsed {format_duration(elapsed)} | ETA {format_duration(remaining)}"
+        )
+        # 如果新行比旧行短，用空格清掉残留尾部；回车后覆盖同一行。
+        self.last_render_length = max(self.last_render_length, len(message))
+        print(message.ljust(self.last_render_length), end="\r", flush=True)
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.started = time.perf_counter()
@@ -487,30 +512,30 @@ class TrainingProgressCallback:
         self.last_step = int(state.global_step)
         print(f"LoRA training started: {state.max_steps:,} optimizer steps; "
               f"effective batch={self.effective_batch_size}.", flush=True)
+        self._render(state)
 
     def on_step_end(self, args, state, control, **kwargs):
         if self.started is None or not state.global_step or state.global_step == self.last_step:
             return
         now = time.perf_counter()
         elapsed = now - self.started
+        self.elapsed_seconds = elapsed
         delta_steps = state.global_step - self.last_step
         delta_time = max(now - self.last_time, 1e-9)
-        steps_per_second = delta_steps / delta_time
-        examples_per_second = steps_per_second * self.effective_batch_size
-        remaining = max(int(state.max_steps) - int(state.global_step), 0) / steps_per_second
-        print(f"[train] step {state.global_step:,}/{state.max_steps:,} | "
-              f"{steps_per_second:.3f} step/s | approx {examples_per_second:.2f} QA/s | "
-              f"elapsed {format_duration(elapsed)} | ETA {format_duration(remaining)}", flush=True)
+        self.steps_per_second = delta_steps / delta_time
         self.last_time = now
         self.last_step = int(state.global_step)
+        self._render(state)
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         loss = (logs or {}).get("loss")
         if isinstance(loss, (int, float)):
-            print(f"[loss] step {state.global_step}: {loss:.6f}", flush=True)
+            self.current_loss = float(loss)
+            self._render(state)
 
     def on_train_end(self, args, state, control, **kwargs):
         elapsed = 0.0 if self.started is None else time.perf_counter() - self.started
+        print(flush=True)
         print(f"LoRA training time: {format_duration(elapsed)} ({elapsed:.2f} seconds)", flush=True)
 
 
@@ -603,6 +628,7 @@ def train(args: argparse.Namespace) -> None:
         args.output_dir.mkdir(parents=True, exist_ok=False)
     dataset, manifest, train_ids = prepare_dataset(args)
     from transformers import Trainer, TrainerCallback, set_seed
+    from transformers.trainer_callback import PrinterCallback
     from peft import LoraConfig, TaskType, get_peft_model
 
     set_seed(args.seed)
@@ -644,6 +670,9 @@ def train(args: argparse.Namespace) -> None:
         processing_class=processor,
         callbacks=[ProgressCallback(effective_batch_size)],
     )
+    # disable_tqdm=True 时 Trainer 会用 PrinterCallback 逐步打印原始字典，
+    # 移除它，避免和自定义的单行训练进度条重复输出。
+    trainer.remove_callback(PrinterCallback)
     if args.validate_image_token_inputs:
         # The selected examples must all fit before any optimizer update is made.
         with TerminalProgress("Validated image/token inputs", len(dataset.records)) as progress:

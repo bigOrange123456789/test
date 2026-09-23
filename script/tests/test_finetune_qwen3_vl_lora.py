@@ -195,7 +195,7 @@ class ProgressTests(unittest.TestCase):
         for seconds in (-1, float("inf"), float("nan")):
             self.assertEqual(finetune.format_duration(seconds), "--:--:--")
 
-    def test_each_optimizer_step_reports_speed_eta_and_final_duration(self):
+    def test_each_optimizer_step_refreshes_one_line_with_loss_speed_eta_and_duration(self):
         callback = finetune.TrainingProgressCallback(effective_batch_size=8)
         state = SimpleNamespace(global_step=0, max_steps=4)
         output = io.StringIO()
@@ -207,11 +207,13 @@ class ProgressTests(unittest.TestCase):
             callback.on_log(None, state, None, logs={"loss": 1.25})
             callback.on_train_end(None, state, None)
         result = output.getvalue()
-        self.assertEqual(result.count("[train]"), 1)
+        self.assertGreaterEqual(result.count("[train]"), 2)
+        self.assertGreaterEqual(result.count("\r"), 4)
         self.assertIn("0.500 step/s", result)
         self.assertIn("4.00 QA/s", result)
         self.assertIn("ETA 00:00:06", result)
-        self.assertIn("1.250000", result)
+        self.assertIn("loss 1.250000", result)
+        self.assertNotIn("[loss]", result)
         self.assertIn("00:00:05 (5.00 seconds)", result)
 
     def test_resume_speed_uses_steps_since_resume(self):
