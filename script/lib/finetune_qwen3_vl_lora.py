@@ -75,6 +75,11 @@ if str(INFERENCE_DIR) not in sys.path:
 
 from embed_mira_chroma import DEFAULT_DATA_ROOT, Sample, image_path, iter_samples  # noqa: E402
 
+try:
+    from .terminal_progress import TerminalProgress
+except ImportError:  # 兼容直接导入本脚本的离线测试和旧调用方式
+    from terminal_progress import TerminalProgress
+
 
 LOGGER = logging.getLogger("finetune_qwen3_vl_lora")
 REQUIRED_PACKAGES = {
@@ -640,10 +645,10 @@ def train(args: argparse.Namespace) -> None:
         callbacks=[ProgressCallback(effective_batch_size)],
     )
     # The selected examples must all fit before any optimizer update is made.
-    for index, record in enumerate(dataset.records, start=1):
-        collator([record])
-        if index % 100 == 0 or index == len(dataset):
-            print(f"Validated image/token inputs: {index}/{len(dataset)}", flush=True)
+    with TerminalProgress("Validated image/token inputs", len(dataset.records)) as progress:
+        for index, record in enumerate(dataset.records, start=1):
+            collator([record])
+            progress.update(index)
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(args.output_dir))

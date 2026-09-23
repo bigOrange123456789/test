@@ -81,6 +81,10 @@ INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
 if str(INFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(INFERENCE_DIR))
 from embed_mira_chroma import iter_samples  # noqa: E402
+try:
+    from .terminal_progress import TerminalProgress
+except ImportError:  # 兼容直接导入本脚本的离线测试和旧调用方式
+    from terminal_progress import TerminalProgress
 DEFAULT_SYSTEM_PROMPT = (
     "You are a medical question-answering assistant. Answer the question using "
     "the provided text and options. Give the answer directly without a thinking block."
@@ -415,10 +419,10 @@ def prepare_tokens(args, samples):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     features = []
-    for index, sample in enumerate(samples, start=1):
-        features.append(build_feature(sample, tokenizer, args.max_length, args.system_prompt))
-        if index % 100 == 0 or index == len(samples):
-            print(f"Tokenized {index:,}/{len(samples):,} QAs", flush=True)
+    with TerminalProgress("Tokenized QAs", len(samples)) as progress:
+        for index, sample in enumerate(samples, start=1):
+            features.append(build_feature(sample, tokenizer, args.max_length, args.system_prompt))
+            progress.update(index)
     lengths = [len(feature["input_ids"]) for feature in features]
     stats = {"min_tokens": min(lengths), "max_tokens": max(lengths),
              "mean_tokens": sum(lengths) / len(lengths),
