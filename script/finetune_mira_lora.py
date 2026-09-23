@@ -66,6 +66,18 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "finetune_mira_lora.json"
+'''
+    2026.09.23
+        微调配置：
+            Qwen3-VL-2B-Instruct
+            mira_split_ids2.json:{
+                "train_count": 15000
+            }
+        微调消耗：
+            LoRA training time: 02:13:32 (8012.71 seconds)
+            Saved LoRA adapter and processor to: G:\Codex\MLMtest\output\qwen3_vl_2b_lora_adapter2
+            Total run time including final save: 02:24:23 (8663.12 seconds)
+'''
 BACKENDS = {
     "DeepSeek-Model": "lib.finetune_deepseek_mira_lora",
     "Qwen3-VL-2B-Instruct": "lib.finetune_qwen3_vl_lora",
