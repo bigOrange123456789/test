@@ -38,6 +38,11 @@ class ManifestAndDataTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
+    def test_image_token_preflight_can_be_disabled(self):
+        parser = finetune.build_parser()
+        self.assertTrue(parser.parse_args([]).validate_image_token_inputs)
+        self.assertFalse(parser.parse_args(["--no-validate-image-token-inputs"]).validate_image_token_inputs)
+
     def manifest(self, payload):
         path = self.root / "split.json"
         path.write_text(json.dumps(payload), encoding="utf-8-sig")

@@ -644,11 +644,17 @@ def train(args: argparse.Namespace) -> None:
         processing_class=processor,
         callbacks=[ProgressCallback(effective_batch_size)],
     )
-    # The selected examples must all fit before any optimizer update is made.
-    with TerminalProgress("Validated image/token inputs", len(dataset.records)) as progress:
-        for index, record in enumerate(dataset.records, start=1):
-            collator([record])
-            progress.update(index)
+    if args.validate_image_token_inputs:
+        # The selected examples must all fit before any optimizer update is made.
+        with TerminalProgress("Validated image/token inputs", len(dataset.records)) as progress:
+            for index, record in enumerate(dataset.records, start=1):
+                collator([record])
+                progress.update(index)
+    else:
+        print(
+            "已跳过训练前的图片/token 预检查；图片或输入处理错误可能会在正式训练时出现。",
+            flush=True,
+        )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(args.output_dir))
@@ -677,7 +683,8 @@ def train(args: argparse.Namespace) -> None:
                       "learning_rate": args.learning_rate, "system_prompt": args.system_prompt,
                       "gradient_accumulation_steps": args.gradient_accumulation_steps,
                       "max_length": args.max_length,
-                      "min_pixels": args.min_pixels, "max_pixels": args.max_pixels},
+                      "min_pixels": args.min_pixels, "max_pixels": args.max_pixels,
+                      "validate_image_token_inputs": args.validate_image_token_inputs},
         "total_elapsed_seconds_including_save": total_elapsed,
         "manifest_metadata": {key: manifest[key] for key in ("seed", "source_splits") if key in manifest},
     }
@@ -726,11 +733,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--target-modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument("--no-validate-image-token-inputs", action="store_false",
+                        dest="validate_image_token_inputs",
+                        help="Skip the per-example image/token preflight before training.")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
     parser.add_argument("--attn-implementation", choices=("sdpa", "eager", "flash_attention_2"), default="sdpa")
     parser.add_argument("--no-gradient-checkpointing", action="store_false", dest="gradient_checkpointing")
-    parser.set_defaults(gradient_checkpointing=True)
+    parser.set_defaults(gradient_checkpointing=True, validate_image_token_inputs=True)
     return parser
 
 
