@@ -568,10 +568,15 @@ def chat_with_model(modelId, question, image_data_url=None, print_features=False
           ],
         }]
 
+      # OpenAI SDK 默认超时较长且会自动重试；显式设置超时，避免网络故障时看似一直没反应。
       client = openai.OpenAI(
         api_key=cfg["api_key"],
-        base_url=cfg["base_url"]
+        base_url=cfg["base_url"],
+        timeout=float(cfg.get("api_timeout", 60)),
+        max_retries=0,
       )
+      if param["stream"]:
+        print(f"[{modelId}] 正在请求远程模型（超时 {float(cfg.get('api_timeout', 60)):g} 秒）...", flush=True)
       message = client.chat.completions.create(
         model=cfg["model"],
         messages=remote_messages,
@@ -598,7 +603,14 @@ def chat_with_model(modelId, question, image_data_url=None, print_features=False
     cfg["messages"].append({"role": "assistant", "content": response})
     return response
   except Exception as e:
-    return f"Failed to call model:{e}" 
+    # 流式输出模式下主循环不会打印返回值，因此必须在这里显式显示请求错误。
+    error_message = str(e)
+    api_key = str(config.get(modelId, {}).get("api_key", ""))
+    if api_key:
+      error_message = error_message.replace(api_key, "<已隐藏>")
+    error_message = short_error_message(error_message)
+    print(f"[{modelId}] 调用失败：{error_message}", file=sys.stderr, flush=True)
+    return f"调用模型失败：{error_message}"
 def initUI():# Gradio UI
   import gradio as gr # pip install gradio
   with gr.Blocks() as demo:
