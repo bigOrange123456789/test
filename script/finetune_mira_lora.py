@@ -18,6 +18,10 @@ DeepSeek 文本模型与 Qwen3-VL 视觉语言模型的数据管线差异较大�
     python script/finetune_mira_lora.py --check-config
     python script/finetune_mira_lora.py
 
+使用 2 张 GPU 进行分布式微调（所有 GPU 需能访问相同的模型、数据和输出路径）：
+
+    torchrun --standalone --nproc_per_node=2 script/finetune_mira_lora.py
+
 也可以在 JSON 参数之后追加临时命令行覆盖。例如 JSON 中配置了 epochs=1，下面
 的命令会把最终值覆盖为 2：
 
@@ -36,6 +40,13 @@ JSON 结构：
 参数名使用后端命令行参数的下划线形式，例如 ``gradient_accumulation_steps``。
 未写入 JSON 的参数继续使用原后端默认值。布尔值会正确转换为 ``--check-env``、
 ``--dry-run``、``--no-gradient-checkpointing`` 等开关。
+
+多 GPU 训练由 Hugging Face Trainer 执行 DDP，每张可见 GPU 各放一份模型；全局有效
+batch size = 每卡 batch_size × gradient_accumulation_steps × GPU 数。Linux/WSL2 有
+NCCL 时优先使用 NCCL；无 NCCL 时回退到 Gloo。所有 worker 必须读取相同配置并访问
+相同数据、模型和输出目录。每个 worker 都会加载完整训练数据并各自做预处理，因此
+主机内存和启动阶段的数据准备开销会随 GPU 进程数增加；MIRA 全量训练集较大，建议
+先用少量样本验证目标机器的内存余量。
 
 默认从项目 ``output/mira_split_ids.json`` 读取训练 ID，并分别将参数保存到
 ``output/deepseek_mira_lora_adapter`` 或 ``output/qwen3_vl_2b_lora_adapter``。
@@ -63,6 +74,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -218,11 +230,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         # 先解析一次以验证 JSON 与临时参数组合；真正执行时后端会再次解析同一 argv。
         backend.build_parser().parse_args(backend_argv)
-        print(f"微调模型：{payload['model']}", flush=True)
-        backend_path = BACKENDS[payload["model"]].replace(".", "/") + ".py"
-        print(f"执行后端：{backend_path}", flush=True)
+        main_process = os.environ.get("RANK", "0") == "0"
+        if main_process:
+            print(f"微调模型：{payload['model']}", flush=True)
+            backend_path = BACKENDS[payload["model"]].replace(".", "/") + ".py"
+            print(f"执行后端：{backend_path}", flush=True)
         if args.check_config:
-            print("配置检查通过；未加载数据、模型，也未写入训练结果。", flush=True)
+            if main_process:
+                print("配置检查通过；未加载数据、模型，也未写入训练结果。", flush=True)
             return 0
         return int(backend.main(backend_argv))
     except (OSError, ValueError, json.JSONDecodeError) as error:

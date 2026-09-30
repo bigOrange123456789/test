@@ -525,6 +525,26 @@ class TokenPreparationTests(unittest.TestCase):
             finetune.build_feature(make_sample(answer="ANSWER"), BoundaryMergingTokenizer(), 256, "SYSTEM")
 
 
+class DistributedDeviceTests(unittest.TestCase):
+    def test_local_rank_cuda_device_keeps_auto_mixed_precision(self):
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                is_bf16_supported=lambda: True,
+            ),
+            bfloat16="bf16",
+            float16="fp16",
+            float32="fp32",
+        )
+        args = SimpleNamespace(device="auto", dtype="auto")
+        with patch.object(finetune, "is_distributed", return_value=True), \
+                patch.object(finetune, "local_rank", return_value=1):
+            self.assertEqual(
+                finetune.device_and_dtype(args, fake_torch),
+                ("cuda:1", "bfloat16", "bf16"),
+            )
+
+
 @unittest.skipIf(torch is None, "torch is needed only for tensor collation tests")
 class CollatorTests(unittest.TestCase):
     def test_right_padding_masks_padding_but_keeps_real_eos_labels(self):

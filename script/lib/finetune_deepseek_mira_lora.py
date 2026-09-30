@@ -83,8 +83,20 @@ if str(INFERENCE_DIR) not in sys.path:
 from embed_mira_chroma import iter_samples  # noqa: E402
 try:
     from .terminal_progress import TerminalProgress
+    from .distributed_training import (
+        cleanup_distributed, is_distributed, is_main_process, local_rank,
+        main_process_print, run_on_main_process, set_local_rank_from_argument,
+        setup_distributed, world_size,
+        SilentProgress,
+    )
 except ImportError:  # 兼容直接导入本脚本的离线测试和旧调用方式
     from terminal_progress import TerminalProgress
+    from distributed_training import (
+        cleanup_distributed, is_distributed, is_main_process, local_rank,
+        main_process_print, run_on_main_process, set_local_rank_from_argument,
+        setup_distributed, world_size,
+        SilentProgress,
+    )
 DEFAULT_SYSTEM_PROMPT = (
     "You are a medical question-answering assistant. Answer the question using "
     "the provided text and options. Give the answer directly without a thinking block."
@@ -145,7 +157,7 @@ def load_training_samples(data_root, train_ids, *, incomplete_policy="error", sk
     csv.field_size_limit(64 * 1024 * 1024)
     for split, rows in requested.items():
         source = Path(data_root) / f"{split}.csv"
-        print(f"Resolving {sum(map(len, rows.values()))} training IDs in {source}", flush=True)
+        main_process_print(f"Resolving {sum(map(len, rows.values()))} training IDs in {source}", flush=True)
         last_row = max(rows)
         with source.open("r", encoding="utf-8-sig", newline="") as stream:
             reader = csv.DictReader(stream, strict=True)
@@ -185,13 +197,13 @@ def load_training_samples(data_root, train_ids, *, incomplete_policy="error", sk
                             if invalid_question:
                                 skipped[sample_id]["invalid_fields"] = ["question"]
                             if len(skipped) <= 10:
-                                print(f"跳过缺失问答：{sample_id}；缺少字段={missing_fields}", flush=True)
+                                main_process_print(f"跳过缺失问答：{sample_id}；缺少字段={missing_fields}", flush=True)
                             continue
                         found[sample_id] = TextSample(sample_id, question.strip(), answer, qa.get("options"))
                 if row_index >= last_row:
                     break
-        print(f"已回源 {len(found) + len(skipped):,}/{len(train_ids):,} 个问答；"
-              f"有效 {len(found):,}，字段缺失 {len(skipped):,}。", flush=True)
+        main_process_print(f"已回源 {len(found) + len(skipped):,}/{len(train_ids):,} 个问答；"
+                           f"有效 {len(found):,}，字段缺失 {len(skipped):,}。", flush=True)
     missing = [sample_id for sample_id in train_ids if sample_id not in found and sample_id not in skipped]
     if missing:
         raise ValueError(f"{len(missing)} training IDs not found: {', '.join(missing[:5])}")
@@ -199,8 +211,8 @@ def load_training_samples(data_root, train_ids, *, incomplete_policy="error", sk
     if skipped_incomplete is not None:
         skipped_incomplete.extend(skipped_records)
     if skipped:
-        print(f"共跳过 {len(skipped):,} 个问题或答案缺失的问答；"
-              "训练时会保存完整跳过清单，不会用占位符训练。", flush=True)
+        main_process_print(f"共跳过 {len(skipped):,} 个问题或答案缺失的问答；"
+                           "训练时会保存完整跳过清单，不会用占位符训练。", flush=True)
     if not found:
         raise ValueError("没有可训练的问答：选中的数据均缺少有效问题或答案。")
     return [found[sample_id] for sample_id in train_ids if sample_id in found]
@@ -321,17 +333,20 @@ class TrainingProgressCallback:
         )
         # 进度文字变短时补空格，清除上一行残留内容。
         self.last_render_length = max(self.last_render_length, len(message))
-        print(message.ljust(self.last_render_length), end="\r", flush=True)
+        if is_main_process():
+            print(message.ljust(self.last_render_length), end="\r", flush=True)
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.started = self.last_time = time.perf_counter()
         self.last_step = int(state.global_step)
         self.intervals.clear()
-        print(f"LoRA training: {state.max_steps:,} optimizer steps; effective batch={self.effective_batch_size}", flush=True)
-        self._render(state)
+        if is_main_process():
+            print(f"LoRA training: {state.max_steps:,} optimizer steps; "
+                  f"global effective batch={self.effective_batch_size}", flush=True)
+            self._render(state)
 
     def on_step_end(self, args, state, control, **kwargs):
-        if self.started is None or state.global_step <= self.last_step:
+        if not is_main_process() or self.started is None or state.global_step <= self.last_step:
             return
         now = time.perf_counter()
         self.intervals.append((state.global_step - self.last_step, max(now - self.last_time, 1e-9)))
@@ -342,21 +357,22 @@ class TrainingProgressCallback:
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         loss = (logs or {}).get("loss")
-        if isinstance(loss, (int, float)):
+        if is_main_process() and isinstance(loss, (int, float)):
             self.current_loss = float(loss)
             self._render(state)
 
     def on_train_end(self, args, state, control, **kwargs):
         self.elapsed_seconds = 0.0 if self.started is None else time.perf_counter() - self.started
-        print(flush=True)
-        print(f"LoRA training time: {format_duration(self.elapsed_seconds)} ({self.elapsed_seconds:.2f} s)", flush=True)
+        if is_main_process():
+            print(flush=True)
+            print(f"LoRA training time: {format_duration(self.elapsed_seconds)} ({self.elapsed_seconds:.2f} s)", flush=True)
 
 
-def output_is_safe(model_dir, output_dir):
+def output_is_safe(model_dir, output_dir, allow_existing=False):
     model_dir, output_dir = Path(model_dir).resolve(), Path(output_dir).resolve()
     if model_dir == output_dir or model_dir in output_dir.parents or output_dir in model_dir.parents:
         raise ValueError("Output must be outside the base model directory and its ancestors; base weights are protected.")
-    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+    if output_dir.exists() and (not output_dir.is_dir() or (any(output_dir.iterdir()) and not allow_existing)):
         raise ValueError(f"Output must be a new or empty directory: {output_dir}")
 
 
@@ -399,7 +415,7 @@ def prepare_samples(args):
             "source_splits": ["train"],
             "selection_mode": "full_train_split",
         }
-        print(f"未指定 split manifest；使用 train.csv 中全部训练问答：{len(train_ids):,} 组。", flush=True)
+        main_process_print(f"未指定 split manifest；使用 train.csv 中全部训练问答：{len(train_ids):,} 组。", flush=True)
     else:
         train_ids, manifest = load_split_manifest(args.split_manifest)
     selected = train_ids[:args.limit] if args.limit else train_ids
@@ -417,9 +433,9 @@ def prepare_samples(args):
         "skipped_incomplete_ids": [item["id"] for item in skipped],
         "skipped_incomplete_details": skipped,
     }
-    print(f"Manifest: {len(train_ids):,} train / {len(manifest.get('test_ids', [])):,} held-out test IDs; "
-          f"selected: {len(selected):,}; trainable: {len(samples):,}; skipped: {len(skipped):,}. "
-          "Images/captions are excluded.", flush=True)
+    main_process_print(f"Manifest: {len(train_ids):,} train / {len(manifest.get('test_ids', [])):,} held-out test IDs; "
+                       f"selected: {len(selected):,}; trainable: {len(samples):,}; skipped: {len(skipped):,}. "
+                       "Images/captions are excluded.", flush=True)
     return samples, manifest
 
 
@@ -431,7 +447,7 @@ def write_data_selection_audit(args):
                                                      if args.split_manifest is not None else None),
                                 "data_root": str(args.data_root), **args.data_selection_audit},
                                ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"数据筛选审计已保存：{path}", flush=True)
+    main_process_print(f"数据筛选审计已保存：{path}", flush=True)
 
 
 def prepare_tokens(args, samples):
@@ -443,7 +459,8 @@ def prepare_tokens(args, samples):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     features = []
-    with TerminalProgress("Tokenized QAs", len(samples)) as progress:
+    progress_class = TerminalProgress if is_main_process() else SilentProgress
+    with progress_class("Tokenized QAs", len(samples)) as progress:
         for index, sample in enumerate(samples, start=1):
             features.append(build_feature(sample, tokenizer, args.max_length, args.system_prompt))
             progress.update(index)
@@ -451,21 +468,26 @@ def prepare_tokens(args, samples):
     stats = {"min_tokens": min(lengths), "max_tokens": max(lengths),
              "mean_tokens": sum(lengths) / len(lengths),
              "supervised_tokens": sum(sum(label != -100 for label in f["labels"]) for f in features)}
-    print(f"Token lengths: min={min(lengths)}, max={max(lengths)}, mean={stats['mean_tokens']:.1f}; "
-          f"supervised answer/EOS tokens={stats['supervised_tokens']:,}", flush=True)
+    main_process_print(f"Token lengths: min={min(lengths)}, max={max(lengths)}, mean={stats['mean_tokens']:.1f}; "
+                       f"supervised answer/EOS tokens={stats['supervised_tokens']:,}", flush=True)
     return tokenizer, TextDataset(features), stats
 
 
 def device_and_dtype(args, torch):
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
-    if device == "cuda" and not torch.cuda.is_available():
+    if args.device == "auto":
+        device = f"cuda:{local_rank()}" if is_distributed() else (
+            "cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = f"cuda:{local_rank()}" if is_distributed() and args.device == "cuda" else args.device
+    is_cuda = device.startswith("cuda")
+    if is_cuda and not torch.cuda.is_available():
         raise ValueError("CUDA requested but unavailable; use --device cpu or a CUDA PyTorch environment.")
     name = args.dtype
     if name == "auto":
-        name = ("bfloat16" if torch.cuda.is_bf16_supported() else "float16") if device == "cuda" else "float32"
+        name = ("bfloat16" if torch.cuda.is_bf16_supported() else "float16") if is_cuda else "float32"
     if device == "cpu" and name != "float32":
         raise ValueError("CPU training uses float32; choose --dtype auto or float32.")
-    if device == "cuda" and name == "bfloat16" and not torch.cuda.is_bf16_supported():
+    if is_cuda and name == "bfloat16" and not torch.cuda.is_bf16_supported():
         raise ValueError("This CUDA device does not support bfloat16.")
     return device, name, getattr(torch, name)
 
@@ -473,7 +495,7 @@ def device_and_dtype(args, torch):
 def train(args):
     started = time.perf_counter()
     lines, problems = dependency_report()
-    print("\n".join(lines), flush=True)
+    main_process_print("\n".join(lines), flush=True)
     if problems:
         raise RuntimeError("Missing/incompatible training dependencies: " + ", ".join(problems) +
                            ". Install: python -m pip install \"torch>=2.1\" "
@@ -484,12 +506,12 @@ def train(args):
     from transformers import AutoModelForCausalLM, Trainer, TrainerCallback, TrainingArguments, set_seed
     from transformers.trainer_callback import PrinterCallback
 
-    output_is_safe(args.model_dir, args.output_dir)
+    run_on_main_process(lambda: output_is_safe(args.model_dir, args.output_dir), "LoRA 输出目录检查")
     set_seed(args.seed)
     samples, manifest = prepare_samples(args)
     tokenizer, dataset, stats = prepare_tokens(args, samples)
     device, dtype_name, dtype = device_and_dtype(args, torch)
-    print(f"Loading {args.model_dir} on {device} with {dtype_name}", flush=True)
+    main_process_print(f"Loading {args.model_dir} on {device} with {dtype_name}", flush=True)
     dtype_key = "dtype" if version_tuple(metadata.version("transformers")) >= (4, 56, 0) else "torch_dtype"
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir, local_files_only=True, low_cpu_mem_usage=True,
@@ -508,7 +530,8 @@ def train(args):
     if not trainable_names or any("lora_" not in name for name in trainable_names):
         raise RuntimeError("Expected only LoRA parameters to be trainable.")
     model.to(device)
-    model.print_trainable_parameters()
+    if is_main_process():
+        model.print_trainable_parameters()
     values = dict(
         output_dir=str(args.output_dir), per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps, num_train_epochs=args.epochs,
@@ -517,7 +540,7 @@ def train(args):
         logging_strategy="steps", logging_steps=1, logging_first_step=True,
         save_strategy="steps", save_steps=args.save_steps, save_total_limit=2,
         report_to="none", remove_unused_columns=False, dataloader_num_workers=0,
-        dataloader_pin_memory=device == "cuda", optim="adamw_torch",
+        dataloader_pin_memory=device.startswith("cuda"), optim="adamw_torch",
         bf16=dtype_name == "bfloat16", fp16=dtype_name == "float16", use_cpu=device == "cpu",
         seed=args.seed, data_seed=args.seed, disable_tqdm=True, label_names=["labels"],
         gradient_checkpointing=args.gradient_checkpointing,
@@ -531,7 +554,7 @@ def train(args):
     class ProgressCallback(TrainingProgressCallback, TrainerCallback):
         pass
 
-    progress = ProgressCallback(args.batch_size * args.gradient_accumulation_steps)
+    progress = ProgressCallback(args.batch_size * args.gradient_accumulation_steps * world_size())
     tokenizer_key = "processing_class" if "processing_class" in inspect.signature(Trainer.__init__).parameters else "tokenizer"
     trainer = Trainer(model=model, args=training_args, train_dataset=dataset,
                       data_collator=TextCollator(tokenizer.pad_token_id), callbacks=[progress],
@@ -539,11 +562,10 @@ def train(args):
     # disable_tqdm=True 会让 Trainer 添加 PrinterCallback 并逐步打印原始日志字典；
     # 移除它，只保留上面的单行训练进度显示。
     trainer.remove_callback(PrinterCallback)
-    write_data_selection_audit(args)
+    run_on_main_process(lambda: write_data_selection_audit(args), "训练数据审计文件写入")
     trainer.train()
     trainer.save_model(str(args.output_dir))
     trainer.save_state()
-    tokenizer.save_pretrained(args.output_dir)
     metadata_payload = {
         **args.data_selection_audit,
         "base_model_dir": str(args.model_dir),
@@ -559,7 +581,9 @@ def train(args):
         "lora": {"r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout, "targets": targets},
         "training": {"epochs": args.epochs, "max_steps": args.max_steps,
                      "completed_optimizer_steps": trainer.state.global_step,
-                     "batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                     "batch_size": args.batch_size, "world_size": world_size(),
+                     "global_effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world_size(),
+                     "gradient_accumulation_steps": args.gradient_accumulation_steps,
                      "learning_rate": args.learning_rate, "max_length": args.max_length,
                      "warmup_ratio": args.warmup_ratio, "weight_decay": args.weight_decay,
                      "gradient_checkpointing": args.gradient_checkpointing, "seed": args.seed,
@@ -568,16 +592,22 @@ def train(args):
         "elapsed_seconds_through_adapter_save": time.perf_counter() - started,
         "package_versions": {package: metadata.version(package) for package in REQUIRED_PACKAGES},
     }
-    (args.output_dir / "training_metadata.json").write_text(
-        json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    total = time.perf_counter() - started
-    print(f"Saved LoRA adapter/tokenizer: {args.output_dir}", flush=True)
-    print(f"Total time including data, loading, training and saving: {format_duration(total)} ({total:.2f} s)", flush=True)
+    def save_tokenizer_and_metadata() -> None:
+        tokenizer.save_pretrained(args.output_dir)
+        (args.output_dir / "training_metadata.json").write_text(
+            json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        total = time.perf_counter() - started
+        print(f"Saved LoRA adapter/tokenizer: {args.output_dir}", flush=True)
+        print(f"Total time including data, loading, training and saving: {format_duration(total)} ({total:.2f} s)", flush=True)
+
+    run_on_main_process(save_tokenizer_and_metadata, "tokenizer/metadata 保存")
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=None,
+                        help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-env", action="store_true", help="Check packages/CUDA only; do not load model weights.")
     mode.add_argument("--dry-run", action="store_true", help="Validate all selected IDs/QA text, without ML dependencies.")
@@ -627,8 +657,8 @@ def validate_args(args):
         "epochs", "learning_rate", "warmup_ratio", "weight_decay", "lora_dropout"
     )) or args.epochs <= 0 or args.learning_rate <= 0 or not 0 <= args.warmup_ratio <= 1 or args.weight_decay < 0 or not 0 <= args.lora_dropout < 1:
         raise ValueError("Invalid epochs, learning rate, warmup, weight decay or dropout.")
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise ValueError("Use python in a single process; distributed launch is not supported.")
+    if is_distributed() and args.device == "cpu":
+        raise ValueError("多 GPU DDP 不支持 --device cpu；请使用 --device auto 或 cuda。")
     targets = [item.strip() for item in args.target_modules.split(",") if item.strip()]
     if not targets or set(targets) - set(TARGET_MODULES.split(",")):
         raise ValueError(f"--target-modules must use Qwen2 projection names from: {TARGET_MODULES}")
@@ -636,7 +666,10 @@ def validate_args(args):
     for name in ("model_dir", "split_manifest", "output_dir"):
         value = getattr(args, name)
         setattr(args, name, value.expanduser().resolve() if value is not None else None)
-    output_is_safe(args.model_dir, args.output_dir)
+    # 多进程时目录空/非空状态由 rank 0 在训练阶段统一检查，避免其余进程
+    # 因 rank 0 已写入审计文件而误判输出目录不是空目录。
+    if not is_distributed():
+        output_is_safe(args.model_dir, args.output_dir)
     config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
     if config.get("model_type") != "qwen2" or "Qwen2ForCausalLM" not in config.get("architectures", []):
         raise ValueError("This script targets the local DeepSeek Qwen2ForCausalLM text model.")
@@ -650,29 +683,35 @@ def main(argv=None):
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     try:
+        set_local_rank_from_argument(args.local_rank)
         if args.check_env:
             lines, problems = dependency_report()
-            print("\n".join(lines))
+            main_process_print("\n".join(lines))
             if problems:
-                print('Install with: python -m pip install "torch>=2.1" '
-                      '"transformers>=4.44,<6" "peft>=0.12,<0.21" '
-                      '"accelerate>=0.33,<2" "safetensors>=0.4.3"')
+                main_process_print('Install with: python -m pip install "torch>=2.1" '
+                                   '"transformers>=4.44,<6" "peft>=0.12,<0.21" '
+                                   '"accelerate>=0.33,<2" "safetensors>=0.4.3"')
             return 1 if problems else 0
+        if is_distributed() and (args.dry_run or args.check_data):
+            raise ValueError("dry-run/check-data 不需要多 GPU；请使用普通 python 命令执行检查。")
+        setup_distributed()
         validate_args(args)
         if args.dry_run or args.check_data:
             samples, _ = prepare_samples(args)
             if args.check_data:
                 prepare_tokens(args, samples)
-            print("Validation complete; no model weights loaded and no files written.", flush=True)
+            main_process_print("Validation complete; no model weights loaded and no files written.", flush=True)
         else:
             train(args)
         return 0
     except KeyboardInterrupt:
-        print("Interrupted; the original model weights were not modified.", flush=True)
+        main_process_print("Interrupted; the original model weights were not modified.", flush=True)
         return 130
     except (OSError, ValueError, RuntimeError, csv.Error, ImportError) as error:
-        print(f"Error: {error}", file=sys.stderr, flush=True)
+        print(f"rank {os.environ.get('RANK', '0')} error: {error}", file=sys.stderr, flush=True)
         return 1
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
