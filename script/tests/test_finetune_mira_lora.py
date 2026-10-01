@@ -121,6 +121,13 @@ class UnifiedFinetuneTests(unittest.TestCase):
         self.assertEqual(args.limit, 3)
         self.assertFalse(args.gradient_checkpointing)
 
+    def test_existing_output_policy_reaches_both_backends(self):
+        for model in ("DeepSeek-Model", "Qwen3-VL-2B-Instruct"):
+            with self.subTest(model=model):
+                payload = {"model": model, "model_arguments": {model: {"on_existing_output": "overwrite"}}}
+                backend, argv = unified.resolve_backend_argv(payload, [])
+                self.assertEqual(backend.build_parser().parse_args(argv).on_existing_output, "overwrite")
+
     def test_deepseek_default_incomplete_samples_policy_is_skip(self):
         backend, argv = unified.resolve_backend_argv({"model": "DeepSeek-Model"}, [])
         self.assertEqual(backend.build_parser().parse_args(argv).incomplete_samples, "skip")

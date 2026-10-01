@@ -187,6 +187,36 @@ class ManifestAndDataTests(unittest.TestCase):
             finetune.output_is_safe(self.root / "base", output_dir)
         finetune.output_is_safe(self.root / "base", output_dir, allow_existing=True)
 
+    def test_overwrite_policy_reuses_existing_output_directory(self):
+        model_dir = self.root / "base"
+        output_dir = self.root / "adapter"
+        model_dir.mkdir()
+        output_dir.mkdir()
+        sentinel = output_dir / "stale.txt"
+        sentinel.write_text("old", encoding="utf-8")
+        args = finetune.build_parser().parse_args([
+            "--model-dir", str(model_dir), "--output-dir", str(output_dir),
+            "--on-existing-output", "overwrite",
+        ])
+        self.assertEqual(finetune.select_output_directory(args), output_dir.resolve())
+        finetune.clear_output_directory(output_dir)
+        self.assertFalse(sentinel.exists())
+
+    def test_new_policy_keeps_existing_output_and_selects_sibling(self):
+        model_dir = self.root / "base"
+        output_dir = self.root / "adapter"
+        model_dir.mkdir()
+        output_dir.mkdir()
+        sentinel = output_dir / "stale.txt"
+        sentinel.write_text("old", encoding="utf-8")
+        args = finetune.build_parser().parse_args([
+            "--model-dir", str(model_dir), "--output-dir", str(output_dir),
+            "--on-existing-output", "new",
+        ])
+        selected = finetune.select_output_directory(args)
+        self.assertNotEqual(selected, output_dir.resolve())
+        self.assertTrue(sentinel.exists())
+
 
 class ProgressTests(unittest.TestCase):
     def test_duration_formats_elapsed_time_and_unknown_eta(self):

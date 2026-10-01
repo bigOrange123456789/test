@@ -38,9 +38,9 @@ CUDA 版 ``MLMtest`` 环境中使用统一入口：
       ``--max-pixels`` 降至 131072；默认每图像素预算为 4096～262144。
     - 默认输出 ``output/qwen3_vl_2b_lora_adapter``，包含 adapter、processor、
       tokenizer、training_metadata.json、trainer_state.json 和 checkpoint。脚本
-      不会向原模型目录写入或合并权重。若目录已有结果，默认改用相邻的
-      ``原目录名_run_年月日_时分秒``，保留旧结果；``--on-existing-output error``
-      可恢复遇到非空目录即停止的行为。实际保存路径会打印到控制台。
+      不会向原模型目录写入或合并权重。若目录已有结果，默认清理该目录后覆盖写入；
+      ``--on-existing-output new`` 可另选带时间戳的新目录，
+      ``error`` 可在目录非空时停止。实际保存路径会打印到控制台。
     - 可用 ``--resume-from-checkpoint`` 恢复训练，但应保持相同清单、模型、数据
       和训练设置。最终 adapter 不是独立完整模型；推理时需加载同一 Qwen3-VL
       基座，再用 ``PeftModel.from_pretrained`` 加载 adapter。
@@ -78,14 +78,16 @@ from embed_mira_chroma import DEFAULT_DATA_ROOT, Sample, image_path, iter_sample
 try:
     from .terminal_progress import TerminalProgress
     from .distributed_training import (
-        cleanup_distributed, is_distributed, is_main_process, set_local_rank_from_argument,
-        main_process_print, run_on_main_process, setup_distributed, world_size,
+        cleanup_distributed, clear_output_directory, is_distributed, is_main_process,
+        set_local_rank_from_argument, main_process_print, run_on_main_process,
+        setup_distributed, world_size,
     )
 except ImportError:  # 兼容直接导入本脚本的离线测试和旧调用方式
     from terminal_progress import TerminalProgress
     from distributed_training import (
-        cleanup_distributed, is_distributed, is_main_process, set_local_rank_from_argument,
-        main_process_print, run_on_main_process, setup_distributed, world_size,
+        cleanup_distributed, clear_output_directory, is_distributed, is_main_process,
+        set_local_rank_from_argument, main_process_print, run_on_main_process,
+        setup_distributed, world_size,
     )
 
 
@@ -565,11 +567,12 @@ def output_is_safe(model_dir: Path, output_dir: Path, allow_existing: bool = Fal
 
 
 def select_output_directory(args: argparse.Namespace) -> Path:
-    """遇到旧结果时另选新目录；只计算路径，不在参数检查或 dry-run 中创建文件。"""
+    """根据覆盖策略选择输出目录；不在参数检查或 dry-run 中清理文件。"""
     requested = args.output_dir
     # 先拒绝与基座重叠及非目录路径，不能靠自动改名绕过保护。
     output_is_safe(args.model_dir, requested, allow_existing=True)
-    if args.resume_from_checkpoint or args.allow_existing_output:
+    if (args.resume_from_checkpoint or args.allow_existing_output
+            or args.on_existing_output == "overwrite"):
         return requested
     if not requested.exists() or not any(requested.iterdir()):
         return requested
@@ -635,8 +638,14 @@ def train(args: argparse.Namespace) -> None:
     """Resolve IDs, load LoRA model, train, and save only adapter artifacts."""
     started = time.perf_counter()
     ensure_dependencies()
-    output_is_safe(args.model_dir, args.output_dir, args.allow_existing_output)
-    if getattr(args, "_auto_output_dir", False):
+    output_is_safe(args.model_dir, args.output_dir, allow_existing=True)
+    if getattr(args, "_clear_output", False):
+        # 覆盖模式只由主进程清理，避免多卡同时删除同一目录。
+        run_on_main_process(
+            lambda: clear_output_directory(args.output_dir),
+            "清理旧 LoRA 输出目录",
+        )
+    elif getattr(args, "_auto_output_dir", False):
         # 仅 rank 0 创建自动选出的目录，并广播创建结果，避免并发创建竞争。
         run_on_main_process(
             lambda: args.output_dir.mkdir(parents=True, exist_ok=False),
@@ -764,8 +773,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="不使用 ID 清单，使用 MIRA 数据目录 train.csv 中的全部问答。")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "qwen3_vl_2b_lora_adapter",
                         help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
-    parser.add_argument("--on-existing-output", choices=("new", "error"), default="new",
-                        help="输出目录非空时：new 自动另选带时间戳的新目录（默认）；error 停止。续训不改目录。")
+    parser.add_argument("--on-existing-output", choices=("overwrite", "new", "error"), default="overwrite",
+                        help="输出目录非空时：overwrite 清理后覆盖（默认）；new 另选目录；error 停止。续训不改目录。")
     parser.add_argument("--allow-existing-output", action="store_true", help="Allow saving into a nonempty adapter directory.")
     parser.add_argument("--resume-from-checkpoint", default=None, help="Trainer checkpoint directory to resume.")
     parser.add_argument("--limit", type=int, default=0, help="Use only the first N manifest IDs for a debug run; 0 means all.")
@@ -843,6 +852,10 @@ def validate_args(args: argparse.Namespace) -> None:
     else:
         args.output_dir = select_output_directory(args)
     args._auto_output_dir = args.output_dir != requested_output
+    args._clear_output = bool(
+        not args.resume_from_checkpoint
+        and (args.on_existing_output == "overwrite" or args.allow_existing_output)
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

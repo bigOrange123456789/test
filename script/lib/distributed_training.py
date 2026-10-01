@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -39,6 +41,18 @@ def validate_local_gpu_count(local_size: int, device_count: int) -> None:
             f"LOCAL_WORLD_SIZE={local_size} 大于当前进程可见 GPU 数量 {device_count}；"
             "请减少 torchrun --nproc_per_node，或检查 CUDA_VISIBLE_DEVICES。"
         )
+
+
+def clear_output_directory(path: str | Path) -> None:
+    """清理训练输出目录内容，但保留目录本身。"""
+    directory = Path(path).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    for child in directory.iterdir():
+        # 符号链接只删除链接本身，避免误删链接目标。
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def is_distributed() -> bool:

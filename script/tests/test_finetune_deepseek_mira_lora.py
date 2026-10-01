@@ -440,6 +440,33 @@ class ManifestAndDataTests(unittest.TestCase):
             finetune.output_is_safe(model_dir, output_file)
         self.assertEqual(output_file.read_text(encoding="ascii"), "preserve")
 
+    def test_overwrite_policy_clears_existing_output(self):
+        model_dir = self.root / "base"
+        output_dir = self.root / "adapter"
+        model_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        sentinel = output_dir / "stale.txt"
+        sentinel.write_text("old", encoding="utf-8")
+        args = finetune.build_parser().parse_args([
+            "--model-dir", str(model_dir), "--output-dir", str(output_dir),
+            "--on-existing-output", "overwrite",
+        ])
+        finetune.prepare_output_directory(args)
+        self.assertFalse(sentinel.exists())
+
+    def test_error_policy_rejects_existing_output(self):
+        model_dir = self.root / "base"
+        output_dir = self.root / "adapter"
+        model_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        (output_dir / "stale.txt").write_text("old", encoding="utf-8")
+        args = finetune.build_parser().parse_args([
+            "--model-dir", str(model_dir), "--output-dir", str(output_dir),
+            "--on-existing-output", "error",
+        ])
+        with self.assertRaises(ValueError):
+            finetune.prepare_output_directory(args)
+
 
 class FakeTokenizer:
     """DeepSeek-like template: generation opens thinking; assistant strips it."""

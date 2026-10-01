@@ -43,8 +43,9 @@
       output/deepseek_mira_smoke_adapter``。显存不足时保持 batch size 1，并可降低
      最大长度，但应先用 ``--check-data`` 确认完整答案仍能容纳。
     - 默认输出 ``output/deepseek_mira_lora_adapter``，包含 adapter、tokenizer、
-      training_metadata.json、trainer_state.json 和定期 checkpoint。输出目录必须
-      不存在或为空，且不得是基座模型目录、其父目录或子目录；不会覆盖原模型。
+      training_metadata.json、trainer_state.json 和定期 checkpoint。若目录已有结果，
+      默认清理后覆盖写入；``--on-existing-output error`` 可在目录非空时停止。目录
+      不得是基座模型目录、其父目录或子目录；不会覆盖原模型。
     - adapter 不是完整模型。推理时先加载同一 DeepSeek 基座，再通过
       ``PeftModel.from_pretrained(base, adapter_dir)`` 加载 adapter。比较微调前后
       应使用相同问题、直接回答前缀和生成参数，避免聊天模板额外插入 <think>。
@@ -84,7 +85,7 @@ from embed_mira_chroma import iter_samples  # noqa: E402
 try:
     from .terminal_progress import TerminalProgress
     from .distributed_training import (
-        cleanup_distributed, is_distributed, is_main_process, local_rank,
+        cleanup_distributed, clear_output_directory, is_distributed, is_main_process, local_rank,
         main_process_print, run_on_main_process, set_local_rank_from_argument,
         setup_distributed, world_size,
         SilentProgress,
@@ -92,7 +93,7 @@ try:
 except ImportError:  # 兼容直接导入本脚本的离线测试和旧调用方式
     from terminal_progress import TerminalProgress
     from distributed_training import (
-        cleanup_distributed, is_distributed, is_main_process, local_rank,
+        cleanup_distributed, clear_output_directory, is_distributed, is_main_process, local_rank,
         main_process_print, run_on_main_process, set_local_rank_from_argument,
         setup_distributed, world_size,
         SilentProgress,
@@ -376,6 +377,15 @@ def output_is_safe(model_dir, output_dir, allow_existing=False):
         raise ValueError(f"Output must be a new or empty directory: {output_dir}")
 
 
+def prepare_output_directory(args):
+    """在正式训练前按策略准备输出目录；不会触碰基座模型目录。"""
+    output_is_safe(args.model_dir, args.output_dir, allow_existing=True)
+    if args.on_existing_output == "error" and args.output_dir.exists() and any(args.output_dir.iterdir()):
+        output_is_safe(args.model_dir, args.output_dir, allow_existing=False)
+    if args.on_existing_output == "overwrite":
+        clear_output_directory(args.output_dir)
+
+
 def version_tuple(version):
     values = [int(part) for part in re.findall(r"\d+", version.split("+", 1)[0])[:3]]
     return tuple(values + [0] * (3 - len(values)))
@@ -506,7 +516,7 @@ def train(args):
     from transformers import AutoModelForCausalLM, Trainer, TrainerCallback, TrainingArguments, set_seed
     from transformers.trainer_callback import PrinterCallback
 
-    run_on_main_process(lambda: output_is_safe(args.model_dir, args.output_dir), "LoRA 输出目录检查")
+    run_on_main_process(lambda: prepare_output_directory(args), "准备 LoRA 输出目录")
     set_seed(args.seed)
     samples, manifest = prepare_samples(args)
     tokenizer, dataset, stats = prepare_tokens(args, samples)
@@ -621,6 +631,8 @@ def build_parser():
     parser.add_argument("--data-root", type=Path, help="Default: manifest data_root, then G:/Codex_dataset/MIRA-data.")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "deepseek_mira_lora_adapter",
                         help="LoRA 保存目录；默认写入项目 output，不覆盖基座权重。")
+    parser.add_argument("--on-existing-output", choices=("overwrite", "error"), default="overwrite",
+                        help="输出目录非空时：overwrite 清理后覆盖（默认）；error 停止。")
     parser.add_argument("--limit", type=int, default=0, help="First N train_ids for a short experiment; 0 uses all.")
     parser.add_argument("--incomplete-samples", choices=("skip", "error"), default="skip",
                         help="原始问答缺少问题或答案时：skip 跳过并记录（默认），error 立即停止。")
@@ -669,7 +681,7 @@ def validate_args(args):
     # 多进程时目录空/非空状态由 rank 0 在训练阶段统一检查，避免其余进程
     # 因 rank 0 已写入审计文件而误判输出目录不是空目录。
     if not is_distributed():
-        output_is_safe(args.model_dir, args.output_dir)
+        output_is_safe(args.model_dir, args.output_dir, allow_existing=True)
     config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
     if config.get("model_type") != "qwen2" or "Qwen2ForCausalLM" not in config.get("architectures", []):
         raise ValueError("This script targets the local DeepSeek Qwen2ForCausalLM text model.")

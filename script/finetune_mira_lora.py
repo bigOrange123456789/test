@@ -55,10 +55,11 @@ JSON 中的相对路径以配置文件所在目录为基准；临时命令行路
 若所选模型档案中的 ``split_manifest`` 为 ``null``，则不读取 ID 清单，直接使用
 MIRA 数据目录 ``train.csv`` 中全部训练问答；validation/test 数据仍不会用于训练。
 
-Qwen 配置可设置 ``on_existing_output: "new"``（默认）：若输出目录已有结果，
-自动另存到相邻的 ``原目录名_run_年月日_时分秒``，保留之前的微调参数；
-``"error"`` 则停止并提示修改目录。断点续训继续使用原输出目录。训练开始和结束
-都会打印实际保存位置；评估新结果时，将评估 JSON 的 ``pathLora`` 指向该位置。
+Qwen 配置可设置 ``on_existing_output: "overwrite"``（默认）：若输出目录已有结果，
+训练前清理目录并覆盖写入；``"new"`` 自动另存到相邻的
+``原目录名_run_年月日_时分秒``，``"error"`` 则停止。DeepSeek 支持
+``overwrite``（默认）和 ``error``。断点续训继续使用原输出目录且不会清理检查点。
+训练开始和结束都会打印实际保存位置；评估新结果时，将评估 JSON 的 ``pathLora`` 指向该位置。
 Qwen 配置中的 ``validate_image_token_inputs`` 默认是 ``true``；设为 ``false`` 可跳过
 训练开始前逐条运行图像/token 处理器的预检查，减少启动等待，但部分输入错误可能会在训练中才出现。
 
