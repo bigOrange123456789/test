@@ -134,8 +134,10 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import warnings
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -168,6 +170,40 @@ except ImportError:
 LOGGER = logging.getLogger("rag_eval")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("evaluate_rag.json")
+
+
+class _HideTruncationWarningsFromConsole(logging.Filter):
+    """截断明细仍写文件日志，但不让逐条 WARNING 打断 tqdm。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "rag_eval_truncation", False)
+
+
+def _install_progress_log_filter() -> None:
+    """只过滤控制台 handler；FileHandler 继续完整记录截断详情。"""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            if not any(isinstance(item, _HideTruncationWarningsFromConsole) for item in handler.filters):
+                handler.addFilter(_HideTruncationWarningsFromConsole())
+
+
+def _truncation_snapshot(generator) -> dict[int, int]:
+    """便于测试替身或其他自定义生成器未实现计数器时继续评估。"""
+    snapshot = getattr(generator, "truncation_snapshot", None)
+    return snapshot() if callable(snapshot) else {}
+
+
+def _report_truncations(generator, previous: dict[int, int], description: str) -> None:
+    """在进度条关闭后汇总该阶段新增的截断次数。"""
+    current = _truncation_snapshot(generator)
+    delta = {limit: count - previous.get(limit, 0)
+             for limit, count in current.items() if count > previous.get(limit, 0)}
+    total = sum(delta.values())
+    if not total:
+        tqdm.write(f"[截断汇总] {description}：0 次。")
+        return
+    detail = "，".join(f"max_new_tokens={limit}: {count} 次" for limit, count in sorted(delta.items()))
+    tqdm.write(f"[截断汇总] {description}：共 {total} 次（{detail}）；逐条详情见日志文件。")
 MODEL_DIRECTORIES = {
     "Qwen3-VL-2B-Instruct": PROJECT_ROOT / "Qwen3-VL-2B-Instruct",
     "DeepSeek-Model": PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B",
@@ -862,8 +898,24 @@ class QwenGenerator:
         self.device = None
         self.last_generation_info = {}
         self._budget_tokenizer = None
+        self._truncation_counts = Counter()
+        self._truncation_lock = threading.Lock()
         if getattr(args, "text_only", False):
             self.supports_images = False
+
+    def truncation_snapshot(self) -> dict[int, int]:
+        """返回各 max_new_tokens 上限的截断次数快照。"""
+        with self._truncation_lock:
+            return dict(self._truncation_counts)
+
+    def _record_truncation(self, max_new_tokens: int, input_tokens: int,
+                           output_tokens: int, elapsed_seconds: float) -> None:
+        with self._truncation_lock:
+            self._truncation_counts[max_new_tokens] += 1
+        LOGGER.warning(
+            "%s 生成达到 max_new_tokens=%d；输出可能被截断（输入token=%d，输出token=%d，耗时=%.1f秒）。",
+            self.args.model, max_new_tokens, input_tokens, output_tokens, elapsed_seconds,
+            extra={"rag_eval_truncation": True})
 
     def _load(self):
         if self.model is not None:
@@ -922,7 +974,8 @@ class QwenGenerator:
                                               clean_up_tokenization_spaces=False)[0].strip()
             hit_limit = _hit_generation_limit(answer_ids[0], max_new_tokens, self.generation_config)
             if hit_limit:
-                LOGGER.warning("生成达到 max_new_tokens=%d；输出可能被截断。", max_new_tokens)
+                self._record_truncation(max_new_tokens, int(prefix_length), int(answer_ids.shape[1]),
+                                        time.perf_counter() - started)
             self.last_generation_info = {
                 "input_tokens": int(prefix_length), "output_tokens": int(answer_ids.shape[1]),
                 "hit_token_limit": hit_limit, "max_new_tokens": max_new_tokens,
@@ -1028,7 +1081,8 @@ class DeepSeekGenerator(QwenGenerator):
         answer_ids = generated[0, inputs["input_ids"].shape[1]:]
         hit_limit = _hit_generation_limit(answer_ids, max_new_tokens, self.generation_config)
         if hit_limit:
-            LOGGER.warning("DeepSeek 生成达到 max_new_tokens=%d；输出可能被截断。", max_new_tokens)
+            self._record_truncation(max_new_tokens, int(inputs["input_ids"].shape[1]), len(answer_ids),
+                                    time.perf_counter() - started)
         self.last_generation_info = {
             "input_tokens": int(inputs["input_ids"].shape[1]), "output_tokens": int(len(answer_ids)),
             "hit_token_limit": hit_limit, "max_new_tokens": max_new_tokens,
@@ -1801,7 +1855,11 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
         for kind, samples in groups:
             if samples:
                 description = f"{config['name']} / {QUESTION_TYPE_LABELS[kind]}" if kind else config["name"]
-                yield from tqdm(samples, desc=description)
+                previous = _truncation_snapshot(llm)
+                try:
+                    yield from tqdm(samples, desc=description)
+                finally:
+                    _report_truncations(llm, previous, description)
 
     with generation_path.open("a", encoding="utf-8") as generations, \
             output_temp.open("w", encoding="utf-8") as predictions:
@@ -2065,6 +2123,7 @@ def run_evaluation(args, prepared=None) -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[logging.StreamHandler(), logging.FileHandler(output / "eval.log", encoding="utf-8")],
         force=True)
+    _install_progress_log_filter()
     llm = None
     run_manifest = None
     metrics_complete = False
@@ -2333,6 +2392,15 @@ def run_semantic_scoring(jobs, runs) -> None:
     judge_model = None
     scorer = None
     started = time.perf_counter()
+    truncation_log = Path(args.suite_output_dir) / "truncation_details.log"
+    truncation_log.parent.mkdir(parents=True, exist_ok=True)
+    truncation_handler = logging.FileHandler(truncation_log, encoding="utf-8")
+    truncation_handler.setLevel(logging.WARNING)
+    truncation_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    truncation_handler.addFilter(lambda record: getattr(record, "rag_eval_truncation", False))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(truncation_handler)
+    _install_progress_log_filter()
     try:
         for job, run in eligible_runs:
             job_started = time.perf_counter()
@@ -2358,13 +2426,19 @@ def run_semantic_scoring(jobs, runs) -> None:
                     print(f"\n统一评分：固定原版 {judge_args.model}；" +
                           ("开放题拆分原子事实，再按参考答案逐条二元核验。" if use_atomic else "每题一次参考答案比较。") +
                           "相同内容复用评分缓存。", flush=True)
-                for row in tqdm(required, desc=f"{job.run_name} {'FActScore' if use_atomic else '语义评分'}"):
-                    answers = row["answer_details"]
-                    # 文字相似度只比较答案字段；语义裁判还检查医学解释，不能仅把选项字母交给它。
-                    sample = {**row, "evaluation_reference": answers["semantic_reference"]}
-                    details = scorer.score(sample, answers["semantic_prediction"])
-                    row["factscore_details" if use_atomic else "semantic_details"] = details
-                    row["factscore" if use_atomic else "semantic_score"] = details["score"]
+                description = f"{job.run_name} {'FActScore' if use_atomic else '语义评分'}"
+                previous = _truncation_snapshot(judge_model) if required else {}
+                try:
+                    for row in tqdm(required, desc=description):
+                        answers = row["answer_details"]
+                        # 文字相似度只比较答案字段；语义裁判还检查医学解释，不能仅把选项字母交给它。
+                        sample = {**row, "evaluation_reference": answers["semantic_reference"]}
+                        details = scorer.score(sample, answers["semantic_prediction"])
+                        row["factscore_details" if use_atomic else "semantic_details"] = details
+                        row["factscore" if use_atomic else "semantic_score"] = details["score"]
+                finally:
+                    if required and judge_model is not None:
+                        _report_truncations(judge_model, previous, description)
                 summary["judge_identity"] = identity
                 update_summary(summary, rows, job)
                 save_scored_rows(directory, summary, rows)
@@ -2389,6 +2463,8 @@ def run_semantic_scoring(jobs, runs) -> None:
             write_suite_comparison(Path(args.suite_output_dir), runs, status="scoring",
                                    elapsed=sum(item["elapsed_seconds"] for item in runs))
     finally:
+        root_logger.removeHandler(truncation_handler)
+        truncation_handler.close()
         if judge_model is not None:
             judge_model.close()
         LOGGER.info("统一裁判评分总耗时 %.1f 秒。", time.perf_counter() - started)

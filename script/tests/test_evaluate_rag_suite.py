@@ -4,6 +4,7 @@ from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import copy
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -258,6 +259,40 @@ class EvaluationSuiteTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(messages, [])
         self.assertFalse(self.output.exists())
+
+    def test_truncation_warning_is_logged_but_hidden_from_console(self):
+        console = io.StringIO()
+        details = self.root / "truncation.log"
+        stream_handler = logging.StreamHandler(console)
+        file_handler = logging.FileHandler(details, encoding="utf-8")
+        root = logging.getLogger()
+        old_level = root.level
+        root.setLevel(logging.WARNING)
+        root.addHandler(stream_handler)
+        root.addHandler(file_handler)
+        try:
+            evaluation._install_progress_log_filter()
+            evaluation.LOGGER.warning("达到 token 上限", extra={"rag_eval_truncation": True})
+            evaluation.LOGGER.warning("其他告警仍应显示")
+        finally:
+            root.removeHandler(stream_handler)
+            root.removeHandler(file_handler)
+            stream_handler.close()
+            file_handler.close()
+            root.setLevel(old_level)
+        self.assertNotIn("达到 token 上限", console.getvalue())
+        self.assertIn("其他告警仍应显示", console.getvalue())
+        self.assertIn("达到 token 上限", details.read_text(encoding="utf-8"))
+
+    def test_truncation_summary_reports_counts_by_token_limit(self):
+        generator = SimpleNamespace(truncation_snapshot=lambda: {1024: 2, 8192: 1})
+        with patch.object(evaluation.tqdm, "write") as write:
+            evaluation._report_truncations(generator, {1024: 1}, "测试开放题")
+        write.assert_called_once()
+        message = write.call_args.args[0]
+        self.assertIn("共 2 次", message)
+        self.assertIn("max_new_tokens=1024: 1 次", message)
+        self.assertIn("max_new_tokens=8192: 1 次", message)
 
 
 if __name__ == "__main__":
