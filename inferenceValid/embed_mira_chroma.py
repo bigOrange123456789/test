@@ -20,13 +20,36 @@ from typing import Any, Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROMPT_CONFIG_PATH = PROJECT_ROOT / "prompts.json"
 DEFAULT_DATA_ROOT = Path(r"G:\Codex_dataset\MIRA-data")
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "Qwen3-VL-Embedding-2B"
 CATEGORIES = ("open_ended", "closed_ended", "single_choice", "multiple_choice")
 DIMENSION = 2048
 PIPELINE_VERSION = 1
-INSTRUCTION = "Represent the user's input."
 LOGGER = logging.getLogger("mira")
+
+
+def _configured_prompt(path: str, fallback: str) -> str:
+    """读取项目统一提示词；配置不存在或字段缺失时保留旧默认值。"""
+    try:
+        lib_dir = PROJECT_ROOT / "script" / "lib"
+        if str(lib_dir) not in sys.path:
+            sys.path.insert(0, str(lib_dir))
+        from prompt_config import prompt as get_prompt
+        return str(get_prompt(path, default=fallback))
+    except FileNotFoundError:
+        return fallback
+
+
+INSTRUCTION = _configured_prompt("embedding.instruction", "Represent the user's input.")
+DOCUMENT_TEMPLATE = _configured_prompt(
+    "embedding.document_template", "Question: {question}{options}Answer: {answer}"
+)
+OPTIONS_TEMPLATE = _configured_prompt("embedding.options_template", "Options: {options}")
+ADDITIONAL_FIELDS_TEMPLATE = _configured_prompt(
+    "embedding.additional_fields_template", "Additional source fields: {fields}"
+)
+CAPTION_TEMPLATE = _configured_prompt("embedding.caption_template", "Caption: {caption}")
 
 
 def json_text(value: Any) -> str:
@@ -109,17 +132,21 @@ class Sample:
 
     def document(self, include_caption: bool = False) -> str:
         """保留问题、选项和完整答案，包括答案解释及视觉证据。"""
-        parts = [f"Question: {self.question or '[not provided in source]'}"]
-        if self.options:
-            parts.append(f"Options: {json_text(self.options)}")
+        question = self.question or "[not provided in source]"
         answer = self.answer if isinstance(self.answer, str) else json_text(self.answer)
         if "answer" in self.missing_fields:
             answer = "[not provided in source]"
-        parts.append(f"Answer: {answer}")
+        try:
+            options = ("\n" + OPTIONS_TEMPLATE.format(options=json_text(self.options)) + "\n") if self.options else "\n"
+            base = DOCUMENT_TEMPLATE.format(question=question, options=options, answer=answer)
+        except (KeyError, ValueError):
+            LOGGER.warning("embedding.document_template 格式无效，已回退默认模板。")
+            base = f"Question: {question}\nAnswer: {answer}"
+        parts = [base]
         if self.extra:
-            parts.append(f"Additional source fields: {json_text(self.extra)}")
+            parts.append(ADDITIONAL_FIELDS_TEMPLATE.format(fields=json_text(self.extra)))
         if include_caption and self.caption:
-            parts.append(f"Caption: {self.caption}")
+            parts.append(CAPTION_TEMPLATE.format(caption=self.caption))
         return "\n".join(parts)
 
     def metadata(self) -> dict[str, Any]:
@@ -267,6 +294,10 @@ def pipeline_config(args: argparse.Namespace) -> dict[str, Any]:
     return {"version": PIPELINE_VERSION, "data_root": str(args.data_root),
             "sources": {split: sha256_file(args.data_root / f"{split}.csv") for split in args.splits},
             "model": model_identity(args.model_dir), "instruction": INSTRUCTION,
+            "document_template": DOCUMENT_TEMPLATE,
+            "options_template": OPTIONS_TEMPLATE,
+            "include_caption_template": CAPTION_TEMPLATE,
+            "additional_fields_template": ADDITIONAL_FIELDS_TEMPLATE,
             "dimension": DIMENSION, "pooling": "last_nonpadding_token_l2", "dtype": args.dtype,
             "context_policy": "no_truncation", "min_pixels": args.min_pixels,
             "max_pixels": args.max_pixels, "include_caption": args.include_caption}

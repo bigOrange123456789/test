@@ -68,12 +68,30 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SCRIPT_DIR.parent
+LIB_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
 if str(INFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(INFERENCE_DIR))
 
 from embed_mira_chroma import DEFAULT_DATA_ROOT, Sample, image_path, iter_samples  # noqa: E402
+
+try:
+    from prompt_config import prompt as _prompt_value  # noqa: E402
+except ImportError:  # 兼容从项目根目录以旧方式导入
+    _prompt_value = None
+
+
+def configured_prompt(path: str, fallback: str) -> str:
+    """读取根目录 prompts.json；缺少配置时回退到内置提示词。"""
+    if _prompt_value is None:
+        return fallback
+    try:
+        return str(_prompt_value(path, default=fallback))
+    except (FileNotFoundError, ValueError, KeyError):
+        return fallback
 
 try:
     from .terminal_progress import TerminalProgress
@@ -100,7 +118,12 @@ REQUIRED_PACKAGES = {
     "safetensors": "0.4.3",
     "Pillow": "10.0.0",
 }
-DEFAULT_SYSTEM_PROMPT = "你是一名谨慎的医学视觉问答助手。请根据问题和图片给出准确、清晰的回答。"
+DEFAULT_SYSTEM_PROMPT = configured_prompt(
+    "finetune.qwen_system",
+    "你是一名谨慎的医学视觉问答助手。请根据问题和图片给出准确、清晰的回答。",
+)
+QUESTION_TEMPLATE = configured_prompt("finetune.question_template", "Question: {question}")
+OPTIONS_TEMPLATE = configured_prompt("finetune.options_template", "\nOptions: {options}")
 
 
 def parse_version(version: str) -> tuple[int, ...]:
@@ -224,10 +247,10 @@ def json_text(value: Any) -> str:
 def sample_question(sample: Sample) -> str:
     """Build the user text while keeping the answer exclusively in the assistant turn."""
     question = sample.question or "[not provided in source]"
-    parts = [f"问题：{question}"]
+    text = QUESTION_TEMPLATE.format(question=question)
     if sample.options:
-        parts.append(f"选项：{json_text(sample.options)}")
-    return "\n".join(parts)
+        text += OPTIONS_TEMPLATE.format(options=json_text(sample.options))
+    return text
 
 
 def sample_answer(sample: Sample) -> str:

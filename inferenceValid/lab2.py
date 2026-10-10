@@ -7,8 +7,22 @@ import re
 import sys
 from collections import defaultdict
 from threading import Thread
-DEFAULT_SYSTEM_PROMPT = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"#"请用简洁、简短的语言回答用户的问题"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_configured_system_prompt():
+  """从项目根目录 prompts.json 读取默认系统提示词。"""
+  fallback = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"
+  path = os.path.join(os.path.dirname(SCRIPT_DIR), "prompts.json")
+  try:
+    with open(path, "r", encoding="utf-8-sig") as file:
+      value = json.load(file).get("inference", {}).get("default_system")
+    return value if isinstance(value, str) and value.strip() else fallback
+  except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+    return fallback
+
+
+DEFAULT_SYSTEM_PROMPT = _load_configured_system_prompt()
 
 def configure_stdout():
   if hasattr(sys.stdout, "reconfigure"):

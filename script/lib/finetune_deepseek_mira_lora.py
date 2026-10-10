@@ -77,11 +77,28 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SCRIPT_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
+LIB_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = Path(r"G:\Codex_dataset\MIRA-data")
 INFERENCE_DIR = PROJECT_ROOT / "inferenceValid"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
 if str(INFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(INFERENCE_DIR))
 from embed_mira_chroma import iter_samples  # noqa: E402
+try:
+    from prompt_config import prompt as _prompt_value  # noqa: E402
+except ImportError:
+    _prompt_value = None
+
+
+def configured_prompt(path: str, fallback: str) -> str:
+    """读取根目录 prompts.json；缺少配置时回退到内置提示词。"""
+    if _prompt_value is None:
+        return fallback
+    try:
+        return str(_prompt_value(path, default=fallback))
+    except (FileNotFoundError, ValueError, KeyError):
+        return fallback
 try:
     from .terminal_progress import TerminalProgress
     from .distributed_training import (
@@ -98,10 +115,13 @@ except ImportError:  # 兼容直接导入本脚本的离线测试和旧调用方
         setup_distributed, world_size,
         SilentProgress,
     )
-DEFAULT_SYSTEM_PROMPT = (
+DEFAULT_SYSTEM_PROMPT = configured_prompt(
+    "finetune.deepseek_system",
     "You are a medical question-answering assistant. Answer the question using "
-    "the provided text and options. Give the answer directly without a thinking block."
+    "the provided text and options. Give the answer directly without a thinking block.",
 )
+QUESTION_TEMPLATE = configured_prompt("finetune.question_template", "Question: {question}")
+OPTIONS_TEMPLATE = configured_prompt("finetune.options_template", "\nOptions: {options}")
 REQUIRED_PACKAGES = {
     "torch": "2.1.0", "transformers": "4.44.0", "peft": "0.12.0",
     "accelerate": "0.33.0", "safetensors": "0.4.3",
@@ -226,9 +246,9 @@ def json_text(value):
 
 
 def sample_question(sample):
-    text = f"Question: {sample.question}"
+    text = QUESTION_TEMPLATE.format(question=sample.question)
     if sample.options is not None and sample.options not in ("", [], {}):
-        text += "\nOptions: " + json_text(sample.options)
+        text += OPTIONS_TEMPLATE.format(options=json_text(sample.options))
     return text
 
 

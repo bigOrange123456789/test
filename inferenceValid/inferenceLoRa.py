@@ -29,10 +29,26 @@ from threading import Thread
 from typing import Any
 
 
-DEFAULT_SYSTEM_PROMPT = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 LOCAL_MODEL_CACHE: dict[str, tuple[Any, Any, str]] = {}
+
+
+def _load_configured_system_prompt() -> str:
+    """读取项目根目录统一提示词；配置不存在时保留旧默认值。"""
+    fallback = "你是一名谨慎的中文医疗问答助手。请基于用户问题给出准确、清晰、简洁的医学科普回答。"
+    path = PROJECT_ROOT / "prompts.json"
+    if not path.is_file():
+        return fallback
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        value = data.get("inference", {}).get("default_system")
+        return value if isinstance(value, str) and value.strip() else fallback
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return fallback
+
+
+DEFAULT_SYSTEM_PROMPT = _load_configured_system_prompt()
 
 
 def configure_stdout() -> None:

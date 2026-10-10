@@ -20,6 +20,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from inferenceValid.embed_mira_chroma import image_path, iter_samples, json_text
 
 
+def _configured_template(path: str, fallback: str) -> str:
+    """读取统一提示词模板；配置文件缺失时回退旧格式。"""
+    try:
+        from .prompt_config import prompt
+        value = prompt(path, default=fallback)
+        return value if isinstance(value, str) and value else fallback
+    except (ImportError, FileNotFoundError, KeyError, ValueError):
+        return fallback
+
+
 LOGGER = logging.getLogger("rag_eval")
 SOURCE_SPLITS = ("train", "validation", "test")
 
@@ -61,7 +71,9 @@ def load_mira_dataset(data_root: Path, source_splits=("train",)) -> list[dict]:
                 continue
             question = sample.question
             if sample.options:
-                question += "\nOptions: " + json_text(sample.options)
+                options_template = _configured_template(
+                    "embedding.options_template", "Options: {options}")
+                question += "\n" + options_template.format(options=json_text(sample.options))
             reference = sample.answer if isinstance(sample.answer, str) else json_text(sample.answer)
             images = []
             for name in sample.images:

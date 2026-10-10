@@ -25,6 +25,20 @@ from urllib.parse import parse_qs, urlsplit
 
 ROOT_DIR = Path(__file__).resolve().parent
 APP_INDEX = ROOT_DIR / "cardio_ai_platform" / "index.html"
+
+
+def _configured_prompt(path: str, fallback: str) -> str:
+    """读取项目根目录 prompts.json 中的提示词；缺失时使用兼容默认值。"""
+    config_path = ROOT_DIR / "prompts.json"
+    if not config_path.is_file():
+        return fallback
+    try:
+        current = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        for part in path.split("."):
+            current = current[part]
+        return current if isinstance(current, str) and current.strip() else fallback
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return fallback
 FRONTEND_TEMPLATES = {
     "original": "原版（三栏病例分析）",
     "compact": "精简版（两栏病例分析，影像上传置顶）",
@@ -59,13 +73,15 @@ REPORT_FIELD_ALIASES = {
 #     "你的回复第一个字符必须是 {，最后一个字符必须是 }。"
 #     'JSON 必须包含四个字符串字段："diagnosis"、"findings"、"analysis"、"advice"。'
 # )
-ANALYSIS_SYSTEM_PROMPT = (
+ANALYSIS_SYSTEM_PROMPT = _configured_prompt(
+    "cardio.analysis_system",
     "你是一名谨慎的中文心血管医学病例分析助手。"
     "你要综合分析输入的所有信息，给出诊断结果和临床建议。"
     "禁止输出思考过程、解释过程、步骤说明或 Markdown。"
     "你的回复第一个字符必须是 {，最后一个字符必须是 }。"
-    'JSON 必须包含四个字符串字段："diagnosis"、"findings"、"analysis"、"advice"。'
+    'JSON 必须包含四个字符串字段："diagnosis"、"findings"、"analysis"、"advice"。',
 )
+CASE_USER_TEMPLATE = _configured_prompt("cardio.case_user_template", "")
 
 _INFERENCE_MODULE = None
 _INFERENCE_CONFIG_CACHE = None
@@ -388,7 +404,7 @@ def _build_case_prompt(inputs: dict, image: dict | None = None, image_sent: bool
 """.strip()
     else:
         image_section = "未上传图片。"
-    return f"""
+    fallback = f"""
 请基于以下心血管病例材料完成结构化病例分析。
 
 输出要求：
@@ -426,6 +442,19 @@ BMI：{bmi or "未填写"}
 请严格按以下结构返回：
 {{"diagnosis":"...","findings":"...","analysis":"...","advice":"..."}}
 """.strip()
+    if not CASE_USER_TEMPLATE:
+        return fallback
+    values = {
+        "age": age or "未填写", "sex": sex or "未填写", "bmi": bmi or "未填写",
+        "blood_pressure": blood_pressure or "未填写", "heart_rate": heart_rate or "未填写",
+        "family_history": family_history or "未填写", "image_section": image_section,
+        "case_input": case_input, "symptoms": symptoms, "exams": exams,
+        "diagnosis_report": diagnosis_report,
+    }
+    try:
+        return CASE_USER_TEMPLATE.format(**values).strip()
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"提示词配置 cardio.case_user_template 格式错误：{exc}") from exc
 
 
 def _call_remote_chat_completion(model_id: str, cfg: dict, args: SimpleNamespace) -> str:
