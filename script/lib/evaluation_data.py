@@ -12,7 +12,7 @@ import re
 
 from .mira_eval_data import load_mira_dataset
 
-from inferenceValid.embed_mira_chroma import image_path, iter_samples, json_text, parse_image_paths
+from script.embed_mira_chroma import image_path, iter_samples, json_text, parse_image_paths
 
 
 LOGGER = logging.getLogger("rag_eval")

@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from inferenceValid.rag_mira import MiraRAG, reference_image_url
-from inferenceValid.embed_mira_chroma import parse_image_paths, image_path
+from script.embed_mira_chroma import parse_image_paths, image_path
 
 
 def analyze(url, payload):

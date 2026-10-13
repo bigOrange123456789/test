@@ -1,4 +1,4 @@
-# Install in the same Python environment used to run embed_mira_chroma.py.
+# Install in the same Python environment used to run script/embed_mira_chroma.py.
 torch>=2.6
 torchvision>=0.21
 transformers>=5.5,<6

@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import cardio_ai_platform as app
-from inferenceValid import embed_mira_chroma as mira
+from script import embed_mira_chroma as mira
 from inferenceValid import rag_mira as rag
 
 

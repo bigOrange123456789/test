@@ -7,7 +7,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from script import evaluate_rag as evaluation
+from script import inference_rag as evaluation
 from script.lib.atomic_factscore import AtomicFactScorer
 
 

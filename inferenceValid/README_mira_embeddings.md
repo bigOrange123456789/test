@@ -2,7 +2,7 @@
 
 ## 默认路径与数据范围
 
-- 脚本：`D:\Codex\MLMtest\inferenceValid\embed_mira_chroma.py`
+- 脚本：`G:\Codex\MLMtest\script\embed_mira_chroma.py`
 - 数据：`G:\Codex_dataset\MIRA-data`。实际目录名是 `Codex_dataset`，不是 `Codex\_dataset`。
 - 模型：`D:\Codex\MLMtest\Qwen3-VL-Embedding-2B`，不是同名大小的 `Qwen3-VL-2B-Instruct` 聊天模型。
 - 数据库及断点：`G:\Codex_dataset\MIRA-chroma`
@@ -18,9 +18,9 @@
 
 ```powershell
 python -m pip install -r inferenceValid/requirements_mira.txt
-python inferenceValid/embed_mira_chroma.py --scan-only --check-images
-python inferenceValid/embed_mira_chroma.py --limit 10
-python inferenceValid/embed_mira_chroma.py
+python script/embed_mira_chroma.py --scan-only --check-images
+python script/embed_mira_chroma.py --limit 10
+python script/embed_mira_chroma.py
 ```
 
 `--scan-only` 只扫描数据，检查数量及结构，不加载模型或创建向量库。
@@ -39,7 +39,7 @@ Transformers 5.5.1 和 ChromaDB 1.5.9。以下命令在项目根目录执行：
 
 ```powershell
 conda activate MLMtest
-python inferenceValid/embed_mira_chroma.py --device cuda:0 --batch-size 4 --commit-every 32
+python script/embed_mira_chroma.py --device cuda:0 --batch-size 4 --commit-every 32
 ```
 
 不指定 `--device` 时，脚本也会自动选择可用的 CUDA GPU；显式指定 `cuda:0` 可以在
@@ -66,15 +66,15 @@ CUDA wheel 版本参考：[PyTorch 官方安装命令](https://pytorch.org/get-s
 常用选项：
 
 ```powershell
-python inferenceValid/embed_mira_chroma.py --device cuda:0 --batch-size 4 --commit-every 32
-python inferenceValid/embed_mira_chroma.py --data-root "G:\Codex_dataset\MIRA-data" --db-dir "G:\Codex_dataset\MIRA-chroma"
-python inferenceValid/embed_mira_chroma.py --help
+python script/embed_mira_chroma.py --device cuda:0 --batch-size 4 --commit-every 32
+python script/embed_mira_chroma.py --data-root "G:\Codex_dataset\MIRA-data" --db-dir "G:\Codex_dataset\MIRA-chroma"
+python script/embed_mira_chroma.py --help
 ```
 
 如需包含验证集和测试集，使用另一个集合：
 
 ```powershell
-python inferenceValid/embed_mira_chroma.py --splits train validation test --collection mira_all_splits
+python script/embed_mira_chroma.py --splits train validation test --collection mira_all_splits
 ```
 
 ## 向量内容
@@ -128,7 +128,7 @@ python inferenceValid/embed_mira_chroma.py --splits train validation test --coll
 ```python
 import chromadb
 from chromadb.config import Settings
-from inferenceValid.embed_mira_chroma import parse_args, QwenEmbeddingEncoder
+from script.embed_mira_chroma import parse_args, QwenEmbeddingEncoder
 
 args = parse_args([])
 encoder = QwenEmbeddingEncoder(args)

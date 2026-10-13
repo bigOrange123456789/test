@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from inferenceValid.embed_mira_chroma import image_path, iter_samples, json_text
+from script.embed_mira_chroma import image_path, iter_samples, json_text
 
 
 def _configured_template(path: str, fallback: str) -> str:

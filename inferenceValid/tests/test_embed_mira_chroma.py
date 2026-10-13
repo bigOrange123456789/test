@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import embed_mira_chroma as mira
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from script import embed_mira_chroma as mira
 
 
 class SimulatedPowerLoss(BaseException):

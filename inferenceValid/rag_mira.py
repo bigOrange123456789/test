@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
-from . import embed_mira_chroma as mira
+from script import embed_mira_chroma as mira
 
 try:
     # 统一提示词配置位于项目根目录，由 script.lib.prompt_config 负责定位和读取。

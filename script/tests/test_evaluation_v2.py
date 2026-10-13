@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
-from script import evaluate_rag as evaluation
+from script import inference_rag as evaluation
 from script.lib.evaluation_statistics import paired_summary, summarize_values
 
 

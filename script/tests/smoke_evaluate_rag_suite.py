@@ -29,7 +29,7 @@ from PIL import Image
 import torch
 from peft import PeftModel
 
-from script import evaluate_rag as evaluation
+from script import inference_rag as evaluation
 
 
 def read_json(path):

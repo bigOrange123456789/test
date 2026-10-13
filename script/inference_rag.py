@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按 evaluate_rag.json 顺序评估本地 Qwen3-VL / DeepSeek 原版与 LoRA。
+"""生成并（默认）评估本地 Qwen3-VL / DeepSeek 原版与 LoRA。
+
+设置配置项 ``skipEvaluation`` 或 ``inferenceOnly`` 为 true 时只执行推理，
+不加载裁判、不计算指标；生成的 generations.jsonl 可交给独立评估脚本处理。
 
 Python >= 3.10。安装依赖后运行：
-    python script/evaluate_rag.py --check_config
-    python script/evaluate_rag.py --check_data
-    python script/evaluate_rag.py
-    python script/evaluate_rag.py --N 2 --output_dir eval_results_trial
-    python script/evaluate_rag.py --resume
+    python script/inference_rag.py --check_config
+    python script/inference_rag.py --check_data
+    python script/inference_rag.py
+    python script/inference_rag.py --N 2 --output_dir eval_results_trial
+    python script/inference_rag.py --resume
 
 每个配置对象是一组评估：name 是名称，pathLora=null 使用原始参数；
 否则只读加载该目录的 LoRA，不合并、不覆盖任何模型文件。
@@ -106,7 +109,7 @@ prima.enabled=false：回到原来的一次性参考语义评分（0/0.5/1），
     python -m unittest script.tests.test_evaluate_rag_suite script.tests.test_evaluation_data script.tests.test_eval_lora -v
     python script/tests/smoke_evaluate_rag_suite.py
 
-注意：本脚本不校验图片文件是否存在，也不将图片内容纳入数据集指纹。
+注意：本脚本不校验图片文件是否存在；数据集指纹包含图片路径字符串，但不读取图片内容。
 请在运行前自行确保图片路径可读；图片被替换或 Chroma 向量原地更新不会使旧生成缓存失效。
 遇到这些变化，应在 JSON 中设置 resume=false 重新生成，或使用新的 outputDir。
 
@@ -144,27 +147,23 @@ from typing import Any, Callable
 
 import jieba
 import numpy as np
-from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from rouge_score import rouge_scorer
 from tqdm import tqdm
 
 try:
     from .lib.eval_lora import adapter_identity, load_lora_adapter, validate_lora_path
     from .lib.evaluation_data import prepare_evaluation_data
-    from .lib.answer_metrics import score_answer, question_type_for_sample
-    from .lib.atomic_factscore import AtomicFactScorer
+    from .lib.answer_metrics import score_answer, question_type_for_sample, semantic_text_for_budget
+    from .lib.text_metrics import chinese_tokens, compute_bleu4, compute_rouge_l
     from .lib.token_budget import (LENGTH_BUDGET_DEFAULTS, FACT_LENGTH_BUDGET_DEFAULTS,
                                    normalize_length_budget, calculate_token_budget)
-    from .lib.reference_judge import ReferenceJudge
     from .lib.evaluation_statistics import summarize_values, paired_summary
 except ImportError:
     from lib.eval_lora import adapter_identity, load_lora_adapter, validate_lora_path
     from lib.evaluation_data import prepare_evaluation_data
-    from lib.answer_metrics import score_answer, question_type_for_sample
-    from lib.atomic_factscore import AtomicFactScorer
+    from lib.answer_metrics import score_answer, question_type_for_sample, semantic_text_for_budget
+    from lib.text_metrics import chinese_tokens, compute_bleu4, compute_rouge_l
     from lib.token_budget import (LENGTH_BUDGET_DEFAULTS, FACT_LENGTH_BUDGET_DEFAULTS,
                                  normalize_length_budget, calculate_token_budget)
-    from lib.reference_judge import ReferenceJudge
     from lib.evaluation_statistics import summarize_values, paired_summary
 
 LOGGER = logging.getLogger("rag_eval")
@@ -367,20 +366,20 @@ REFERENCE_JUDGE_PROMPTS = {
     "retry": _prompt_value(_PROMPT_CONFIG, "reference_judge.retry", ""),
 }
 
-# AtomicFactScorer / ReferenceJudge 在独立模块中实现；在本评估入口将该模块
-# 的提示常量替换为同一 prompts.json 中的内容，使裁判实际调用也遵循统一配置。
-if FACTSCORE_PROMPTS["extract"] and FACTSCORE_PROMPTS["verify"]:
-    _factscore_module = sys.modules.get(AtomicFactScorer.__module__)
-    if _factscore_module is not None:
-        _factscore_module.EXTRACT_PROMPT = FACTSCORE_PROMPTS["extract"]
-        _factscore_module.VERIFY_PROMPT = FACTSCORE_PROMPTS["verify"]
-        _factscore_module.VERIFY_OUTPUT_SUFFIX = FACTSCORE_PROMPTS["verify_output_suffix"]
-        _factscore_module.RETRY_PREFIX = FACTSCORE_PROMPTS["retry"]
-if REFERENCE_JUDGE_PROMPTS["prompt"]:
-    _reference_judge_module = sys.modules.get(ReferenceJudge.__module__)
-    if _reference_judge_module is not None:
-        _reference_judge_module.JUDGE_PROMPT = REFERENCE_JUDGE_PROMPTS["prompt"]
-        _reference_judge_module.RETRY_PROMPT = REFERENCE_JUDGE_PROMPTS["retry"]
+def _configure_judge_prompts(atomic_cls, reference_cls) -> None:
+    """评分模式才导入裁判模块，并同步统一提示词配置。"""
+    if FACTSCORE_PROMPTS["extract"] and FACTSCORE_PROMPTS["verify"]:
+        module = sys.modules.get(atomic_cls.__module__)
+        if module is not None:
+            module.EXTRACT_PROMPT = FACTSCORE_PROMPTS["extract"]
+            module.VERIFY_PROMPT = FACTSCORE_PROMPTS["verify"]
+            module.VERIFY_OUTPUT_SUFFIX = FACTSCORE_PROMPTS["verify_output_suffix"]
+            module.RETRY_PREFIX = FACTSCORE_PROMPTS["retry"]
+    if REFERENCE_JUDGE_PROMPTS["prompt"]:
+        module = sys.modules.get(reference_cls.__module__)
+        if module is not None:
+            module.JUDGE_PROMPT = REFERENCE_JUDGE_PROMPTS["prompt"]
+            module.RETRY_PROMPT = REFERENCE_JUDGE_PROMPTS["retry"]
 
 
 def _configured_prompt(path: str, default: str) -> str:
@@ -434,6 +433,8 @@ def metrics_for(evaluation: dict) -> tuple:
 
 
 def _judge_enabled(args) -> bool:
+    if getattr(args, "skip_evaluation", False):
+        return False
     prima = prima_settings(args)
     if prima["enabled"]:
         return prima["factScore"] and "open_ended" in prima["questionTypes"]
@@ -464,7 +465,8 @@ def resolve_run_configs(args):
     jobs, names = [], set()
     for settings in entries:
         unknown = set(settings) - {"name", "model", "useRAG", "datasetPath", "chromaPath", "pathLora", "datasetFilter",
-                                   "evaluation", "generation", "outputDir", "resume", "textOnly", "_说明"}
+                                   "evaluation", "generation", "outputDir", "resume", "textOnly",
+                                   "skipEvaluation", "inferenceOnly", "_说明"}
         if unknown:
             raise ValueError(f"未知运行配置字段：{sorted(unknown)}")
         if "model" in settings and (not isinstance(settings["model"], str) or settings["model"] not in MODEL_DIRECTORIES):
@@ -533,6 +535,16 @@ def resolve_run_configs(args):
             if key in settings and type(settings[key]) is not bool:
                 raise ValueError(f"{key} 必须为 true/false。")
             setattr(job, field, getattr(args, field) if getattr(args, field, None) is not None else settings.get(key, False))
+        # 推理与评分解耦：skipEvaluation/inferenceOnly 任一为 true 即只生成答案。
+        skip_value = settings.get("skipEvaluation", False)
+        inference_value = settings.get("inferenceOnly", False)
+        if type(skip_value) is not bool or type(inference_value) is not bool:
+            raise ValueError("skipEvaluation 和 inferenceOnly 必须为 JSON true/false。")
+        if "skipEvaluation" in settings and "inferenceOnly" in settings:
+            LOGGER.warning("配置 %s 同时包含 skipEvaluation 和 inferenceOnly，按 OR 规则处理（任一为 true 即只推理）。",
+                           settings.get("name", "未命名"))
+        cli_skip = getattr(args, "skip_evaluation", None)
+        job.skip_evaluation = bool(skip_value or inference_value) if cli_skip is None else bool(cli_skip)
         if "outputDir" in settings and (not isinstance(settings["outputDir"], str) or not settings["outputDir"].strip()):
             raise ValueError("outputDir 必须是非空路径字符串。")
         # 旧快速检查参数只关闭语义裁判，不再用词重叠冒充事实正确性。
@@ -578,6 +590,8 @@ def resolve_run_configs(args):
         jobs.append(job)
     if len({_digest(job.evaluation) for job in jobs}) != 1:
         raise ValueError("同一批比较必须使用完全相同的 evaluation 设置和固定裁判。")
+    if len({job.skip_evaluation for job in jobs}) != 1:
+        raise ValueError("同一批任务的 skipEvaluation/inferenceOnly 必须一致。")
     return jobs
 
 
@@ -777,43 +791,6 @@ def retrieve_evidence(query_embedding: np.ndarray, knowledge_embeddings: np.ndar
     ranked = np.argsort(-scores, kind="stable")[:top_k]
     return [dict(knowledge[indices[int(j)]], similarity=float(np.clip(scores[j], -1, 1)))
             for j in ranked]
-
-
-def chinese_tokens(text: str) -> list[str]:
-    """jieba 精确模式；过滤空白，保留标点和大小写，各任务规则一致。"""
-    return [token.strip() for token in jieba.lcut(text, cut_all=False) if token.strip()]
-
-
-def compute_bleu4(prediction: str, reference: str, smoothing: str = "none") -> float:
-    """句级 BLEU-4（0-1）；固定四元权重，不启用 auto_reweigh。"""
-    pred, ref = chinese_tokens(prediction), chinese_tokens(reference)
-    if not pred or not ref:
-        return 0.0
-    if smoothing not in {"none", "method1"}:
-        raise ValueError("BLEU smoothing 只能为 none 或 method1。")
-    smooth = SmoothingFunction().method1 if smoothing == "method1" else None
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        return float(sentence_bleu([ref], pred, weights=(0.25, 0.25, 0.25, 0.25),
-                                   smoothing_function=smooth, auto_reweigh=False))
-
-
-class WhitespaceTokenizer:
-    """ROUGE 默认 tokenizer 删除中文；此处保留已分好的中文词元。"""
-    def tokenize(self, text: str) -> list[str]:
-        return text.split()
-
-
-@lru_cache(maxsize=1)
-def _rouge_scorer():
-    return rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False,
-                                   tokenizer=WhitespaceTokenizer())
-
-
-def compute_rouge_l(prediction: str, reference: str) -> float:
-    """jieba 分词后空格连接，返回 ROUGE-L F-measure（0-1）。"""
-    pred, ref = " ".join(chinese_tokens(prediction)), " ".join(chinese_tokens(reference))
-    return float(_rouge_scorer().score(ref, pred)["rougeL"].fmeasure)
 
 
 def _json_claims(raw: str) -> list[str]:
@@ -1260,7 +1237,7 @@ def generate_answer(sample: dict, evidence: list[dict], llm: QwenGenerator) -> s
     if not budget["enabled"]:
         return llm.chat(messages, llm.args.max_new_tokens)
     # 参考答案只在本地用于计数，不写进 messages；排除影像标注和隐藏思考。
-    reference = score_answer(sample, "")["semantic_reference"]
+    reference = semantic_text_for_budget(sample)
     count = llm.count_tokens(reference) if reference else None
     limit = (calculate_token_budget(count, budget) if count is not None else
              min(budget["maxNewTokens"], max(budget["minNewTokens"], llm.args.max_new_tokens)))
@@ -2024,6 +2001,22 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
                     **sample, "config_name": config["name"],
                     "generation_fingerprint": fingerprint, "prediction": prediction,
                     "retrieved_evidence": evidence, "generation_info": generation_info})
+            if getattr(args, "skip_evaluation", False):
+                # 保留预测数据结构，不解析答案、不计算指标，也不启动裁判。
+                row = {**sample, "prediction": prediction, "question_type": sample.get("question_type"),
+                       "normalized_prediction": None, "normalized_reference": None,
+                       "answer_details": {}, "answer_accuracy": None, "choice_f1": None,
+                       "bleu4": None, "rouge_l": None, "semantic_score": None, "factscore": None,
+                       "explanation_rouge_l": None, "explanation_enabled": False,
+                       "judge_required": False, "judge_metric": None,
+                       "semantic_details": {}, "factscore_details": {},
+                       "retrieved_evidence": evidence, "retrieved_count": len(evidence),
+                       "config_name": config["name"], "generation_fingerprint": fingerprint,
+                       "generation_from_cache": key in cached, "generation_info": generation_info,
+                       "metrics_skipped": True}
+                _json_line(predictions, row)
+                results.append(row)
+                continue
             answers = score_answer(sample, prediction)
             if prima["enabled"]:
                 judge_metric = "factscore"
@@ -2054,6 +2047,33 @@ def evaluate_config(config: dict, test: list[dict], knowledge: list[dict], args,
             _json_line(predictions, row)
             results.append(row)
     os.replace(output_temp, directory / "predictions.jsonl")
+    if getattr(args, "skip_evaluation", False):
+        _archive_inactive_report(directory / "by_question_type")
+        summary = {
+            "name": config["name"], "use_rag": config["use_rag"],
+            "run_name": args.run_name, "lora_path": args.lora_path,
+            "dataset_filter": args.dataset_filter,
+            "test_fingerprint": dataset_fingerprint(test),
+            "model": args.model, "model_path": args.model_path,
+            "generation_input_mode": "text_and_images" if llm.supports_images else "text_only",
+            "top_k": config["top_k"] if config["use_rag"] else 0,
+            "num_samples": len(results), "knowledge_size": len(knowledge), "seed": args.seed,
+            "knowledge_size_requested": args.knowledge_size,
+            "exclude_shared_images": args.exclude_shared_images,
+            "chroma_db_dir": str(args.chroma_db_dir) if args.chroma_db_dir else None,
+            "chroma_collection": args.chroma_collection if args.chroma_db_dir else None,
+            "chroma_id_prefix": getattr(args, "chroma_id_prefix", None) if args.chroma_db_dir else None,
+            "bleu_smoothing": args.bleu_smoothing, "scoring_version": SCHEMA_VERSION,
+            "evaluation": args.evaluation, "generation_settings": generation_settings(args),
+            "cached_generations": sum(r["generation_from_cache"] for r in results),
+            "dataset_fingerprint": data_hash, "generation_fingerprint": fingerprint,
+            "metrics": None, "by_question_type": None, "skipped": True,
+            "skip_reason": "推理结果，未评分；请使用 evaluate_rag_metrics.py 计算指标。",
+        }
+        _write_json(directory / "summary.json", summary)
+        _write_json(directory / "review_needed.json", [])
+        LOGGER.info("%s 推理完成，n=%d；未计算任何指标。", config["name"], len(results))
+        return summary, results
     summary = {
         "name": config["name"], "use_rag": config["use_rag"],
         "run_name": args.run_name, "lora_path": args.lora_path,
@@ -2217,6 +2237,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text_only", action="store_true", default=None, help="所有模型只接收文本；亦可配置 textOnly=true")
     parser.add_argument("--export_only", action="store_true",
                         help="从 output_dir 已完成的 JSON/JSONL 结果导出 Excel 和柱状图，不加载模型、不重新评分")
+    skip_group = parser.add_mutually_exclusive_group()
+    skip_group.add_argument("--skip_evaluation", dest="skip_evaluation", action="store_true",
+                            help="只执行推理并保存生成结果，不计算指标或加载裁判")
+    skip_group.add_argument("--no_skip_evaluation", dest="skip_evaluation", action="store_false",
+                            help="执行完整评分；覆盖 JSON 中的 skipEvaluation/inferenceOnly")
+    parser.set_defaults(skip_evaluation=None)
     parser.add_argument("--model_path", help="覆盖所选模型的权重路径；默认项目中的对应模型目录")
     parser.add_argument("--embedding_model_path", help="默认项目中的 Qwen3-VL-Embedding-2B；切换生成模型不改变嵌入模型")
     parser.add_argument("--seed", type=int, default=42)
@@ -2271,15 +2297,19 @@ def run_evaluation(args, prepared=None) -> int:
     run_manifest = None
     metrics_complete = False
     try:
-        try:
-            from rag_reports import check_report_dependencies, export_evaluation_report, export_saved_results
-        except ModuleNotFoundError as error:
-            if error.name != "rag_reports":
-                raise
+        if getattr(args, "skip_evaluation", False):
             export_evaluation_report = None
-            if args.export_only:
-                raise RuntimeError("未安装可选 rag_reports 模块；评估 JSON/JSONL 仍可直接读取。") from error
-            LOGGER.warning("未找到可选 rag_reports 模块，将保存 JSON/JSONL 指标与对比结果，跳过 Excel/图表。")
+            LOGGER.info("只推理模式已启用：不计算指标、不加载裁判。")
+        else:
+            try:
+                from rag_reports import check_report_dependencies, export_evaluation_report, export_saved_results
+            except ModuleNotFoundError as error:
+                if error.name != "rag_reports":
+                    raise
+                export_evaluation_report = None
+                if args.export_only:
+                    raise RuntimeError("未安装可选 rag_reports 模块；评估 JSON/JSONL 仍可直接读取。") from error
+                LOGGER.warning("未找到可选 rag_reports 模块，将保存 JSON/JSONL 指标与对比结果，跳过 Excel/图表。")
         if args.export_only:
             paths = export_saved_results(output)
             print(f"报告已导出：\nExcel: {paths['excel']}\n柱状图: {paths['chart']}")
@@ -2359,9 +2389,10 @@ def run_evaluation(args, prepared=None) -> int:
                        if len(caches[c["name"]]) != len(test)}
             if missing:
                 raise ValueError(f"缓存不足，已在加载模型前终止: {missing}")
-        LOGGER.info("评分方案：%s；生成阶段不进行自评。",
-                    "PRIMA：开放题FActScore，其余Accuracy，解释ROUGE-L" if prima_settings(args)["enabled"]
-                    else f"按题型核对答案；固定裁判范围={args.evaluation['judgeScope']}")
+        if not getattr(args, "skip_evaluation", False):
+            LOGGER.info("评分方案：%s；生成阶段不进行自评。",
+                        "PRIMA：开放题FActScore，其余Accuracy，解释ROUGE-L" if prima_settings(args)["enabled"]
+                        else f"按题型核对答案；固定裁判范围={args.evaluation['judgeScope']}")
         if reference_length_budget(args)["enabled"]:
             LOGGER.info("已启用参考答案长度预算：%s；参考内容不会进入待测模型提示。",
                         json.dumps(reference_length_budget(args), ensure_ascii=False))
@@ -2408,6 +2439,18 @@ def run_evaluation(args, prepared=None) -> int:
                 fingerprints[config["name"]], data_hash)
             summaries.append(summary)
             by_config[config["name"]] = {canonical_id(r["id"]): r for r in results}
+        if getattr(args, "skip_evaluation", False):
+            comparison = {"skipped": True, "status": "inference_only",
+                          "note": "推理结果，未评分；需使用 evaluate_rag_metrics.py 进行指标评估。",
+                          "summaries": summaries, "baseline": None, "paired_deltas": []}
+            _write_json(output / "comparison.json", comparison)
+            run_manifest.update(status="inference_only", skipped=True, elapsed_seconds=time.perf_counter() - started,
+                                report_status="not_applicable")
+            _write_json(output / "run_config.json", run_manifest)
+            llm.close()
+            llm = None
+            LOGGER.info("推理回答已保存，未评分；输出目录: %s", output)
+            return 0
         comparison = {"summaries": summaries, "baseline": None, "paired_deltas": []}
         baseline = next((c["name"] for c in configs if not c["use_rag"]), None)
         if baseline:
@@ -2520,6 +2563,17 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 def run_semantic_scoring(jobs, runs) -> None:
     """先结束全部答案生成，再只加载一次固定裁判。裁判缓存可跨模型共用。"""
+    if any(getattr(job, "skip_evaluation", False) for job in jobs):
+        LOGGER.info("只推理模式：跳过统一裁判评分。")
+        return
+    # 仅完整评分模式才导入裁判依赖，避免只推理时初始化评分模块。
+    try:
+        from .lib.atomic_factscore import AtomicFactScorer
+        from .lib.reference_judge import ReferenceJudge
+    except ImportError:
+        from lib.atomic_factscore import AtomicFactScorer
+        from lib.reference_judge import ReferenceJudge
+    _configure_judge_prompts(AtomicFactScorer, ReferenceJudge)
     eligible_runs = [(job, run) for job, run in zip(jobs, runs) if run["status"] != "failed"]
     if not eligible_runs or not _judge_enabled(jobs[0]):
         return
@@ -2615,6 +2669,23 @@ def run_semantic_scoring(jobs, runs) -> None:
 
 def write_suite_comparison(root: Path, runs: list[dict], *, status: str, elapsed: float) -> dict:
     """汇总本轮已完成结果；同模型且测试内容一致时计算微调前后的逐题差值。"""
+    # 只推理模式无论是否有单个任务失败，都输出明确的“未评分”占位报告，
+    # 避免把 metrics=null 的 summary 送入正常评分汇总逻辑。
+    if runs and any(run.get("inference_only", False) for run in runs):
+        has_failures = any(run.get("status") == "failed" for run in runs)
+        suite_status = "inference_only_with_failures" if has_failures else "inference_only"
+        result = {"schema_version": SCHEMA_VERSION, "status": suite_status, "runs": runs,
+                  "elapsed_seconds": elapsed, "same_test_data": None, "summaries": [],
+                  "paired_deltas": [], "skipped": True,
+                  "note": "推理结果，未评分；请使用 evaluate_rag_metrics.py 计算指标。"}
+        _write_json(root / "suite_comparison.json", result)
+        lines = ["# 模型推理结果", "", "本轮仅生成回答，未执行指标计算或裁判评分。"]
+        if has_failures:
+            lines.extend(["", "部分任务失败："])
+            lines.extend(f"- {run['name']}：{run.get('error', '请查看对应 eval.log')}" for run in runs
+                         if run.get("status") == "failed")
+        (root / "suite_comparison.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return result
     summaries = []
     predictions = {}
     for run in runs:
@@ -2821,12 +2892,20 @@ def main(argv: list[str] | None = None) -> int:
                                   "test_selection": metadata["test_selection"]})
                     entry["question_type_counts"] = {kind: sum(question_type_for_sample(sample) == kind for sample in test)
                                                        for kind in QUESTION_TYPE_ORDER}
-                    entry["reference_explanation_count"] = sum(score_answer(sample, "")["explanation_eligible"] for sample in test)
+                    # 只推理检查不进入评分解析；说明字段无法在该模式下计算时明确标记未知。
+                    entry["reference_explanation_count"] = (
+                        None if job.skip_evaluation else
+                        sum(score_answer(sample, "")["explanation_eligible"] for sample in test)
+                    )
                 checked.append(entry)
             print(json.dumps(checked[0] if len(checked) == 1 else checked, ensure_ascii=False, indent=2))
             return 0
     except (ValueError, OSError) as error:
         print(f"配置或测试数据错误：{error}", file=sys.stderr)
+        return 1
+    if args.export_only and any(job.skip_evaluation for job in jobs):
+        print("配置错误：只推理模式不能使用 --export_only；请交给 evaluate_rag_metrics.py 评分。",
+              file=sys.stderr)
         return 1
     if args.export_only:
         codes = [run_evaluation(job) for job in jobs]
@@ -2837,10 +2916,11 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     write_suite_comparison(root, runs, status="running", elapsed=0.0)
     for index, job in enumerate(jobs, 1):
-        print(f"\n[{index}/{len(jobs)}] 开始评估 {job.run_name}：{job.model}；"
+        print(f"\n[{index}/{len(jobs)}] {'开始推理' if job.skip_evaluation else '开始评估'} {job.run_name}：{job.model}；"
               f"{'加载 LoRA' if job.lora_path else '原始参数'}", flush=True)
         run = {"name": job.run_name, "model": job.model, "lora_path": job.lora_path,
-               "output_dir": job.output_dir, "status": "running"}
+               "output_dir": job.output_dir, "status": "running",
+               "inference_only": bool(job.skip_evaluation)}
         job_started = time.perf_counter()
         try:
             configs = parse_eval_config(job.eval_config, job.top_k)
@@ -2860,25 +2940,30 @@ def main(argv: list[str] | None = None) -> int:
         run["elapsed_seconds"] = time.perf_counter() - job_started
         runs.append(run)
         write_suite_comparison(root, runs, status="running", elapsed=time.perf_counter() - started)
-    try:
-        run_semantic_scoring(jobs, runs)
-    except Exception as error:
-        LOGGER.exception("统一裁判评分未完成；生成回答已保留，修正问题后可 resume 续评。")
-        for run in runs:
-            if run["status"] == "generated":
-                run["scoring_status"] = "failed"
-                run["error"] = str(error)
-    failed = any(run["status"] != "complete" for run in runs)
-    needs_review = any(run.get("scoring_status") == "needs_review" for run in runs)
-    status = "failed" if failed else "needs_review" if needs_review else "complete"
+    skip_evaluation = jobs[0].skip_evaluation
+    if not skip_evaluation:
+        try:
+            run_semantic_scoring(jobs, runs)
+        except Exception as error:
+            LOGGER.exception("统一裁判评分未完成；生成回答已保留，修正问题后可 resume 续评。")
+            for run in runs:
+                if run["status"] == "generated":
+                    run["scoring_status"] = "failed"
+                    run["error"] = str(error)
+    failed = any(run["status"] not in ({"inference_only"} if skip_evaluation else {"complete"}) for run in runs)
+    needs_review = not skip_evaluation and any(run.get("scoring_status") == "needs_review" for run in runs)
+    status = "inference_only" if skip_evaluation and not failed else "failed" if failed else "needs_review" if needs_review else "complete"
     result = write_suite_comparison(root, runs, status=status,
                                     elapsed=time.perf_counter() - started)
-    if result["summaries"]:
+    if result["summaries"] and not skip_evaluation:
         print_comparison(result["summaries"])
-    print(f"\n本轮完成 {sum(run['status'] == 'complete' for run in runs)}/{len(runs)} 组，"
+    completed = sum(run["status"] == ("inference_only" if skip_evaluation else "complete") for run in runs)
+    print(f"\n本轮完成 {completed}/{len(runs)} 组，"
           f"总耗时 {result['elapsed_seconds']:.1f} 秒；汇总：{root / 'suite_comparison.md'}")
     if needs_review:
         print("存在裁判评分失败，已记录为 null 并列入 review_needed.json；请先复核再比较均值。")
+    if skip_evaluation and not failed:
+        print("本轮仅推理，未评分；生成结果可交由 evaluate_rag_metrics.py 独立评估。")
     return 1 if failed else 2 if needs_review else 0
 
 

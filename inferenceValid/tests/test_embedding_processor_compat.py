@@ -6,7 +6,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from inferenceValid import embed_mira_chroma as mira
+from script import embed_mira_chroma as mira
 
 
 class EmbeddingProcessorCompatibilityTests(unittest.TestCase):

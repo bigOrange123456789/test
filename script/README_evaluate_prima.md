@@ -1,6 +1,8 @@
 # PRIMA 题型评估说明
 
-在 `MLMtest` 环境运行 `python script/evaluate_rag.py`。所有实验参数仍来自同目录的 `evaluate_rag.json`，四组模型的 `evaluation` 配置必须一致。
+在 `MLMtest` 环境中，建议先用 `python script/inference_rag.py` 生成回答，再用 `python script/evaluate_rag_metrics.py` 单独计算指标。实验参数仍来自 `evaluate_rag.json`；所有被比较运行的 `evaluation` 配置必须一致。
+
+两阶段运行方式和缓存边界见 [MIGRATION.md](MIGRATION.md)。在 `evaluate_rag.json` 每组配置顶层设置 `"skipEvaluation": true` 后，推理阶段不会加载裁判或计算指标；完成后把生成的 `generations.jsonl` 路径传给 `evaluate_rag_metrics.py --generations ...`。
 
 实验指标参照 PRIMA（DOI: 10.1109/TMI.2026.3728817）第 7 页 “Metrics and Implementation Details” 和第 8 页 Table II。
 
@@ -124,4 +126,4 @@ ROUGE-L 采用项目原有的 jieba 分词 + 最长公共子序列 F1，表示�
 
 本流程先完成四组答案生成，再加载一次固定裁判。相比一次性整体语义评分，真正的事实拆分和核验需要更多模型调用。成功阶段缓存用于减少重复工作；首次完整评估仍需相应时间。
 
-使用 `python script/evaluate_rag.py --check_data` 可以只检查四组路径、题型数量和参考解释覆盖，不加载模型、不生成正式结果。
+使用 `python script/inference_rag.py --check_data` 可以只检查四组路径、题型数量和参考解释覆盖，不加载模型、不生成正式结果。

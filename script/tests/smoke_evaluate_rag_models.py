@@ -29,7 +29,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from PIL import Image
 import torch
 
-from script import evaluate_rag as evaluation
+from script import inference_rag as evaluation
 
 
 def release_log_files():

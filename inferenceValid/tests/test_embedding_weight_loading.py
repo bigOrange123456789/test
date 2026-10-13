@@ -10,7 +10,7 @@ import torch
 from safetensors.torch import save_file
 from transformers import Qwen3VLConfig, Qwen3VLModel
 
-from inferenceValid import embed_mira_chroma as mira
+from script import embed_mira_chroma as mira
 
 
 class EmbeddingWeightLoadingTests(unittest.TestCase):

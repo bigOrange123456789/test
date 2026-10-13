@@ -115,6 +115,12 @@ def _semantic_text(value: Any, question_type: str) -> str:
     return "\n".join(pieces)
 
 
+def semantic_text_for_budget(sample: dict) -> str:
+    """仅提取参考答案文本供 token 预算使用，不执行任何评分或解析状态计算。"""
+    question_type = question_type_for_sample(sample)
+    return _semantic_text(sample.get("answer", sample.get("reference", "")), question_type)
+
+
 _EXPLANATION_MARKER = re.compile(
     r"(?:^|\n|(?<=[.!?。]))\s*(?:#{1,6}\s*)?"
     r"(?:explanation|rationale|reasoning|解释|理由|推理解释|推理说明)\s*[:：]\s*", re.I,

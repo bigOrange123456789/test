@@ -15,7 +15,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from inferenceValid.embed_mira_chroma import CATEGORIES, iter_samples
+from script.embed_mira_chroma import CATEGORIES, iter_samples
 from script import sample_mira_ids
 from script.sample_mira_ids import sample_dataset
 
