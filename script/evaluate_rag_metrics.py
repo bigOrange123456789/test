@@ -44,6 +44,7 @@ TYPE_LABELS = {"open_ended": "开放式问题", "closed_ended": "封闭式问题
                "single_choice": "单选题", "multiple_choice": "多选题"}
 METRICS = ("answer_accuracy", "choice_f1", "bleu4", "rouge_l", "semantic_score")
 PRIMA_METRICS = ("factscore", "answer_accuracy", "explanation_rouge_l")
+ALL_METRICS = tuple(dict.fromkeys((*PRIMA_METRICS, *METRICS)))
 METRIC_LABELS = {"answer_accuracy": "Accuracy", "choice_f1": "Choice F1", "bleu4": "BLEU-4",
                  "rouge_l": "ROUGE-L", "semantic_score": "Semantic score",
                  "factscore": "FActScore", "explanation_rouge_l": "Explanation ROUGE-L"}
@@ -57,10 +58,36 @@ EVAL_DEFAULTS = {
     "bootstrapSamples": 1000,
     "prima": {
         "enabled": True, "separateQuestionTypes": True, "questionTypes": list(QUESTION_TYPES),
+        "announceQuestionType": True,
         "factScore": True, "explanationRougeL": True, "factScoreMaxNewTokens": 1024,
         "factScoreBatchSize": 8, "factScoreLengthBudget": FACT_LENGTH_BUDGET_DEFAULTS,
     },
 }
+
+
+def _default_metric_selection(prima_enabled: bool, prima: dict) -> dict[str, bool]:
+    """未配置逐项开关时保持旧版两套协议的行为。"""
+    enabled = set(PRIMA_METRICS if prima_enabled else METRICS)
+    return {name: name in enabled for name in ALL_METRICS}
+
+
+def _normalize_metric_selection(raw: dict | None, evaluation: dict) -> dict[str, bool]:
+    """规范化 7 个指标的开关；缺省时兼容原有 prima/legacy 行为。"""
+    defaults = _default_metric_selection(evaluation["prima"]["enabled"], evaluation["prima"])
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError("evaluation.metrics 必须为 JSON 对象。")
+    unknown = set(raw) - set(ALL_METRICS)
+    if unknown:
+        raise ValueError(f"evaluation.metrics 出现未知指标：{sorted(unknown)}")
+    result = {**defaults, **raw}
+    for name, value in result.items():
+        if type(value) is not bool:
+            raise ValueError(f"evaluation.metrics.{name} 必须为布尔值。")
+    if not any(result.values()):
+        raise ValueError("evaluation.metrics 至少要启用一个指标。")
+    return result
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -160,11 +187,15 @@ def _normalize_evaluation(raw: dict | None, config_dir: Path) -> dict:
     raw = raw or {}
     if not isinstance(raw, dict):
         raise ValueError("evaluation 必须为 JSON 对象。")
-    unknown = set(raw) - set(EVAL_DEFAULTS)
+    # metrics 是评分阶段的逐项开关；允许它出现在 evaluation 中，
+    # 但在下面单独规范化，避免把原始生成阶段的 sidecar 配置误当成评分配置。
+    metrics_raw = raw.get("metrics")
+    protocol_raw = {key: value for key, value in raw.items() if key != "metrics"}
+    unknown = set(protocol_raw) - set(EVAL_DEFAULTS)
     if unknown:
         raise ValueError(f"evaluation 出现未知配置项：{sorted(unknown)}")
-    result = {**EVAL_DEFAULTS, **raw}
-    prima_raw = raw.get("prima", {})
+    result = {**EVAL_DEFAULTS, **protocol_raw}
+    prima_raw = protocol_raw.get("prima", {})
     if not isinstance(prima_raw, dict) or set(prima_raw) - (set(EVAL_DEFAULTS["prima"]) | {"announceQuestionType"}):
         raise ValueError(f"evaluation.prima 配置无效；可选字段为 {list(EVAL_DEFAULTS['prima'])}")
     prima = {**EVAL_DEFAULTS["prima"], **prima_raw}
@@ -200,6 +231,8 @@ def _normalize_evaluation(raw: dict | None, config_dir: Path) -> dict:
         result["judgeModelPath"] = str((config_dir / candidate).resolve() if not candidate.is_absolute() else candidate.resolve())
     else:
         raise ValueError("evaluation.judgeModelPath 必须为路径字符串或 null。")
+    result["metrics"] = _normalize_metric_selection(metrics_raw, result)
+    result["_metrics_explicit"] = metrics_raw is not None
     return result
 
 
@@ -302,6 +335,9 @@ class _TextJudgeModel:
 
 
 def _metric_names(evaluation: dict) -> tuple[str, ...]:
+    selection = evaluation.get("metrics")
+    if isinstance(selection, dict):
+        return tuple(name for name in ALL_METRICS if selection.get(name, False))
     return PRIMA_METRICS if evaluation["prima"]["enabled"] else METRICS
 
 
@@ -312,9 +348,9 @@ def _metric_applies(row: dict, metric: str) -> bool:
     if metric == "choice_f1":
         return kind in {"single_choice", "multiple_choice"}
     if metric == "factscore":
-        return row["judge_required"] and row["judge_metric"] == "factscore"
+        return row.get("factscore_required", False)
     if metric == "semantic_score":
-        return row["judge_required"] and row["judge_metric"] == "semantic_score"
+        return row.get("semantic_required", False)
     if metric == "explanation_rouge_l":
         return row["explanation_enabled"]
     return True
@@ -343,7 +379,8 @@ def _update_summary(summary: dict, rows: list[dict], seed: int) -> None:
         for kind in types
     }
     summary["judge_failures"] = sum(
-        (row.get("factscore_details") if row["judge_metric"] == "factscore" else row.get("semantic_details", {})).get("status") == "judge_failed"
+        any(details.get("status") == "judge_failed" for details in (
+            row.get("factscore_details", {}), row.get("semantic_details", {})))
         for row in rows)
     summary["judge_required"] = sum(row["judge_required"] for row in rows)
     summary["possible_truncations"] = sum(bool(row.get("generation_info", {}).get("hit_token_limit")) for row in rows)
@@ -352,8 +389,9 @@ def _update_summary(summary: dict, rows: list[dict], seed: int) -> None:
 
 
 def _needs_review(row: dict) -> bool:
-    details = row.get("factscore_details") if row.get("judge_metric") == "factscore" else row.get("semantic_details", {})
-    return bool(details.get("status") == "judge_failed"
+    judge_failed = any(details.get("status") == "judge_failed" for details in (
+        row.get("factscore_details", {}), row.get("semantic_details", {})))
+    return bool(judge_failed
                 or row.get("answer_details", {}).get("parse_status") in {"prediction_unparseable", "invalid_reference"}
                 or row.get("generation_info", {}).get("hit_token_limit")
                 or (row.get("explanation_enabled") and row["answer_details"].get("explanation_status") != "ok"))
@@ -387,6 +425,7 @@ def _load_dataset_fallback(dataset_path: str | None, paths: list[Path], records:
 
 def _make_rows(records: list[dict], evaluation: dict, label: str) -> list[dict]:
     prima = evaluation["prima"]
+    selected_metrics = evaluation["metrics"]
     rows = []
     seen = set()
     for source in records:
@@ -406,14 +445,19 @@ def _make_rows(records: list[dict], evaluation: dict, label: str) -> list[dict]:
         sample = {**source, "reference": reference}
         sample.setdefault("answer", reference)
         answers = score_answer(sample, prediction)
-        if prima["enabled"]:
-            judge_metric = "factscore"
-            judge_required = prima["factScore"] and answers["question_type"] == "open_ended" and "open_ended" in prima["questionTypes"]
-        else:
-            judge_metric = "semantic_score"
-            judge_required = evaluation["judgeScope"] == "all" or (
-                evaluation["judgeScope"] == "open_ended" and answers["question_type"] == "open_ended")
-        explanation_enabled = prima["enabled"] and prima["explanationRougeL"]
+        is_open = answers["question_type"] == "open_ended"
+        factscore_required = bool(selected_metrics.get("factscore") and is_open
+                                  and (not prima["enabled"] or "open_ended" in prima["questionTypes"])
+                                  and (evaluation.get("_metrics_explicit") or prima["factScore"]))
+        semantic_required = bool(selected_metrics.get("semantic_score") and
+                                 (evaluation["judgeScope"] == "all" or
+                                  evaluation["judgeScope"] == answers["question_type"] or
+                                  (evaluation["judgeScope"] == "open_ended" and is_open)))
+        judge_required = factscore_required or semantic_required
+        judge_metric = ("both" if factscore_required and semantic_required
+                        else "factscore" if factscore_required else "semantic_score")
+        explanation_enabled = bool(selected_metrics.get("explanation_rouge_l") and
+                                   (evaluation.get("_metrics_explicit") or prima["explanationRougeL"]))
         explanation_score = None
         if explanation_enabled and answers["explanation_eligible"]:
             explanation_score = compute_rouge_l(answers["prediction_explanation"], answers["reference_explanation"])
@@ -426,6 +470,7 @@ def _make_rows(records: list[dict], evaluation: dict, label: str) -> list[dict]:
                "rouge_l": compute_rouge_l(normalized_prediction, normalized_reference),
                "semantic_score": None, "factscore": None, "explanation_rouge_l": explanation_score,
                "explanation_enabled": explanation_enabled, "judge_required": judge_required,
+               "factscore_required": factscore_required, "semantic_required": semantic_required,
                "judge_metric": judge_metric,
                "semantic_details": {"score": None, "status": "pending" if judge_required and judge_metric == "semantic_score" else "not_applicable"},
                "factscore_details": {"score": None, "status": "pending" if judge_required and judge_metric == "factscore" else "not_applicable"},
@@ -440,26 +485,26 @@ def _make_rows(records: list[dict], evaluation: dict, label: str) -> list[dict]:
 
 def _judge_rows(rows: list[dict], evaluation: dict, llm, cache_dir: Path, identity: dict) -> None:
     prima = evaluation["prima"]
-    scorer = None
-    if prima["enabled"] and prima["factScore"]:
+    fact_rows = [row for row in rows if row.get("factscore_required")]
+    semantic_rows = [row for row in rows if row.get("semantic_required")]
+    if fact_rows:
         scorer = AtomicFactScorer(llm, cache_dir, identity,
                                   max_new_tokens=prima["factScoreMaxNewTokens"],
                                   batch_size=prima["factScoreBatchSize"], retries=evaluation["judgeRetries"],
                                   length_budget=prima["factScoreLengthBudget"])
-    elif not prima["enabled"] and evaluation["judgeScope"] != "none":
-        scorer = ReferenceJudge(llm, cache_dir, identity,
-                                max_new_tokens=evaluation["judgeMaxNewTokens"], retries=evaluation["judgeRetries"])
-    if scorer is None:
-        return
-    required = [row for row in rows if row["judge_required"]]
-    for row in tqdm(required, desc="FActScore" if prima["enabled"] else "语义裁判"):
-        answers = row["answer_details"]
-        sample = {**row, "evaluation_reference": answers["semantic_reference"]}
-        details = scorer.score(sample, answers["semantic_prediction"])
-        if prima["enabled"]:
+        for row in tqdm(fact_rows, desc="FActScore"):
+            answers = row["answer_details"]
+            sample = {**row, "evaluation_reference": answers["semantic_reference"]}
+            details = scorer.score(sample, answers["semantic_prediction"])
             row["factscore_details"] = details
             row["factscore"] = details["score"]
-        else:
+    if semantic_rows:
+        scorer = ReferenceJudge(llm, cache_dir, identity,
+                                max_new_tokens=evaluation["judgeMaxNewTokens"], retries=evaluation["judgeRetries"])
+        for row in tqdm(semantic_rows, desc="语义裁判"):
+            answers = row["answer_details"]
+            sample = {**row, "evaluation_reference": answers["semantic_reference"]}
+            details = scorer.score(sample, answers["semantic_prediction"])
             row["semantic_details"] = details
             row["semantic_score"] = details["score"]
 
@@ -481,11 +526,12 @@ def _summary(label: str, generation_path: Path, source_records: list[dict], rows
                                       ("id", "question", "reference", "answer", "options", "images", "question_type")}
                                      for row in source_records])
     sidecar = sidecar or {}
+    persisted_evaluation = {key: value for key, value in evaluation.items() if key != "_metrics_explicit"}
     return {"name": label, "config_name": rows[0].get("config_name"), "generations_path": str(generation_path),
             "num_samples": len(rows), "test_fingerprint": test_fingerprint,
             "dataset_fingerprint": sidecar.get("dataset_fingerprint", test_fingerprint),
             "generation_fingerprint": rows[0].get("generation_fingerprint"),
-            "evaluation": evaluation, "metric_scale": "0-1", "std_ddof": 0,
+            "evaluation": persisted_evaluation, "metric_scale": "0-1", "std_ddof": 0,
             "aggregation": "macro average over test samples", "protocol": "prima" if evaluation["prima"]["enabled"] else "reference_semantic",
             "model": sidecar.get("model"), "model_path": sidecar.get("model_path"),
             "lora_path": sidecar.get("lora_path"), "use_rag": sidecar.get("use_rag"),
@@ -586,11 +632,15 @@ def _write_reports(root: Path, summaries: list[dict], by_label: dict[str, dict],
             paired.append(delta)
     same_data = len({summary["test_fingerprint"] for summary in summaries}) <= 1
     result = {"schema_version": "rag-metrics-v1", "status": "complete", "protocol": "prima" if evaluation["prima"]["enabled"] else "reference_semantic",
-              "same_test_data": same_data, "summaries": summaries, "paired_deltas": paired,
+              "same_test_data": same_data, "metrics_enabled": list(_metric_names(evaluation)),
+              "summaries": summaries, "paired_deltas": paired,
               "note": "多选题按所选选项集合精确匹配；缺失评分记 null 并列入人工复核，不以零分替代。"}
     question_rows = []
+    report_metrics = _metric_names(evaluation)
+    metric_headers = [METRIC_LABELS[name] + " (%)" for name in report_metrics]
     lines = ["# MIRA 生成结果评分", "", "分数范围为 0–100%；±为有效样本总体标准差，n 为有效评分数。", "",
-             "| 评估名称 | 题型 | 题数 | FActScore (%) | Accuracy (%) | 解释 ROUGE-L (%) |", "| --- | --- | ---: | ---: | ---: | ---: |"]
+             "| " + " | ".join(["评估名称", "题型", "题数", *metric_headers]) + " |",
+             "| " + " | ".join(["---", "---", "---:", *("---:" for _ in report_metrics)]) + " |"]
     for summary in summaries:
         groups = summary.get("by_question_type", {}) if evaluation["prima"]["separateQuestionTypes"] else {"all": summary}
         if not groups:
@@ -601,9 +651,7 @@ def _write_reports(root: Path, summaries: list[dict], by_label: dict[str, dict],
                    "metrics": metrics}
             question_rows.append(row)
             lines.append("| " + " | ".join([summary["name"], TYPE_LABELS.get(kind, "合并"), str(group["num_samples"]),
-                                                   _summary_display(metrics.get("factscore", {})),
-                                                   _summary_display(metrics.get("answer_accuracy", {})),
-                                                   _summary_display(metrics.get("explanation_rouge_l", {}))]) + " |")
+                                                   *(_summary_display(metrics.get(name, {})) for name in report_metrics)]) + " |")
     if paired:
         lines.extend(["", "配对比较（只比较同 ID 且 ID 集合一致的 LoRA/原版结果）：", ""])
         for delta in paired:
@@ -656,12 +704,23 @@ def _run_task(task: dict, config_path: Path, cli_generations: list[str] | None,
             entries.append((label, path, records))
     sidecars = [value for _, path, _ in entries if (value := _read_sidecar_evaluation(path)) is not None]
     selected_eval = task.get("evaluation")
+    # 兼容将指标开关写在任务顶层的配置形式；推荐写在 evaluation.metrics 中。
+    if task.get("metrics") is not None:
+        selected_eval = dict(selected_eval or {})
+        selected_eval["metrics"] = task["metrics"]
     if selected_eval is None and sidecars:
         selected_eval = sidecars[0]
     evaluation = _normalize_evaluation(selected_eval, config_dir)
     # 输入来自相同实验协议时评价配置应一致；从 sidecar 推断时同样逐一核对。
     normalized_sidecars = [_normalize_evaluation(value, config_dir) for value in sidecars]
-    if any(_canonical(value) != _canonical(evaluation) for value in normalized_sidecars):
+    # 指标开关属于本次独立评分配置，不要求与生成阶段 sidecar 的评分选择完全相同。
+    # 其余协议参数仍必须一致，避免混合不同题型/裁判口径的结果。
+    comparable_evaluation = {key: value for key, value in evaluation.items()
+                             if key not in {"metrics", "_metrics_explicit"}}
+    comparable_sidecars = [{key: value for key, value in value.items()
+                            if key not in {"metrics", "_metrics_explicit"}}
+                           for value in normalized_sidecars]
+    if any(_canonical(value) != _canonical(comparable_evaluation) for value in comparable_sidecars):
         raise ValueError("所有 generations 对应 summary.json 的 evaluation 设置必须一致，且与评估配置相同。")
     seed = task.get("seed", 42)
     if type(seed) is not int or seed < 0 or seed >= 2**32:
@@ -682,23 +741,26 @@ def _run_task(task: dict, config_path: Path, cli_generations: list[str] | None,
     cache_dir = output / "judge_cache"
     if not resume and cache_dir.exists():
         LOGGER.info("resume=false：本轮不删除既有 judge_cache，成功裁判缓存仍可安全复用。")
-    needs_judge = (evaluation["prima"]["enabled"] and evaluation["prima"]["factScore"]
-                   or not evaluation["prima"]["enabled"] and evaluation["judgeScope"] != "none")
+    active_metrics = _metric_names(evaluation)
+    needs_judge = bool({"factscore", "semantic_score"} & set(active_metrics))
     judge = None
     judge_identity = None
     summaries, by_label = [], {}
     try:
         if needs_judge and any(
-                (evaluation["prima"]["enabled"] and evaluation["prima"]["factScore"]
-                 and any(question_type_for_sample(row) == "open_ended" for row in records))
-                or (not evaluation["prima"]["enabled"] and evaluation["judgeScope"] != "none")
+                any((metric == "factscore" and question_type_for_sample(row) == "open_ended")
+                    or (metric == "semantic_score" and
+                        (evaluation["judgeScope"] == "all" or
+                         evaluation["judgeScope"] == "open_ended" and question_type_for_sample(row) == "open_ended"))
+                    for row in records for metric in active_metrics)
                 for _, _, records in entries):
             judge = _TextJudgeModel(evaluation["judgeModel"], evaluation["judgeModelPath"])
             judge_identity = {"model_type": evaluation["judgeModel"], "model_path": evaluation["judgeModelPath"],
                               "revision": "local", "software": {name: importlib.metadata.version(name)
                               for name in ("transformers", "torch") if _has_package(name)}}
+        persisted_evaluation = {key: value for key, value in evaluation.items() if key != "_metrics_explicit"}
         _write_json(output / "run_config.json", {"name": task.get("name"), "generations": [str(path) for _, path, _ in entries],
-                                                   "labels": [label for label, _, _ in entries], "evaluation": evaluation,
+                                                   "labels": [label for label, _, _ in entries], "evaluation": persisted_evaluation,
                                                    "seed": seed, "resume": resume, "status": "running"})
         for label, path, records in entries:
             # JSONL 通常自带 answer/options；若 datasetPath 给出则仅缺字段时回源。
