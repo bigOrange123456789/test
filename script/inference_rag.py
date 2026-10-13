@@ -41,7 +41,7 @@ prima.enabled=false：回到原来的一次性参考语义评分（0/0.5/1），
 实现基于 Transformers 4.57.x，不需要克隆 Qwen SDK。
 
 运行配置：
-    - 默认读取本脚本同目录的 ``evaluate_rag.json``，与启动时工作目录无关。
+    - 默认读取本脚本同目录的 ``inference_rag.json``，与启动时工作目录无关。
       JSON 可为一个对象或非空对象数组；数组每项对应一组评估，按顺序执行。
     - ``model`` 支持 ``Qwen3-VL-2B-Instruct`` 和 ``DeepSeek-Model``。
       DeepSeek-Model 是配置选择标识，其默认权重位于项目根目录的
@@ -168,7 +168,7 @@ except ImportError:
 
 LOGGER = logging.getLogger("rag_eval")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("evaluate_rag.json")
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("inference_rag.json")
 
 
 class _HideTruncationWarningsFromConsole(logging.Filter):
@@ -2221,7 +2221,7 @@ def build_parser() -> argparse.ArgumentParser:
     """命令行入口；额外选项控制显存、缓存和评分口径。"""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", help="运行配置文件；默认读取本脚本同目录的 evaluate_rag.json")
+    parser.add_argument("--config", help="运行配置文件；默认读取本脚本同目录的 inference_rag.json")
     parser.add_argument("--check_config", action="store_true", help="仅显示解析后的配置并检查模型类型，不加载权重/数据、不写结果")
     parser.add_argument("--check_data", action="store_true", help="检查全部配置并回源测试编号，显示数量；不加载权重、不写结果")
     parser.add_argument("--model", choices=list(MODEL_DIRECTORIES), help="覆盖 JSON 的 model 选择")
