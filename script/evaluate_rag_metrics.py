@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -582,6 +583,59 @@ def _summary_display(metrics: dict) -> str:
     return "—" if value is None else f"{value * 100:.2f} ± {metrics['std'] * 100:.2f} (n={metrics['n']})"
 
 
+CONSOLE_METRIC_LABELS = {
+    "factscore": "FActScore (%)",
+    "answer_accuracy": "Accuracy (%)",
+    "explanation_rouge_l": "解释ROUGE-L (%)",
+    "choice_f1": "Choice F1 (%)",
+    "bleu4": "BLEU-4 (%)",
+    "rouge_l": "ROUGE-L (%)",
+    "semantic_score": "语义评分 (%)",
+}
+
+
+def _display_width(value: str) -> int:
+    """估算 CMD 中中英文混排文本占用的显示宽度。"""
+    return sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
+
+
+def _pad_console_cell(value: str, width: int) -> str:
+    return value + " " * max(0, width - _display_width(value))
+
+
+def _console_table(summaries: list[dict], evaluation: dict) -> str:
+    """生成简洁的题型分组汇总表，供 CMD 查看；详细结果仍保存为 JSON/Markdown。"""
+    metric_names = _metric_names(evaluation)
+    headers = ["任务", "题型", "N", *(CONSOLE_METRIC_LABELS[name] for name in metric_names)]
+    show_explanation_count = "explanation_rouge_l" in metric_names
+    if show_explanation_count:
+        headers.append("有效解释/题数")
+    rows: list[list[str]] = []
+    for summary in summaries:
+        groups = summary.get("by_question_type", {}) if evaluation["prima"]["separateQuestionTypes"] else {"all": summary}
+        if not groups:
+            groups = {"all": summary}
+        for kind, group in groups.items():
+            metrics = group.get("metrics", {})
+            values = [_summary_display(metrics.get(name, {})) for name in metric_names]
+            if show_explanation_count:
+                explanation = metrics.get("explanation_rouge_l", {})
+                valid = explanation.get("n", 0) if isinstance(explanation, dict) else 0
+                values.append(f"{valid}/{group.get('num_samples', 0)}")
+            rows.append([summary.get("name", ""), TYPE_LABELS.get(kind, "合并"),
+                         str(group.get("num_samples", 0)), *values])
+    if not rows:
+        return ""
+    widths = [max(_display_width(headers[index]), *(_display_width(row[index]) for row in rows))
+              for index in range(len(headers))]
+    separator = "+".join("-" * width for width in widths)
+    lines = [" | ".join(_pad_console_cell(value, widths[index]) for index, value in enumerate(headers)),
+             separator]
+    lines.extend(" | ".join(_pad_console_cell(value, widths[index]) for index, value in enumerate(row))
+                 for row in rows)
+    return "\n".join(lines)
+
+
 def _write_reports(root: Path, summaries: list[dict], by_label: dict[str, dict], evaluation: dict, seed: int) -> dict:
     paired = []
     names = list(by_label)
@@ -780,6 +834,10 @@ def _run_task(task: dict, config_path: Path, cli_generations: list[str] | None,
         manifest.update(status="needs_review" if any(s["judge_failures"] for s in summaries) else "complete",
                         report_status="complete", summaries_count=len(summaries))
         _write_json(output / "run_config.json", manifest)
+        table = _console_table(summaries, evaluation)
+        if table:
+            print("\n评估结果汇总：")
+            print(table)
         print(f"评估完成：{output}")
         return 2 if any(summary["judge_failures"] for summary in summaries) else 0
     finally:
