@@ -99,7 +99,10 @@ def print_config_summary(config):
 
 def normalize_model_ids(models_response):
   model_ids = []
-  for model in getattr(models_response, "data", []):
+  models = models_response
+  if not hasattr(models, "__iter__"):
+    models = getattr(models_response, "data", [])
+  for model in models:
     model_id = getattr(model, "id", None)
     if model_id:
       model_ids.append(model_id)
@@ -172,6 +175,49 @@ def print_available_remote_models(config):
         print(f"  - {available_model}")
 
   print("\n==========================================\n")
+
+
+def print_current_api_models(config, model_id):
+  cfg = config.get(model_id)
+  if cfg is None:
+    print(f"当前模型不存在：{model_id}")
+    return
+  if is_local_config(model_id, cfg):
+    print(f"[{model_id}] 当前使用的是本地模型，没有远程 API 模型版本列表。")
+    return
+
+  api_key = cfg.get("api_key")
+  base_url = cfg.get("base_url")
+  if not api_key or not base_url:
+    print(f"[{model_id}] 查询失败：配置缺少 api_key 或 base_url。")
+    return
+
+  try:
+    import openai # pip install openai
+  except ImportError:
+    print("当前环境未安装 openai，无法检查远程 API 模型列表。")
+    return
+
+  print(f"========== 当前 API 可用模型 | {model_id} ==========")
+  print(f"base_url: {base_url}")
+  print(f"api_key: {mask_api_key(str(api_key))}")
+  try:
+    client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=15)
+    available_models = normalize_model_ids(client.models.list())
+  except Exception as error:
+    print("状态：查询失败，api_key 可能失效，或 base_url 不支持 /models。")
+    print(f"错误：{short_error_message(error)}")
+    print("==============================================\n")
+    return
+
+  if not available_models:
+    print("状态：查询成功，但没有返回模型列表。")
+  else:
+    print(f"可用模型数量：{len(available_models)}")
+    print("可用模型 ID：")
+    for available_model in available_models:
+      print(f"  - {available_model}")
+  print("==============================================\n")
 
 
 def is_vision_language_model(model_config):
@@ -590,7 +636,7 @@ def chat_with_model(modelId, question, image_data_url=None, print_features=False
         max_retries=0,
       )
       if param["stream"]:
-        print(f"[{modelId}] 正在请求远程模型（超时 {float(cfg.get('api_timeout', 60)):g} 秒）...", flush=True)
+        print(f"[{modelId}] 正在请求远程模型...", flush=True) # print(f"[{modelId}] 正在请求远程模型（超时 {float(cfg.get('api_timeout', 60)):g} 秒）...", flush=True)
       message = client.chat.completions.create(
         model=cfg["model"],
         messages=remote_messages,
@@ -690,6 +736,8 @@ while True:
     elif str0=="html":
       print("[html]正在生成交互页面的链接...")
       initUI2()
+    elif str0=="showQueryModel":
+      print_current_api_models(config, modelId)
     else:
       print("无法识别的切换目标:",str0)
       exit(0)
