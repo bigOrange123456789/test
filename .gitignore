@@ -64,6 +64,7 @@ Qwen3-VL-Embedding-2B/*
 
 
 config.json
+config-old.json
 files
 
 # Temporary or demo scripts

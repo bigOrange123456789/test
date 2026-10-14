@@ -13,12 +13,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import io
 import json
 import logging
 import math
 import os
 import re
 import sys
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -89,22 +91,6 @@ def _normalize_metric_selection(raw: dict | None, evaluation: dict) -> dict[str,
     if not any(result.values()):
         raise ValueError("evaluation.metrics 至少要启用一个指标。")
     return result
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def _write_jsonl(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        for row in rows:
-            stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
-    os.replace(temporary, path)
 
 
 def _canonical(value: Any) -> str:
@@ -546,9 +532,9 @@ def _summary(label: str, generation_path: Path, source_records: list[dict], rows
             "generation_input_mode": sidecar.get("generation_input_mode", "from_generations"), "scoring_seconds": elapsed}
 
 
-def _save_one(root: Path, label: str, generation_path: Path, records: list[dict], evaluation: dict,
+def _save_one(label: str, generation_path: Path, records: list[dict], evaluation: dict,
               seed: int, judge, judge_identity: dict | None, cache_dir: Path,
-              sidecar: dict | None = None) -> dict:
+              sidecar: dict | None = None) -> tuple[dict, list[dict]]:
     started = time.perf_counter()
     records = _load_dataset_fallback(None, [generation_path], records)
     rows = _make_rows(records, evaluation, label)
@@ -559,23 +545,7 @@ def _save_one(root: Path, label: str, generation_path: Path, records: list[dict]
     summary = _summary(label, generation_path, records, rows, evaluation, seed,
                        time.perf_counter() - started, sidecar)
     _update_summary(summary, rows, seed)
-    directory = _label_directory(root, label)
-    _write_jsonl(directory / "predictions.jsonl", rows)
-    _write_json(directory / "summary.json", summary)
-    review = [row for row in rows if _needs_review(row)]
-    _write_json(directory / "review_needed.json", review)
-    prima = evaluation["prima"]
-    if prima["enabled"] and prima["separateQuestionTypes"]:
-        for kind in QUESTION_TYPES:
-            group = [row for row in rows if row["answer_details"]["question_type"] == kind]
-            group_dir = directory / "by_question_type" / kind
-            group_summary = {**summary, "question_type": kind, "num_samples": len(group),
-                             "included": kind in prima["questionTypes"]}
-            _update_summary(group_summary, group, seed)
-            _write_jsonl(group_dir / "predictions.jsonl", group)
-            _write_json(group_dir / "summary.json", group_summary)
-            _write_json(group_dir / "review_needed.json", [row for row in group if _needs_review(row)])
-    return summary
+    return summary, rows
 
 
 def _summary_display(metrics: dict) -> str:
@@ -691,10 +661,6 @@ def _write_reports(root: Path, summaries: list[dict], by_label: dict[str, dict],
               "note": "多选题按所选选项集合精确匹配；缺失评分记 null 并列入人工复核，不以零分替代。"}
     question_rows = []
     report_metrics = _metric_names(evaluation)
-    metric_headers = [METRIC_LABELS[name] + " (%)" for name in report_metrics]
-    lines = ["# MIRA 生成结果评分", "", "分数范围为 0–100%；±为有效样本总体标准差，n 为有效评分数。", "",
-             "| " + " | ".join(["评估名称", "题型", "题数", *metric_headers]) + " |",
-             "| " + " | ".join(["---", "---", "---:", *("---:" for _ in report_metrics)]) + " |"]
     for summary in summaries:
         groups = summary.get("by_question_type", {}) if evaluation["prima"]["separateQuestionTypes"] else {"all": summary}
         if not groups:
@@ -704,23 +670,283 @@ def _write_reports(root: Path, summaries: list[dict], by_label: dict[str, dict],
             row = {"name": summary["name"], "question_type": kind, "num_samples": group["num_samples"],
                    "metrics": metrics}
             question_rows.append(row)
-            lines.append("| " + " | ".join([summary["name"], TYPE_LABELS.get(kind, "合并"), str(group["num_samples"]),
-                                                   *(_summary_display(metrics.get(name, {})) for name in report_metrics)]) + " |")
-    if paired:
-        lines.extend(["", "配对比较（只比较同 ID 且 ID 集合一致的 LoRA/原版结果）：", ""])
-        for delta in paired:
-            lines.append(f"- {delta['name']} 相对 {delta['baseline']}：" + "; ".join(
-                f"{METRIC_LABELS[key]} {value['mean'] * 100:+.2f}（n={value['n']}）"
-                for key, value in delta["metrics"].items() if value["mean"] is not None))
-    if not same_data:
-        lines.extend(["", "输入间测试 ID 或内容不同；不得直接横向比较总体均值。"])
-    lines.extend(["", result["note"], ""])
     result["question_type_comparison"] = question_rows
-    _write_json(root / "suite_comparison.json", result)
-    _write_json(root / "comparison.json", result)
-    _write_json(root / "question_type_comparison.json", {"rows": question_rows, "paired_deltas": paired})
-    (root / "suite_comparison.md").write_text("\n".join(lines), encoding="utf-8")
     return result
+
+
+EXCEL_CHUNK_SIZE = 15000
+EXCEL_CELL_LIMIT = 30000
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _excel_value(value: Any, *, truncate: bool = True) -> Any:
+    if isinstance(value, (dict, list, tuple)):
+        value = _json_text(value)
+    if isinstance(value, str):
+        if value.lstrip().startswith(("=", "+", "-", "@")):
+            value = "'" + value
+        if truncate and len(value) > EXCEL_CELL_LIMIT:
+            value = value[:EXCEL_CELL_LIMIT - 40] + "…（内容过长，完整内容见原始记录页）"
+    return value
+
+
+def _style_sheet(sheet, headers: list[str], rows: list[list[Any]]) -> None:
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    sheet.append(headers)
+    for row in rows:
+        sheet.append([_excel_value(value) for value in row])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    sheet.sheet_view.showGridLines = False
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="315B64")
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+    sheet.row_dimensions[1].height = 30
+    for column_index, header in enumerate(headers, 1):
+        samples = [str(header)]
+        samples.extend(str(row[column_index - 1]) for row in rows[:300]
+                       if column_index - 1 < len(row) and row[column_index - 1] is not None)
+        width = min(60, max(12, max((min(len(value), 60) for value in samples), default=12) + 2))
+        sheet.column_dimensions[get_column_letter(column_index)].width = width
+    if len(headers) == 1 and rows:
+        sheet.column_dimensions["A"].width = 100
+
+
+def _add_sheet(workbook, title: str, headers: list[str], rows: list[list[Any]]):
+    sheet = workbook.create_sheet(title)
+    _style_sheet(sheet, headers, rows)
+    return sheet
+
+
+def _percent(value: Any) -> float | None:
+    return None if value is None else float(value) * 100
+
+
+def _review_reasons(row: dict) -> str:
+    reasons = []
+    answers = row.get("answer_details", {})
+    if answers.get("parse_status") in {"prediction_unparseable", "invalid_reference"}:
+        reasons.append(f"答案解析：{answers['parse_status']}")
+    if row.get("generation_info", {}).get("hit_token_limit"):
+        reasons.append("生成回答可能达到 token 上限")
+    if row.get("explanation_enabled") and answers.get("explanation_status") != "ok":
+        reasons.append(f"解释文本：{answers.get('explanation_status', '缺失')}")
+    for label, key in (("FActScore", "factscore_details"), ("语义评分", "semantic_details")):
+        if row.get(key, {}).get("status") == "judge_failed":
+            reasons.append(f"{label}裁判失败")
+    return "；".join(reasons)
+
+
+def _metric_summary_rows(summaries: list[dict], evaluation: dict) -> list[list[Any]]:
+    rows = []
+    for summary in summaries:
+        groups = summary.get("by_question_type", {}) if evaluation["prima"]["separateQuestionTypes"] else {"all": summary}
+        for kind, group in (groups or {"all": summary}).items():
+            for metric in _metric_names(evaluation):
+                stats = group.get("metrics", {}).get(metric, {})
+                ci95 = stats.get("ci95", [None, None])
+                rows.append([
+                    summary.get("name"), TYPE_LABELS.get(kind, "合并"), group.get("num_samples", 0),
+                    METRIC_LABELS[metric], stats.get("n", 0), stats.get("total", group.get("num_samples", 0)),
+                    _percent(stats.get("coverage")), _percent(stats.get("mean")), _percent(stats.get("std")),
+                    _percent(ci95[0] if ci95 else None), _percent(ci95[1] if len(ci95) > 1 else None),
+                    stats.get("ci_method"),
+                ])
+    return rows
+
+
+def _detail_headers(evaluation: dict) -> list[str]:
+    return [
+        "评估名称", "题目ID", "题型", "问题", "标准答案", "参考文本", "生成回答",
+        "归一化回答", "归一化参考",
+        *(METRIC_LABELS[name] + " (%)" for name in ALL_METRICS),
+        "答案解析状态", "答案解析详情", "FActScore状态", "FActScore原因",
+        "语义评分状态", "语义评分原因", "解释状态", "生成信息", "检索证据数",
+        "是否需复核", "复核原因",
+    ]
+
+
+def _detail_row(label: str, row: dict) -> list[Any]:
+    answers = row.get("answer_details", {})
+    fact = row.get("factscore_details", {})
+    semantic = row.get("semantic_details", {})
+    reasons = _review_reasons(row)
+    return [
+        label, row.get("id"), TYPE_LABELS.get(row.get("question_type"), row.get("question_type")),
+        row.get("question"), row.get("answer", row.get("reference")), row.get("reference"),
+        row.get("prediction"), row.get("normalized_prediction"), row.get("normalized_reference"),
+        *(_percent(row.get(metric)) for metric in ALL_METRICS),
+        answers.get("parse_status"), _json_text(answers), fact.get("status"), fact.get("reason"),
+        semantic.get("status"), semantic.get("reason"), answers.get("explanation_status"),
+        _json_text(row.get("generation_info", {})), row.get("retrieved_count", 0),
+        bool(reasons), reasons,
+    ]
+
+
+def _append_chunked_json(rows: list[list[Any]], category: str, object_name: str, field: str, value: Any) -> None:
+    content = _json_text(value)
+    chunks = [content[index:index + EXCEL_CHUNK_SIZE] for index in range(0, len(content), EXCEL_CHUNK_SIZE)] or [""]
+    for index, chunk in enumerate(chunks, 1):
+        rows.append([category, object_name, field, chunk, index, len(chunks)])
+
+
+def _restore_judge_cache(workbook_path: Path, cache_dir: Path) -> int:
+    if not workbook_path.is_file():
+        return 0
+    from openpyxl import load_workbook
+
+    workbook = None
+    restored = 0
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        if "_judge_cache" not in workbook.sheetnames:
+            return 0
+        grouped: dict[str, list[tuple[int, str]]] = {}
+        for relative, part, content in workbook["_judge_cache"].iter_rows(min_row=2, values_only=True):
+            if not isinstance(relative, str) or type(part) is not int or not isinstance(content, str):
+                continue
+            grouped.setdefault(relative, []).append((part, content))
+        cache_root = cache_dir.resolve()
+        for relative, chunks in grouped.items():
+            target = (cache_root / relative).resolve()
+            if target == cache_root or cache_root not in target.parents:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("".join(piece for _, piece in sorted(chunks)), encoding="utf-8")
+            restored += 1
+    except Exception as exc:
+        LOGGER.warning("未能从现有工作簿恢复裁判缓存，将重新评分：%s", exc)
+    finally:
+        if workbook is not None:
+            workbook.close()
+    return restored
+
+
+def _judge_cache_rows(cache_dir: Path) -> list[list[Any]]:
+    rows = []
+    if not cache_dir.is_dir():
+        return rows
+    for path in sorted(cache_dir.rglob("*.json")):
+        relative = path.relative_to(cache_dir).as_posix()
+        content = path.read_text(encoding="utf-8")
+        chunks = [content[index:index + EXCEL_CHUNK_SIZE] for index in range(0, len(content), EXCEL_CHUNK_SIZE)] or [""]
+        rows.extend([[relative, index, chunk] for index, chunk in enumerate(chunks, 1)])
+    return rows
+
+
+def _write_workbook(workbook_path: Path, task: dict, summaries: list[dict], by_label: dict[str, list[dict]],
+                    evaluation: dict, seed: int, report: dict, manifest: dict, log_text: str,
+                    cache_dir: Path) -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    summary_sheet = _add_sheet(
+        workbook, "指标汇总",
+        ["评估名称", "题型", "题数", "指标", "有效评分数", "适用题数", "覆盖率 (%)",
+         "平均值 (%)", "标准差（百分点）", "95% CI下限 (%)", "95% CI上限 (%)", "区间方法"],
+        _metric_summary_rows(summaries, evaluation),
+    )
+    for row in summary_sheet.iter_rows(min_row=2, min_col=7, max_col=11):
+        for cell in row:
+            cell.number_format = "0.00"
+
+    detail_rows = []
+    review_rows = []
+    evidence_rows = []
+    raw_rows = []
+    for summary in summaries:
+        label = summary["name"]
+        for row in by_label[label]:
+            detail_rows.append(_detail_row(label, row))
+            reasons = _review_reasons(row)
+            if reasons:
+                review_rows.append([
+                    label, row.get("id"), TYPE_LABELS.get(row.get("question_type"), row.get("question_type")),
+                    row.get("question"), row.get("reference"), row.get("prediction"), reasons,
+                ])
+            evidence = row.get("retrieved_evidence", [])
+            if isinstance(evidence, dict):
+                evidence = [evidence]
+            if isinstance(evidence, list):
+                for index, item in enumerate(evidence, 1):
+                    item = item if isinstance(item, dict) else {"内容": item}
+                    evidence_rows.append([
+                        label, row.get("id"), index,
+                        item.get("text", item.get("document", item.get("content"))),
+                        item.get("score", item.get("distance")), _json_text(item),
+                    ])
+            raw = _json_text(row)
+            chunks = [raw[index:index + EXCEL_CHUNK_SIZE] for index in range(0, len(raw), EXCEL_CHUNK_SIZE)] or [""]
+            raw_rows.extend([[label, row.get("id"), index, len(chunks), chunk]
+                             for index, chunk in enumerate(chunks, 1)])
+
+    _add_sheet(workbook, "逐题明细", _detail_headers(evaluation), detail_rows)
+    _add_sheet(workbook, "复核清单",
+               ["评估名称", "题目ID", "题型", "问题", "参考文本", "生成回答", "复核原因"],
+               review_rows)
+
+    paired_rows = []
+    for delta in report.get("paired_deltas", []):
+        groups = [("总体", delta.get("metrics", {}))]
+        groups.extend((TYPE_LABELS.get(kind, kind), metrics)
+                      for kind, metrics in delta.get("by_question_type", {}).items())
+        for kind, metrics_by_name in groups:
+            for metric, stats in metrics_by_name.items():
+                ci95 = stats.get("ci95", [None, None])
+                paired_rows.append([
+                    delta.get("name"), delta.get("baseline"), kind, METRIC_LABELS.get(metric, metric),
+                    stats.get("n", 0), _percent(stats.get("mean")), _percent(stats.get("std")),
+                    _percent(ci95[0] if ci95 else None), _percent(ci95[1] if len(ci95) > 1 else None),
+                    stats.get("ci_method"),
+                ])
+    _add_sheet(workbook, "配对比较",
+               ["微调结果", "基线结果", "题型", "指标", "有效配对数", "平均差值（百分点）",
+                "差值标准差（百分点）", "95% CI下限", "95% CI上限", "区间方法"],
+               paired_rows)
+    evidence_sheet = _add_sheet(workbook, "检索证据",
+                                ["评估名称", "题目ID", "序号", "证据文本", "相关度/距离", "证据完整数据 JSON"],
+                                evidence_rows)
+    for row in evidence_sheet.iter_rows(min_row=2, min_col=6, max_col=6):
+        row[0].alignment = Alignment(wrap_text=True, vertical="top")
+    _add_sheet(workbook, "原始记录", ["评估名称", "题目ID", "分段", "总分段", "完整逐题记录 JSON"], raw_rows)
+
+    info_rows = []
+    for key, value in manifest.items():
+        _append_chunked_json(info_rows, "本次评估", task.get("name", "evaluation_metrics"), key, value)
+    for summary in summaries:
+        for key, value in summary.items():
+            _append_chunked_json(info_rows, "实验结果", summary.get("name", ""), key, value)
+    for key, value in report.items():
+        _append_chunked_json(info_rows, "套件对比", "comparison", key, value)
+    _add_sheet(workbook, "运行信息", ["类别", "对象", "字段", "值 JSON片段", "分段", "总分段"], info_rows)
+    _add_sheet(workbook, "运行日志", ["运行日志"], [[line] for line in log_text.splitlines()])
+
+    cache_rows = _judge_cache_rows(cache_dir)
+    if cache_rows:
+        cache_sheet = _add_sheet(workbook, "_judge_cache", ["相对路径", "分段", "缓存 JSON片段"], cache_rows)
+        cache_sheet.sheet_state = "hidden"
+
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=workbook_path.parent, prefix=f".{workbook_path.stem}.",
+                                         suffix=".xlsx", delete=False) as stream:
+            temporary_path = Path(stream.name)
+        workbook.save(temporary_path)
+        os.replace(temporary_path, workbook_path)
+    finally:
+        workbook.close()
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def _load_config(path: Path) -> list[dict]:
@@ -782,25 +1008,31 @@ def _run_task(task: dict, config_path: Path, cli_generations: list[str] | None,
     output_value = cli_output_dir or task.get("outputDir", "../output/eval_results_metrics")
     output = Path(output_value).expanduser()
     output = (config_dir / output).resolve() if not output.is_absolute() else output.resolve()
-    if len(_load_config(config_path)) > 1 and not cli_output_dir:
-        task_name = _safe_label(task.get("name", f"task_{int(time.time())}"))
+    task_count = len(_load_config(config_path))
+    task_name = _safe_label(task.get("name") or (f"task_{int(time.time())}" if task_count > 1 else "evaluation_metrics"))
+    if task_count > 1 and not cli_output_dir:
         output = output / task_name
     output.mkdir(parents=True, exist_ok=True)
-    log_path = output / "eval.log"
+    workbook_path = output / f"{task_name}.xlsx"
+    log_buffer = io.StringIO()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                        handlers=[logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")], force=True)
+                        handlers=[logging.StreamHandler(), logging.StreamHandler(log_buffer)], force=True)
     resume = cli_resume if cli_resume is not None else task.get("resume", True)
     if type(resume) is not bool:
         raise ValueError("resume 必须为布尔值。")
-    cache_dir = output / "judge_cache"
-    if not resume and cache_dir.exists():
-        LOGGER.info("resume=false：本轮不删除既有 judge_cache，成功裁判缓存仍可安全复用。")
+    cache_temporary = tempfile.TemporaryDirectory(prefix="rag-metrics-judge-cache-")
+    cache_dir = Path(cache_temporary.name)
     active_metrics = _metric_names(evaluation)
     needs_judge = bool({"factscore", "semantic_score"} & set(active_metrics))
     judge = None
     judge_identity = None
     summaries, by_label = [], {}
     try:
+        restored = _restore_judge_cache(workbook_path, cache_dir) if resume else 0
+        if restored:
+            LOGGER.info("已从现有 Excel 工作簿恢复 %d 个裁判缓存文件。", restored)
+        elif not resume:
+            LOGGER.info("resume=false：本轮不读取现有工作簿中的裁判缓存。")
         if needs_judge and any(
                 any((metric == "factscore" and question_type_for_sample(row) == "open_ended")
                     or (metric == "semantic_score" and
@@ -813,9 +1045,6 @@ def _run_task(task: dict, config_path: Path, cli_generations: list[str] | None,
                               "revision": "local", "software": {name: importlib.metadata.version(name)
                               for name in ("transformers", "torch") if _has_package(name)}}
         persisted_evaluation = {key: value for key, value in evaluation.items() if key != "_metrics_explicit"}
-        _write_json(output / "run_config.json", {"name": task.get("name"), "generations": [str(path) for _, path, _ in entries],
-                                                   "labels": [label for label, _, _ in entries], "evaluation": persisted_evaluation,
-                                                   "seed": seed, "resume": resume, "status": "running"})
         for label, path, records in entries:
             # JSONL 通常自带 answer/options；若 datasetPath 给出则仅缺字段时回源。
             dataset_path = cli_dataset_path if cli_dataset_path is not None else task.get("datasetPath")
@@ -825,28 +1054,34 @@ def _run_task(task: dict, config_path: Path, cli_generations: list[str] | None,
                 records = _load_dataset_fallback(dataset_path, [path], records)
             sidecar = json.loads((path.parent / "summary.json").read_text(encoding="utf-8-sig")) \
                 if (path.parent / "summary.json").is_file() else {}
-            summary = _save_one(output, label, path, records, evaluation, seed, judge,
-                                judge_identity, cache_dir, sidecar)
+            summary, rows = _save_one(label, path, records, evaluation, seed, judge,
+                                       judge_identity, cache_dir, sidecar)
             summaries.append(summary)
-            by_label[label] = _read_jsonl(output / label / "predictions.jsonl")
+            by_label[label] = rows
         report = _write_reports(output, summaries, by_label, evaluation, seed)
-        manifest = json.loads((output / "run_config.json").read_text(encoding="utf-8"))
-        manifest.update(status="needs_review" if any(s["judge_failures"] for s in summaries) else "complete",
-                        report_status="complete", summaries_count=len(summaries))
-        _write_json(output / "run_config.json", manifest)
+        manifest = {
+            "name": task.get("name"), "generations": [str(path) for _, path, _ in entries],
+            "labels": [label for label, _, _ in entries], "evaluation": persisted_evaluation,
+            "seed": seed, "resume": resume, "status": "needs_review" if any(s["judge_failures"] for s in summaries) else "complete",
+            "report_status": "complete", "summaries_count": len(summaries), "same_test_data": report["same_test_data"],
+            "output_file": str(workbook_path),
+        }
+        LOGGER.info("正在写入 Excel 评估结果：%s", workbook_path)
+        _write_workbook(workbook_path, task, summaries, by_label, evaluation, seed, report, manifest,
+                        log_buffer.getvalue(), cache_dir)
         table = _console_table(summaries, evaluation)
         if table:
             print("\n评估结果汇总：")
             print(table)
-        print(f"评估完成：{output}")
+        print(f"评估完成：{workbook_path}")
         return 2 if any(summary["judge_failures"] for summary in summaries) else 0
     finally:
         if judge is not None:
             judge.close()
         for handler in list(logging.getLogger().handlers):
-            if isinstance(handler, logging.FileHandler):
-                logging.getLogger().removeHandler(handler)
-                handler.close()
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+        cache_temporary.cleanup()
 
 
 def _has_package(name: str) -> bool:
@@ -861,11 +1096,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="只评分已有 generations.jsonl，不运行推理。")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="评估 JSON 配置路径。")
     parser.add_argument("--generations", nargs="+", help="generations.jsonl 文件或包含该文件的目录。")
-    parser.add_argument("--output_dir", help="覆盖 JSON 中 outputDir。")
+    parser.add_argument("--output_dir", help="覆盖 JSON 中 outputDir；评估结果以同名 Excel 文件保存到此目录。")
     parser.add_argument("--dataset_path", help="缺少答案/选项元数据时回源数据集的路径。")
     parser.add_argument("--resume", dest="resume", action="store_true", default=None,
-                        help="复用输出目录下的 judge_cache。")
-    parser.add_argument("--no_resume", dest="resume", action="store_false", help="不复用本轮评分结果。")
+                        help="复用现有 Excel 工作簿中的裁判缓存。")
+    parser.add_argument("--no_resume", dest="resume", action="store_false", help="本轮不读取现有 Excel 工作簿中的裁判缓存。")
     return parser
 
 
