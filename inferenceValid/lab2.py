@@ -558,6 +558,7 @@ config = load_config()
 # print_config_summary(config)
 if args.check_remote_models:
   print_available_remote_models(config)
+# args.stream=False
 
 param={
   "max_new_tokens":args.max_new_tokens,#256,#512      # 最大生成长度
@@ -661,6 +662,8 @@ def chat_with_model(modelId, question, image_data_url=None, print_features=False
       response = re.sub(r'.*?</think>\s*', '', response, flags=re.DOTALL) # 删除Chain of Thought
     cfg["messages"].append(build_history_user_message(question, has_image=image is not None))
     cfg["messages"].append({"role": "assistant", "content": response})
+    # print("response",response)
+    # print("111111111111111111111111111111")
     return response
   except Exception as e:
     # 流式输出模式下主循环不会打印返回值，因此必须在这里显式显示请求错误。

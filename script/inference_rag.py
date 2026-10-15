@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生成并（默认）评估本地 Qwen3-VL / DeepSeek 原版与 LoRA。
+"""生成并（默认）评估 ModelConfig.json 选择的本地或远程模型及 LoRA。
 
 设置配置项 ``skipEvaluation`` 或 ``inferenceOnly`` 为 true 时只执行推理，
 不加载裁判、不计算指标；生成的 generations.jsonl 可交给独立评估脚本处理。
@@ -43,9 +43,10 @@ prima.enabled=false：回到原来的一次性参考语义评分（0/0.5/1），
 运行配置：
     - 默认读取本脚本同目录的 ``inference_rag.json``，与启动时工作目录无关。
       JSON 可为一个对象或非空对象数组；数组每项对应一组评估，按顺序执行。
-    - ``model`` 支持 ``Qwen3-VL-2B-Instruct`` 和 ``DeepSeek-Model``。
-      DeepSeek-Model 是配置选择标识，其默认权重位于项目根目录的
-      ``DeepSeek-R1-Distill-Qwen-1.5B``；千问默认使用同名模型文件夹。
+    - ``model`` 使用 ``ModelConfig.json`` 中的模型代号，例如 ``Qwen``、
+      ``Qwen_LoRA``、``silicon``、``chatGPT``；旧的
+      ``Qwen3-VL-2B-Instruct`` 和 ``DeepSeek-Model`` 仍兼容。localhost=true
+      的条目加载本地权重，localhost=false 的条目通过 OpenAI 兼容 API 调用。
       ``useRAG`` 为 false/true 时分别只评估无/有
       RAG；省略时默认同时运行 no_rag 和 rag_top5。``pathLora`` 指定已有 LoRA
       目录，null 表示原始模型；``name`` 决定结果子目录，组名必须唯一。
@@ -57,8 +58,8 @@ prima.enabled=false：回到原来的一次性参考语义评分（0/0.5/1），
       resume=true 复用当前版本匹配的生成缓存；textOnly=true 让千问也只接收文本。
       generation.maxNewTokens 默认2048、maxInputTokens默认16384，可提高输出预算。
       四组共用较充足的输出上限，减少 DeepSeek 思考段占满预算、没有最终答案的情况。
-    - evaluation.judgeModel 默认 Qwen3-VL-2B-Instruct；judgeModelPath=null 使用
-      本地默认原版目录，不加载 LoRA；judgeScope 默认 open_ended（仅开放题），
+    - evaluation.judgeModel 默认 Qwen；judgeModelPath=null 使用 ModelConfig.json 中
+      该代号的本地原版目录，不加载 LoRA；judgeScope 默认 open_ended（仅开放题），
       all 评所有题，none 只算客观指标；judgeMaxNewTokens 默认256、judgeRetries默认1。
       bootstrapSamples 默认1000。四组 evaluation 必须完全相同，保证裁判和口径一致。
     - evaluation.prima.enabled 总开关默认false（当前JSON已设true）。子参数：
@@ -126,6 +127,7 @@ prima.enabled=false：回到原来的一次性参考语义评分（0/0.5/1），
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import gc
 import hashlib
@@ -133,6 +135,7 @@ import heapq
 import importlib.metadata
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -207,6 +210,114 @@ MODEL_DIRECTORIES = {
     "Qwen3-VL-2B-Instruct": PROJECT_ROOT / "Qwen3-VL-2B-Instruct",
     "DeepSeek-Model": PROJECT_ROOT / "DeepSeek-R1-Distill-Qwen-1.5B",
 }
+MODEL_CONFIG_PATH = PROJECT_ROOT / "ModelConfig.json"
+LEGACY_MODEL_ALIASES = {
+    "Qwen3-VL-2B-Instruct": "Qwen",
+    "DeepSeek-Model": "DeepSeek",
+}
+
+
+def load_model_config() -> dict[str, dict]:
+    """读取项目模型代号表；密钥只留在内存中，不写入运行结果。"""
+    if not MODEL_CONFIG_PATH.is_file():
+        return {}
+    raw = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"模型配置必须是 JSON 对象：{MODEL_CONFIG_PATH}")
+    result = {}
+    for key, value in raw.items():
+        alias = key.strip() if isinstance(key, str) else ""
+        if not alias or not isinstance(value, dict):
+            raise ValueError(f"ModelConfig.json 中的模型代号/配置无效：{key!r}")
+        if alias in result:
+            raise ValueError(f"ModelConfig.json 中模型代号去除首尾空格后重复：{alias}")
+        result[alias] = value
+    return result
+
+
+def model_aliases() -> list[str]:
+    """支持新的 ModelConfig 代号，同时保留旧配置中的两个模型名。"""
+    return sorted(set(MODEL_DIRECTORIES) | set(load_model_config()) | set(LEGACY_MODEL_ALIASES))
+
+
+def _model_config_alias(model: str) -> str:
+    return LEGACY_MODEL_ALIASES.get(model, model)
+
+
+def model_spec(model: str) -> dict:
+    """取得规范化配置。localhost 缺省为 false，与 ModelConfig 的远程默认一致。"""
+    if model in MODEL_DIRECTORIES:
+        return {"model_path": str(MODEL_DIRECTORIES[model]), "lora_adapter": None,
+                "localhost": True, "legacy_alias": True}
+    configs = load_model_config()
+    alias = _model_config_alias(model)
+    if alias in configs:
+        spec = dict(configs[alias])
+    elif model in MODEL_DIRECTORIES:
+        # 兼容旧测试和没有 ModelConfig.json 的已有部署。
+        spec = {"model_path": str(MODEL_DIRECTORIES[model]), "lora_adapter": None, "localhost": True}
+    else:
+        raise ValueError(f"ModelConfig.json 中没有模型代号 {model!r}；可选值：{', '.join(model_aliases())}")
+    local = spec.get("localhost", False)
+    if type(local) is not bool:
+        raise ValueError(f"模型 {model} 的 localhost 必须是 JSON true 或 false。")
+    spec["localhost"] = local
+    if local:
+        if not isinstance(spec.get("model_path"), str) or not spec["model_path"].strip():
+            raise ValueError(f"本地模型 {model} 缺少 model_path。")
+    else:
+        for field in ("api_key", "base_url", "model"):
+            if not isinstance(spec.get(field), str) or not spec[field].strip():
+                raise ValueError(f"远程模型 {model} 缺少有效的 {field}。")
+        if not isinstance(spec.get("extra_body", {}), dict):
+            raise ValueError(f"远程模型 {model} 的 extra_body 必须是 JSON 对象。")
+    return spec
+
+
+def is_local_model(model: str) -> bool:
+    return bool(model_spec(model)["localhost"])
+
+
+def local_model_kind(args) -> str:
+    """按解析后的权重架构分派本地生成器，因而 LoRA 代号也可正确选择底座。"""
+    try:
+        config_path = Path(args.model_path).expanduser() / "config.json"
+        if config_path.is_file():
+            model_type = json.loads(config_path.read_text(encoding="utf-8-sig")).get("model_type")
+            if model_type == "qwen2":
+                return "deepseek"
+            if model_type == "qwen3_vl":
+                return "qwen"
+    except (OSError, json.JSONDecodeError):
+        pass
+    return "deepseek" if _model_config_alias(args.model) in {"DeepSeek", "DeepSeek_LoRA"} else "qwen"
+
+
+def _resolve_model_path(value: str) -> str:
+    """ModelConfig 路径兼容项目根目录和 script/ 下的旧相对路径。"""
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    candidates = (PROJECT_ROOT / "script" / path, PROJECT_ROOT / path)
+    return str(next((candidate.resolve() for candidate in candidates if candidate.exists()), candidates[-1].resolve()))
+
+
+def model_identity(args) -> dict:
+    """缓存和结果身份包含远程端点，不包含 API key。"""
+    spec = model_spec(args.model)
+    if spec["localhost"]:
+        return _model_identity(args.model_path, args.model_revision)
+    return {"alias": args.model, "base_url": spec["base_url"].rstrip("/"),
+            "model": spec["model"], "extra_body": spec.get("extra_body", {})}
+
+
+def generation_input_mode(args) -> str:
+    """根据本地模型类型、远程图像能力和 textOnly 得到实际输入模态。"""
+    if getattr(args, "text_only", False):
+        return "text_only"
+    spec = model_spec(args.model)
+    supports_images = (local_model_kind(args) != "deepseek") if spec["localhost"] else bool(spec.get("supports_images", False))
+    return "text_and_images" if supports_images else "text_only"
 
 # 统一提示词配置。默认值用于向后兼容；项目根目录存在 prompts.json 时，
 # 所有生成/检索/事实核验提示均从该文件读取。配置文件由 prompt_config
@@ -276,7 +387,7 @@ PRIMA_DEFAULTS = {
     "factScoreLengthBudget": FACT_LENGTH_BUDGET_DEFAULTS,
 }
 EVALUATION_DEFAULTS = {
-    "judgeModel": "Qwen3-VL-2B-Instruct", "judgeModelPath": None,
+    "judgeModel": "Qwen", "judgeModelPath": None,
     "judgeScope": "open_ended", "judgeMaxNewTokens": 256, "judgeRetries": 1,
     "bootstrapSamples": 1000,
     "prima": PRIMA_DEFAULTS,
@@ -469,8 +580,8 @@ def resolve_run_configs(args):
                                    "skipEvaluation", "inferenceOnly", "_说明"}
         if unknown:
             raise ValueError(f"未知运行配置字段：{sorted(unknown)}")
-        if "model" in settings and (not isinstance(settings["model"], str) or settings["model"] not in MODEL_DIRECTORIES):
-            raise ValueError(f"model 仅支持 {', '.join(MODEL_DIRECTORIES)}")
+        if "model" in settings and (not isinstance(settings["model"], str) or settings["model"] not in model_aliases()):
+            raise ValueError(f"model 必须是 ModelConfig.json 中的模型代号；可选值：{', '.join(model_aliases())}")
         if "useRAG" in settings and type(settings["useRAG"]) is not bool:
             raise ValueError("useRAG 必须是 JSON true 或 false。")
         job = copy.deepcopy(args)
@@ -499,8 +610,8 @@ def resolve_run_configs(args):
         for field, minimum, maximum in (("factScoreMaxNewTokens", 128, 8192), ("factScoreBatchSize", 1, 32)):
             if type(prima[field]) is not int or not minimum <= prima[field] <= maximum:
                 raise ValueError(f"evaluation.prima.{field} 必须是 {minimum}～{maximum} 的整数。")
-        if not isinstance(job.evaluation["judgeModel"], str) or job.evaluation["judgeModel"] not in MODEL_DIRECTORIES:
-            raise ValueError("evaluation.judgeModel 必须是支持的模型类型。")
+        if not isinstance(job.evaluation["judgeModel"], str) or job.evaluation["judgeModel"] not in model_aliases():
+            raise ValueError("evaluation.judgeModel 必须是 ModelConfig.json 中的模型代号。")
         if not isinstance(job.evaluation["judgeScope"], str) or job.evaluation["judgeScope"] not in {"open_ended", "all", "none"}:
             raise ValueError("evaluation.judgeScope 可选 open_ended、all、none。")
         for field, minimum, maximum in (("judgeMaxNewTokens", 32, 2048), ("judgeRetries", 0, 1),
@@ -508,14 +619,18 @@ def resolve_run_configs(args):
             value = job.evaluation[field]
             if type(value) is not int or not minimum <= value <= maximum:
                 raise ValueError(f"evaluation.{field} 必须是 {minimum}～{maximum} 的整数。")
+        judge_alias = job.evaluation["judgeModel"]
+        judge_spec = model_spec(judge_alias)
         judge_path = job.evaluation["judgeModelPath"]
         if judge_path is not None:
             if not isinstance(judge_path, str) or not judge_path.strip():
                 raise ValueError("evaluation.judgeModelPath 必须为路径字符串或 null。")
+            if not judge_spec["localhost"]:
+                raise ValueError("远程 evaluation.judgeModel 不使用 judgeModelPath；请在 ModelConfig.json 中配置端点。")
             judge_path = Path(judge_path).expanduser()
             job.evaluation["judgeModelPath"] = str((judge_path if judge_path.is_absolute() else config_path.parent / judge_path).resolve())
-        else:
-            job.evaluation["judgeModelPath"] = str(MODEL_DIRECTORIES[job.evaluation["judgeModel"]])
+        elif judge_spec["localhost"]:
+            job.evaluation["judgeModelPath"] = _resolve_model_path(judge_spec["model_path"])
         generation = settings.get("generation", {})
         if not isinstance(generation, dict) or set(generation) - {"maxNewTokens", "maxInputTokens", "referenceLengthBudget"}:
             raise ValueError("generation 仅支持 maxNewTokens、maxInputTokens、referenceLengthBudget。")
@@ -553,7 +668,19 @@ def resolve_run_configs(args):
             job.evaluation["prima"]["factScore"] = False
         job.config = str(config_path) if config_path.is_file() else None
         job.model = args.model or settings.get("model", "Qwen3-VL-2B-Instruct")
-        job.model_path = args.model_path or str(MODEL_DIRECTORIES[job.model])
+        selected_model_spec = model_spec(job.model)
+        job.is_local_model = selected_model_spec["localhost"]
+        if job.is_local_model:
+            job.model_path = args.model_path or _resolve_model_path(selected_model_spec["model_path"])
+        else:
+            job.model_path = selected_model_spec["model"]
+        job.model_config_alias = _model_config_alias(job.model)
+        job.remote_supports_images = bool(selected_model_spec.get("supports_images", False))
+        if "supports_images" in selected_model_spec and type(selected_model_spec["supports_images"]) is not bool:
+            raise ValueError(f"模型 {job.model} 的 supports_images 必须是 JSON true 或 false。")
+        default_lora = (_resolve_model_path(selected_model_spec["lora_adapter"])
+                        if job.is_local_model and selected_model_spec.get("lora_adapter") else None)
+        job.lora_path = default_lora
         job.embedding_model_path = args.embedding_model_path or str(PROJECT_ROOT / "Qwen3-VL-Embedding-2B")
         for field, key in (("dataset_path", "datasetPath"), ("chroma_db_dir", "chromaPath"),
                            ("lora_path", "pathLora"), ("dataset_filter", "datasetFilter")):
@@ -562,11 +689,19 @@ def resolve_run_configs(args):
             if key in settings and not (nullable and value is None):
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError(f"{key} 必须是非空路径字符串" + ("或 null。" if nullable else "。"))
-            if getattr(job, field, None) is None:
+            if field == "lora_path" and key in settings:
+                # 显式 pathLora（包括 null）优先；省略时使用模型代号自身的 LoRA。
                 if value is not None:
                     path = Path(value).expanduser()
                     value = str((config_path.parent / path).resolve() if not path.is_absolute() else path.resolve())
                 setattr(job, field, value)
+            elif getattr(job, field, None) is None:
+                if value is not None:
+                    path = Path(value).expanduser()
+                    value = str((config_path.parent / path).resolve() if not path.is_absolute() else path.resolve())
+                setattr(job, field, value)
+        if not job.is_local_model and job.lora_path:
+            raise ValueError(f"远程模型 {job.model} 不支持本地 pathLora；请在 ModelConfig.json 中选择本地代号。")
         if args.eval_config is None and "useRAG" in settings:
             use_rag = settings["useRAG"]
             job.eval_config = json.dumps([{
@@ -605,10 +740,12 @@ def resolve_run_config(args):
 
 def validate_model_choice(args):
     """及早发现模型种类与本地路径不匹配；显式远程路径保留旧行为。"""
+    if not is_local_model(args.model):
+        return
     directory = Path(args.model_path).expanduser()
     if directory.is_dir():
         config = json.loads((directory / "config.json").read_text(encoding="utf-8-sig"))
-        expected = "qwen2" if args.model == "DeepSeek-Model" else "qwen3_vl"
+        expected = "qwen2" if local_model_kind(args) == "deepseek" else "qwen3_vl"
         if config.get("model_type") != expected:
             raise ValueError(f"model={args.model} 要求 model_type={expected}，但 {directory} 是 {config.get('model_type')}")
     elif directory.is_absolute():
@@ -1198,12 +1335,148 @@ class DeepSeekGenerator(QwenGenerator):
         super().close()
 
 
+class OpenAICompatibleGenerator:
+    """通过 ModelConfig.json 中的 OpenAI 兼容端点生成文本答案和裁判结果。"""
+    def __init__(self, args):
+        self.args = args
+        self.spec = model_spec(args.model)
+        self.model = None
+        self.client = None
+        self.last_generation_info = {}
+        self.supports_images = bool(self.spec.get("supports_images", False)) and not getattr(args, "text_only", False)
+        self.token_count_method = "remote_character_estimate"
+        self._truncation_counts = Counter()
+        self._truncation_lock = threading.Lock()
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """在无服务端 tokenizer 时用可复现的中英文混合估算，不加载本地模型。"""
+        cjk = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", text))
+        other = len(text) - cjk
+        return max(1, cjk + (other + 3) // 4) if text else 0
+
+    def count_tokens(self, text: str) -> int:
+        return self._estimate_tokens(text)
+
+    def _get_client(self):
+        if self.client is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise RuntimeError("远程 API 推理需要安装 openai Python 包（pip install openai）。") from exc
+            self.client = OpenAI(api_key=self.spec["api_key"], base_url=self.spec["base_url"],
+                                 timeout=180.0, max_retries=2)
+        return self.client
+
+    def _image_url(self, block: dict) -> str:
+        source = block.get("image")
+        if not source:
+            raise ValueError("远程图文请求的图片块缺少 image 路径。")
+        if isinstance(source, str) and source.startswith(("http://", "https://", "data:")):
+            return source
+        path = Path(source).expanduser()
+        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    def _messages(self, messages: list[dict]) -> list[dict]:
+        converted = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                converted.append({"role": message["role"], "content": content})
+                continue
+            if not isinstance(content, list):
+                raise ValueError("远程 API 消息 content 必须是文本或内容块列表。")
+            blocks = []
+            text_parts = []
+            for block in content:
+                kind = block.get("type")
+                if kind == "text":
+                    text_parts.append(str(block.get("text", "")))
+                elif kind == "image" and self.supports_images:
+                    if text_parts:
+                        blocks.append({"type": "text", "text": "\n".join(text_parts)})
+                        text_parts = []
+                    blocks.append({"type": "image_url", "image_url": {"url": self._image_url(block)}})
+                elif kind == "image":
+                    raise ValueError("此远程模型未在 ModelConfig.json 中声明 supports_images=true，不能接收图片。")
+                else:
+                    raise ValueError(f"远程 API 不支持内容类型：{kind}")
+            if text_parts:
+                blocks.append({"type": "text", "text": "\n".join(text_parts)})
+            converted.append({"role": message["role"],
+                              "content": blocks if self.supports_images else "\n".join(
+                                  block["text"] for block in blocks)})
+        return converted
+
+    def chat(self, messages: list[dict], max_new_tokens: int) -> str:
+        started = time.perf_counter()
+        api_messages = self._messages(messages)
+        request = {"model": self.spec["model"], "messages": api_messages,
+                   "max_tokens": max_new_tokens, "temperature": 0}
+        extra_body = self.spec.get("extra_body") or {}
+        try:
+            response = self._get_client().chat.completions.create(
+                **request, extra_body=extra_body or None)
+        except Exception as exc:
+            # SDK 的异常文本可能回显请求数据，绝不允许密钥进入日志或结果清单。
+            safe_message = str(exc).replace(self.spec["api_key"], "<redacted>")
+            raise RuntimeError(f"远程模型 {self.spec['model']} 请求失败：{safe_message}") from None
+        if not getattr(response, "choices", None):
+            raise RuntimeError(f"远程模型 {self.spec['model']} 返回了空 choices。")
+        choice = response.choices[0]
+        content = getattr(getattr(choice, "message", None), "content", None)
+        if isinstance(content, list):
+            text = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        else:
+            text = content or ""
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        output_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        input_tokens = int(input_tokens) if input_tokens is not None else self._estimate_tokens(
+            "\n".join(str(message.get("content", "")) for message in api_messages))
+        output_tokens = int(output_tokens) if output_tokens is not None else self._estimate_tokens(text)
+        finish_reason = getattr(choice, "finish_reason", None)
+        hit_limit = finish_reason == "length"
+        elapsed = time.perf_counter() - started
+        if hit_limit:
+            with self._truncation_lock:
+                self._truncation_counts[max_new_tokens] += 1
+            LOGGER.warning("%s 远程生成达到 max_new_tokens=%d，输出可能被截断。",
+                           self.args.model, max_new_tokens,
+                           extra={"rag_eval_truncation": True})
+        self.last_generation_info = {
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "hit_token_limit": hit_limit, "finish_reason": finish_reason,
+            "max_new_tokens": max_new_tokens, "elapsed_seconds": elapsed,
+            "token_count_method": self.token_count_method,
+        }
+        return str(text).strip()
+
+    def text(self, prompt: str, max_new_tokens: int = 1024) -> str:
+        return self.chat([{"role": "system", "content": FACT_SYSTEM},
+                          {"role": "user", "content": prompt}], max_new_tokens)
+
+    def truncation_snapshot(self) -> dict[int, int]:
+        with self._truncation_lock:
+            return dict(self._truncation_counts)
+
+    def close(self):
+        if self.client is not None:
+            close = getattr(self.client, "close", None)
+            if callable(close):
+                close()
+        self.client = None
+
+
 def create_generator(args):
-    if args.model == "DeepSeek-Model":
+    spec = model_spec(args.model)
+    if not spec["localhost"]:
+        return OpenAICompatibleGenerator(args)
+    if local_model_kind(args) == "deepseek":
         return DeepSeekGenerator(args)
-    if args.model == "Qwen3-VL-2B-Instruct":
-        return QwenGenerator(args)
-    raise ValueError(f"未知生成模型：{args.model}")
+    return QwenGenerator(args)
 
 
 def generate_answer(sample: dict, evidence: list[dict], llm: QwenGenerator) -> str:
@@ -1242,7 +1515,7 @@ def generate_answer(sample: dict, evidence: list[dict], llm: QwenGenerator) -> s
     limit = (calculate_token_budget(count, budget) if count is not None else
              min(budget["maxNewTokens"], max(budget["minNewTokens"], llm.args.max_new_tokens)))
     audit = {"mode": "reference_length", "reference_tokens": count,
-             "count_method": "native_tokenizer_without_special_tokens",
+             "count_method": getattr(llm, "token_count_method", "native_tokenizer_without_special_tokens"),
              "source": "answer_and_explanation" if reference else "fixed_missing_reference",
              "initial_max_new_tokens": limit, "policy": dict(budget)}
     LOGGER.info("%s：参考答案 %s tokens，本题输出预算 %d（上限 %d）。",
@@ -1401,7 +1674,7 @@ def _model_identity(path: str, revision: str) -> dict:
 
 def package_versions() -> dict:
     versions = {}
-    for package in ("torch", "torchvision", "transformers", "qwen-vl-utils",
+    for package in ("torch", "torchvision", "transformers", "qwen-vl-utils", "openai",
                     "jieba", "nltk", "rouge-score", "numpy", "Pillow", "peft"):
         try:
             versions[package] = importlib.metadata.version(package)
@@ -1421,8 +1694,9 @@ def generation_fingerprint(args, config: dict, data_hash: str,
         "schema": SCHEMA_VERSION, "dataset": data_hash, "test_ids": sorted(test_ids),
         "config": {"use_rag": config["use_rag"], "top_k": config["top_k"] if config["use_rag"] else 0},
         "model_choice": args.model,
-        "generation_input_mode": "text_only" if args.model == "DeepSeek-Model" or getattr(args, "text_only", False) else "text_and_images",
-        "model": _model_identity(args.model_path, args.model_revision),
+        "generation_input_mode": generation_input_mode(args),
+        "model": model_identity(args),
+        "remote_token_estimator": "chars-v1" if not is_local_model(args.model) else None,
         "lora": adapter_identity(getattr(args, "lora_path", None)),
         "peft_version": versions.get("peft") if getattr(args, "lora_path", None) else None,
         "embedding_model": _model_identity(args.embedding_model_path, args.embedding_revision)
@@ -1430,7 +1704,7 @@ def generation_fingerprint(args, config: dict, data_hash: str,
         "settings": {k: getattr(args, k) for k in fields},
         # 提示词配置属于生成条件；修改 prompts.json 后不能复用旧回答缓存。
         "prompts": {
-            "answer_system": TEXT_ANSWER_SYSTEM if args.model == "DeepSeek-Model" or getattr(args, "text_only", False) else ANSWER_SYSTEM,
+            "answer_system": TEXT_ANSWER_SYSTEM if generation_input_mode(args) == "text_only" else ANSWER_SYSTEM,
             "query": QUERY_INSTRUCTION, "document": DOCUMENT_INSTRUCTION,
             "chroma": CHROMA_INSTRUCTION, "answer_formats": ANSWER_FORMATS,
             "data_format": DATA_FORMAT_PROMPTS,
@@ -2224,7 +2498,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="运行配置文件；默认读取本脚本同目录的 inference_rag.json")
     parser.add_argument("--check_config", action="store_true", help="仅显示解析后的配置并检查模型类型，不加载权重/数据、不写结果")
     parser.add_argument("--check_data", action="store_true", help="检查全部配置并回源测试编号，显示数量；不加载权重、不写结果")
-    parser.add_argument("--model", choices=list(MODEL_DIRECTORIES), help="覆盖 JSON 的 model 选择")
+    parser.add_argument("--model", choices=model_aliases(), help="按 ModelConfig.json 中的模型代号选择模型")
     parser.add_argument("--dataset_path", help="MIRA CSV 目录或 JSONL 数据集路径；覆盖 datasetPath")
     parser.add_argument("--source_splits", nargs="+", choices=("train", "validation", "test"), default=["train"],
                         help="RAG 知识库从哪些原始 CSV 读取，默认 train；不改变固定测试集")
@@ -2344,8 +2618,8 @@ def run_evaluation(args, prepared=None) -> int:
         random.seed(args.seed)
         np.random.seed(args.seed)
         jieba.dt.tmp_dir = str(output)
-        LOGGER.info("评估模型=%s；路径=%s；生成输入=%s", args.model, args.model_path,
-                    "纯文本（忽略当前及参考图片）" if args.model == "DeepSeek-Model" or args.text_only else "文本与图片")
+        LOGGER.info("评估模型=%s；模型标识=%s；生成输入=%s", args.model,
+                    model_spec(args.model).get("model", args.model_path), generation_input_mode(args))
         # 即使 --resume，也以当前筛选文件为准；旧 test_ids.json 不能覆盖新配置。
         test, knowledge, selection = prepared if prepared is not None else prepare_protocol_data(args, configs)
         knowledge_candidates = selection["knowledge_candidates"]
@@ -2549,6 +2823,8 @@ def judge_arguments(args):
     judge_args = copy.deepcopy(args)
     judge_args.model = args.evaluation["judgeModel"]
     judge_args.model_path = args.evaluation["judgeModelPath"]
+    if not model_spec(judge_args.model)["localhost"]:
+        judge_args.model_path = model_spec(judge_args.model)["model"]
     judge_args.lora_path = None
     judge_args.text_only = True
     judge_args.model_revision = "main"
@@ -2581,7 +2857,7 @@ def run_semantic_scoring(jobs, runs) -> None:
     prima = prima_settings(args)
     use_atomic = prima["enabled"]
     judge_args = judge_arguments(args)
-    identity = {"model": _model_identity(judge_args.model_path, judge_args.model_revision),
+    identity = {"model": model_identity(judge_args),
                 "model_type": judge_args.model, "lora": None,
                 "versions": package_versions(), "dtype": judge_args.dtype,
                 "device": judge_args.device, "attention": judge_args.attn_implementation,
@@ -2858,8 +3134,9 @@ def main(argv: list[str] | None = None) -> int:
             parse_eval_config(job.eval_config, job.top_k)
             if not job.export_only:
                 validate_model_choice(job)
-                validate_lora_path(job.model_path, job.lora_path)
-                if _judge_enabled(job):
+                if job.is_local_model:
+                    validate_lora_path(job.model_path, job.lora_path)
+                if _judge_enabled(job) and model_spec(job.evaluation["judgeModel"])["localhost"]:
                     validate_model_choice(judge_arguments(job))
                 if not job.dataset_path:
                     raise ValueError(f"{job.run_name} 缺少 datasetPath / --dataset_path。")
@@ -2872,7 +3149,7 @@ def main(argv: list[str] | None = None) -> int:
                 entry = {
                     "name": job.run_name, "config": job.config, "model": job.model,
                     "model_path": job.model_path, "pathLora": job.lora_path,
-                    "generation_input_mode": "text_only" if job.model == "DeepSeek-Model" or job.text_only else "text_and_images",
+                    "generation_input_mode": generation_input_mode(job),
                     "evaluation": job.evaluation, "generation": {"maxNewTokens": job.max_new_tokens,
                                                                   "maxInputTokens": job.max_input_tokens,
                                                                   "referenceLengthBudget": reference_length_budget(job)},
