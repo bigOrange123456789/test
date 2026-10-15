@@ -29,6 +29,10 @@ dataset/**/*.tsv
 # Local sampling, fine-tuning, and evaluation JSON configuration
 /script/*.json
 
+# Local model API credentials and runtime configuration
+/ModelConfig.json
+/ModelConfig.local.json
+
 # Generated split manifests, LoRA adapters, and training checkpoints
 /output/
 
