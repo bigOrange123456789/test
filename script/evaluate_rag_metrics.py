@@ -291,8 +291,10 @@ class _TextJudgeModel:
                         {"role": "user", "content": prompt_text}]
             rendered = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = self.processor(text=[rendered], images=None, videos=None, return_tensors="pt")
-            decode = lambda ids: self.processor.batch_decode(
-                ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            # new_ids 是一维张量，不能用 batch_decode（会把每个 token 当成一个
+            # 独立序列，[0] 只解出第一个 token，例如裁判输出只剩 '{"'）。
+            decode = lambda ids: self.tokenizer.decode(
+                ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         input_length = int(inputs["input_ids"].shape[1])
         if input_length > self.max_input_tokens:
             raise ValueError(f"裁判输入 {input_length} tokens 超过 max_input_tokens={self.max_input_tokens}。")

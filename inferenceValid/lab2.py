@@ -536,6 +536,19 @@ def decode_generated_tokens(cfg, outputs, inputs):
   )
 
 
+def remote_generation_kwargs(cfg):
+  """按实际模型名称选择生成参数，兼容 OpenAI 推理模型和其他远程 API。"""
+  model_name = str(cfg["model"]).strip().lower().rsplit("/", 1)[-1]
+  if re.match(r"^(?:gpt-5|o1|o3|o4)(?:-|$)", model_name):
+    # GPT-5 / o 系列使用新的 token 上限参数，并由服务端使用默认温度。
+    # 此上限包括推理 token 和最终回答 token。
+    return {"max_completion_tokens": param["max_new_tokens"]}
+  return {
+      "max_tokens": param["max_new_tokens"],
+      "temperature": param["temperature"],
+  }
+
+
 def local_generation_kwargs(cfg, inputs):
   tokenizer = cfg["tokenizer"]
   eos_token_id = getattr(tokenizer, "eos_token_id", None)
@@ -642,8 +655,7 @@ def chat_with_model(modelId, question, image_data_url=None, print_features=False
         model=cfg["model"],
         messages=remote_messages,
         extra_body=cfg.get("extra_body", {}),
-        temperature=param["temperature"],
-        max_tokens=param["max_new_tokens"], #1000
+        **remote_generation_kwargs(cfg),
         stream=param["stream"],  # 开启流式
         # enable_thinking=param["enable_thinking"],
       )
@@ -651,10 +663,15 @@ def chat_with_model(modelId, question, image_data_url=None, print_features=False
         response = ""
         print(" "+modelId+":", end="", flush=True)
         for chunk in message:
-            if chunk.choices[0].delta.content is not None:
-                content = chunk.choices[0].delta.content
-                response += content
-                print(content, end="", flush=True) 
+          # 部分接口会发送 choices=[] 的 token 用量统计块，其中没有回答正文。
+          choices = getattr(chunk, "choices", None)
+          if not choices:
+            continue
+          delta = getattr(choices[0], "delta", None)
+          content = getattr(delta, "content", None)
+          if content is not None:
+            response += content
+            print(content, end="", flush=True)
         print()
       else:
         response = message.choices[0].message.content

@@ -57,6 +57,7 @@ dataset/**/*.tsv
 
 # Downloaded Qwen3-VL model files.
 Qwen3-VL-2B-Instruct/
+Qwen3.8-27B/
 .hf_cache/
 
 # Downloaded Qwen3-VL embedding model assets.
