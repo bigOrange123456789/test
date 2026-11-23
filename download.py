@@ -34,3 +34,4 @@ snapshot_download(
     local_dir_use_symlinks=False   # 不使用符号链接，复制实际文件
 )
 print("请到huggingface上手动下载模型的model.safetensors文件: https://huggingface.co/models")
+
